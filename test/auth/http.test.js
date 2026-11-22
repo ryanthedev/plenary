@@ -298,7 +298,7 @@ test("Bearer missing, malformed, forged or expired → 401 auth; cookies never a
 
 // ---- admin rules ----
 
-test("POST /boards: non-admin and tenantless callers get 403; a tenant field is refused and creates nothing", async () => {
+test("POST /boards: non-admin and tenantless callers get 403; cross-tenant tenant field is refused with 403 and creates nothing", async () => {
   let creates = 0;
   const counting = { ...registry, createBoard: async o => { creates++; return registry.createBoard(o); } };
   routes = build({ registry: counting });
@@ -308,10 +308,13 @@ test("POST /boards: non-admin and tenantless callers get 403; a tenant field is 
     expect(r.status).toBe(403);
     expect(await r.json()).toEqual({ error: "forbidden" });
   }
-  const other = await registry.createTenant({ domain: "globex.com", admins: ["google:1001"] });
+  const other = await registry.createTenant({ domain: "globex.com", admins: ["google:9999"] });
   const r = await api("/boards", admin, "POST", { tenant: other.id });
-  expect(r.status).toBe(400);
-  expect(await r.json()).toEqual({ error: "unknown-field", field: "tenant" });
+  expect(r.status).toBe(403);
+  expect(await r.json()).toEqual({ error: "forbidden" });
+  const unk = await api("/boards", admin, "POST", { bogus: 1 });
+  expect(unk.status).toBe(400);
+  expect(await unk.json()).toEqual({ error: "unknown-field", field: "bogus" });
   expect(creates).toBe(0);
   const bad = await api("/boards", admin, "POST", { memberRole: "owner" });
   expect(bad.status).toBe(400);

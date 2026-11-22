@@ -42,7 +42,7 @@ export const mint = {
 
 /**
  * @typedef {"owner"|"editor"|"annotator"|"commenter"|"viewer"} Role
- * @typedef {{ id: string, domain: string|null, admins: string[], createdAt: number }} Tenant
+ * @typedef {{ id: string, name: string, domain: string|null, admins: string[], createdAt: number }} Tenant
  * @typedef {{ id: string, tenant: string, title: string, memberRole: Role|null, createdAt: number }} Board
  * @typedef {Board & { role: Role }} BoardAccess
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
@@ -51,15 +51,22 @@ export const mint = {
  * @typedef {{ events: AuditEvent[], nextBefore: string|null }} AuditPage
  *
  * @typedef {{
- *   createTenant(o: { domain: string|null, admins?: string[] }): Promise<Tenant>,
+ *   createTenant(o: { name?: string|null, domain: string|null, admins?: string[] }): Promise<Tenant>,
  *   tenant(id: string): Promise<Tenant|null>,
  *   tenantByDomain(domain: string): Promise<Tenant|null>,
  *   listPersonalTenants?(): Promise<Tenant[]>,
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
+ *   addTenantMember(tenant: string, email: string): Promise<{ added: boolean }>,
+ *   removeTenantMember(tenant: string, email: string): Promise<boolean>,
+ *   isTenantMember(tenant: string, email: string): Promise<boolean>,
+ *   tenantMembers(tenant: string): Promise<string[]>,
+ *   tenantsForMember(email: string): Promise<Tenant[]>,
+ *   tenantsForAdmin(user: string, email?: string|null): Promise<Tenant[]>,
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
  *   board(id: string): Promise<Board|null>,
  *   listBoards(tenant: string): Promise<Board[]>,
  *   listBoardsFor(tenant: string, user: string, opts?: { email?: string|null, isMember?: boolean, at?: number }): Promise<BoardAccess[]>,
+ *   boardsForUser(user: string, email?: string|null, opts?: { at?: number }): Promise<BoardAccess[]>,
  *   setGrant(board: string, user: string, role: Role|null): Promise<void>,   // rejects code "last-owner" (atomic)
  *   grant(board: string, user: string): Promise<Role|null>,
  *   grants(board: string): Promise<{ user: string, role: Role }[]>,

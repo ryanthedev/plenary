@@ -34,14 +34,70 @@ export function registryContract(name, makeRegistry, opts = {}) {
 
     // ---- tenants ----
 
-    test("createTenant: minted id t- + 12 [a-z0-9], domain lower-cased, admins, createdAt", async () => {
+    test("createTenant: minted id t- + 12 [a-z0-9], name defaults, domain lower-cased, admins, createdAt", async () => {
       const t = await r.createTenant({ domain: "Acme.COM", admins: ["google:root"] });
       expect(t.id).toMatch(/^t-[a-z0-9]{12}$/);
-      expect(t).toMatchObject({ domain: "acme.com", admins: ["google:root"], createdAt: T0 });
+      expect(t).toMatchObject({ name: "acme.com", domain: "acme.com", admins: ["google:root"], createdAt: T0 });
       expect(await r.tenant(t.id)).toEqual(t);
-      const u = await r.createTenant({ domain: "globex.com" });
+      const u = await r.createTenant({ domain: "globex.com", name: "  Globex Corp  " });
       expect(u.id).not.toBe(t.id);
+      expect(u.name).toBe("Globex Corp");
       expect(u.admins).toEqual([]);
+      const p = await r.createTenant({ domain: null });
+      expect(p.name).toBe("Personal Workspace");
+      const p2 = await r.createTenant({ domain: null, name: "Design Lab" });
+      expect(p2.name).toBe("Design Lab");
+    });
+
+    test("addTenantMember / removeTenantMember / tenantMembers / tenantsForMember: normalized, sorted, idempotent", async () => {
+      const t1 = await r.createTenant({ domain: null, name: "Org One", admins: ["google:root"] });
+      clock.t = T0 + 10;
+      const t2 = await r.createTenant({ domain: null, name: "Org Two", admins: ["google:root"] });
+
+      expect(await r.tenantMembers(t1.id)).toEqual([]);
+      expect(await r.tenantMembers("t-nope00000000")).toEqual([]);
+      expect(await r.tenantsForMember("bob@gmail.com")).toEqual([]);
+
+      expect(await r.addTenantMember(t1.id, "  Zoe@Gmail.com ")).toEqual({ added: true });
+      expect(await r.addTenantMember(t1.id, "zoe@gmail.com")).toEqual({ added: false });
+      expect(await r.addTenantMember(t1.id, "Ada@Gmail.com")).toEqual({ added: true });
+      expect(await r.addTenantMember(t2.id, "ada@gmail.com")).toEqual({ added: true });
+
+      expect(await r.tenantMembers(t1.id)).toEqual(["ada@gmail.com", "zoe@gmail.com"]);
+      expect(await r.isTenantMember(t1.id, "ADA@GMAIL.COM")).toBe(true);
+      expect(await r.isTenantMember(t1.id, "nobody@gmail.com")).toBe(false);
+      expect(await r.isTenantMember("t-nope00000000", "ada@gmail.com")).toBe(false);
+      expect((await r.tenantsForMember(" ADA@GMAIL.COM ")).map(t => t.id)).toEqual([t1.id, t2.id]);
+      expect((await r.tenantsForMember("zoe@gmail.com")).map(t => t.id)).toEqual([t1.id]);
+
+      // tenantsForAdmin: indexed lookup by user id or email:<addr>
+      expect((await r.tenantsForAdmin("google:root")).map(t => t.id)).toEqual([t1.id, t2.id]);
+      await r.addTenantAdmin(t2.id, "email:ada@gmail.com");
+      expect((await r.tenantsForAdmin("google:ada", "ADA@GMAIL.COM")).map(t => t.id)).toEqual([t2.id]);
+      expect(await r.tenantsForAdmin("google:nobody")).toEqual([]);
+
+      await expect(r.addTenantMember("t-nope00000000", "ada@gmail.com")).rejects.toThrow();
+      await expect(r.addTenantMember(t1.id, "   ")).rejects.toThrow();
+
+      expect(await r.removeTenantMember(t1.id, " ZOE@gmail.com ")).toBe(true);
+      expect(await r.removeTenantMember(t1.id, "zoe@gmail.com")).toBe(false);
+      expect(await r.removeTenantMember("t-nope00000000", "ada@gmail.com")).toBe(false);
+      expect(await r.tenantMembers(t1.id)).toEqual(["ada@gmail.com"]);
+      expect(await r.isTenantMember(t1.id, "zoe@gmail.com")).toBe(false);
+      expect(await r.tenantsForMember("zoe@gmail.com")).toEqual([]);
+
+      // listBoardsFor trusts only the caller-passed isMember boolean (M1: email trust stays in core)
+      const b = await r.createBoard({ tenant: t1.id, title: "Team Board", memberRole: "editor" });
+      const bPriv = await r.createBoard({ tenant: t1.id, title: "Private", memberRole: null });
+      expect((await r.listBoardsFor(t1.id, "google:ada", { email: "Ada@Gmail.com", isMember: true })).map(x => [x.id, x.role])).toEqual([[b.id, "editor"]]);
+      expect(await r.listBoardsFor(t1.id, "google:ada", { email: "Ada@Gmail.com", isMember: false })).toEqual([]);
+      expect(bPriv.memberRole).toBe(null);
+
+      // boardsForUser: indexed lookup of direct grants, live invites, and live link uses across tenants
+      await r.setGrant(bPriv.id, "google:ada", "owner");
+      await r.createInvite({ board: b.id, email: "ada@gmail.com", role: "annotator", by: "google:root" });
+      const direct = await r.boardsForUser("google:ada", "ADA@GMAIL.COM");
+      expect(direct.map(x => [x.id, x.role]).sort()).toEqual([[b.id, "annotator"], [bPriv.id, "owner"]].sort());
     });
 
     test("createTenant: a domain has one tenant (case-insensitive); null domains are not unique", async () => {

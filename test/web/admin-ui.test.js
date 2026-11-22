@@ -102,8 +102,13 @@ describe("httpAdmin (web/adapters/admin/http.js)", () => {
     };
     const api = httpAdmin({ origin: "https://plenary.example/", token: "tok-secret-123", fetch: fakeFetch });
 
+    await api.listTenants();
+    await api.createTenant({ name: "Design Lab" });
+    await api.listTenantMembers("t-1");
+    await api.addTenantMember("t-1", "friend@gmail.com");
+    await api.removeTenantMember("t-1", "friend@gmail.com");
     await api.listBoards();
-    await api.createBoard({ title: "Roadmap", memberRole: "editor" });
+    await api.createBoard({ title: "Roadmap", memberRole: "editor", tenant: "t-1" });
     await api.listLinks("b-1");
     await api.createLink("b-1", { role: "viewer", expiresAt: 999999 });
     await api.revokeLink("b-1", "lnk-1");
@@ -112,10 +117,15 @@ describe("httpAdmin (web/adapters/admin/http.js)", () => {
     await api.revokeInvite("b-1", "inv-1");
     await api.setGrant("b-1", "google:123", "editor");
     await api.boardAudit("b-1", { limit: 25, before: "1000:5" });
-    await api.adminAudit({ board: "b-1", limit: 10, before: "2000:9" });
+    await api.adminAudit({ tenant: "t-1", board: "b-1", limit: 10, before: "2000:9" });
 
     expect(calls.every(c => c.headers.Authorization === "Bearer tok-secret-123")).toBe(true);
     expect(calls.map(c => `${c.method} ${c.url}`)).toEqual([
+      "GET https://plenary.example/tenants",
+      "POST https://plenary.example/tenants",
+      "GET https://plenary.example/tenants/t-1/members",
+      "POST https://plenary.example/tenants/t-1/members",
+      "DELETE https://plenary.example/tenants/t-1/members/friend%40gmail.com",
       "GET https://plenary.example/boards",
       "POST https://plenary.example/boards",
       "GET https://plenary.example/boards/b-1/links",
@@ -126,10 +136,12 @@ describe("httpAdmin (web/adapters/admin/http.js)", () => {
       "DELETE https://plenary.example/boards/b-1/invites/inv-1",
       "PUT https://plenary.example/boards/b-1/grants/google%3A123",
       "GET https://plenary.example/boards/b-1/audit?limit=25&before=1000%3A5",
-      "GET https://plenary.example/admin/audit?board=b-1&limit=10&before=2000%3A9",
+      "GET https://plenary.example/admin/audit?tenant=t-1&board=b-1&limit=10&before=2000%3A9",
     ]);
-    expect(calls[1].body).toEqual({ title: "Roadmap", memberRole: "editor" });
-    expect(calls[8].body).toEqual({ role: "editor" });
+    expect(calls[1].body).toEqual({ name: "Design Lab" });
+    expect(calls[3].body).toEqual({ email: "friend@gmail.com" });
+    expect(calls[6].body).toEqual({ title: "Roadmap", memberRole: "editor", tenant: "t-1" });
+    expect(calls[13].body).toEqual({ role: "editor" });
   });
 
   test("throws structured { status, code, message } errors on HTTP failure, malformed JSON, and network failure", async () => {
@@ -305,6 +317,111 @@ describe("mountBoardsHome (web/adapters/dom/admin.js)", () => {
     expect(reloginBtn).not.toBe(null);
     reloginBtn.click();
     expect(relogged).toBe(true);
+    view.destroy();
+  });
+
+  test("fresh @gmail.com user sees Create Org card, creates org to unlock New Board + Org & Members, manages members, and switches orgs", async () => {
+    const { root } = installStubDom();
+    const tenants = [];
+    const membersBy = {};
+    const createdBoards = [];
+    let orgSeq = 0;
+
+    const admin = {
+      listBoards: async () => ({ isAdmin: tenants.some(t => t.isAdmin), boards: [] }),
+      listTenants: async () => ({ tenants: [...tenants] }),
+      createTenant: async ({ name }) => {
+        const t = { id: `t-org${++orgSeq}`, name, domain: null, isAdmin: true };
+        tenants.push(t);
+        membersBy[t.id] = [];
+        return { tenant: t };
+      },
+      listTenantMembers: async tid => ({ members: [...(membersBy[tid] ?? [])], admins: ["google:1", "email:you@gmail.com"] }),
+      addTenantMember: async (tid, email) => {
+        const e = email.trim().toLowerCase();
+        membersBy[tid] = [...(membersBy[tid] ?? []), e];
+        return { email: e };
+      },
+      removeTenantMember: async (tid, email) => {
+        membersBy[tid] = (membersBy[tid] ?? []).filter(m => m !== email);
+      },
+      createBoard: async o => {
+        createdBoards.push(o);
+        return { board: { id: "b-1", tenant: o.tenant ?? tenants[0].id, title: o.title, memberRole: o.memberRole, createdAt: 1000 } };
+      },
+      adminAudit: async () => ({ events: [], nextBefore: null }),
+    };
+
+    const view = mountBoardsHome({
+      root,
+      admin,
+      me: { user: "google:1", name: "You", email: "you@gmail.com", domain: null },
+      onOpenBoard: () => {},
+    });
+    await view.ready;
+
+    // Fresh user sees Create Org card and does NOT yet see New Board or Org & Members tab
+    const card = root.find(e => e.getAttribute("data-create-org-card") != null);
+    expect(card).not.toBe(null);
+    expect(root.find(e => e.getAttribute("data-action") === "new-board")).toBe(null);
+    expect(root.find(e => e.getAttribute("data-tab") === "org")).toBe(null);
+
+    // Create first org from the welcoming card
+    const orgForm = card.find(e => e.getAttribute("data-form") === "create-org");
+    const orgInput = orgForm.find(e => e.getAttribute("name") === "orgName");
+    orgInput.value = "Home Studio";
+    orgInput.fire("input");
+    orgForm.fire("submit");
+    await flush();
+
+    // Immediately unlocks New Board, Org & Members tab, and hides the onboarding card
+    expect(root.find(e => e.getAttribute("data-create-org-card") != null)).toBe(null);
+    expect(root.find(e => e.getAttribute("data-action") === "new-board")).not.toBe(null);
+    const orgTab = root.find(e => e.getAttribute("data-tab") === "org");
+    expect(orgTab).not.toBe(null);
+
+    // Switch to Org & Members tab, add a member, verify rendered, then remove
+    orgTab.click();
+    await flush();
+    const addForm = root.find(e => e.getAttribute("data-form") === "add-member");
+    const emailInput = addForm.find(e => e.getAttribute("name") === "memberEmail");
+    emailInput.value = "Friend@Gmail.com";
+    emailInput.fire("input");
+    addForm.fire("submit");
+    await flush();
+
+    const memberRow = root.find(e => e.getAttribute("data-member-email") === "friend@gmail.com");
+    expect(memberRow).not.toBe(null);
+    memberRow.find(e => e.getAttribute("data-action") === "remove-member").click();
+    await flush();
+    expect(root.find(e => e.getAttribute("data-member-email") === "friend@gmail.com")).toBe(null);
+
+    // Create a second org from the Org & Members tab and switch between them
+    const createAnother = root.find(e => e.getAttribute("data-form") === "create-org");
+    const secondInput = createAnother.find(e => e.getAttribute("name") === "orgName");
+    secondInput.value = "Side Project";
+    secondInput.fire("input");
+    createAnother.fire("submit");
+    await flush();
+
+    expect(root.findAll(e => e.getAttribute("data-tenant-id") != null).map(e => e.getAttribute("data-tenant-id"))).toEqual(["t-org1", "t-org2"]);
+
+    // Switch back to t-org1, open New Board modal, select t-org2, and submit
+    root.find(e => e.getAttribute("data-tenant-id") === "t-org1").click();
+    await flush();
+    root.find(e => e.getAttribute("data-action") === "new-board").click();
+    const modalForm = root.find(e => e.getAttribute("aria-label") === "New Board");
+    const tenantSel = modalForm.find(e => e.getAttribute("name") === "tenant");
+    expect(tenantSel).not.toBe(null);
+    tenantSel.value = "t-org2";
+    tenantSel.fire("change");
+    const titleIn = modalForm.find(e => e.getAttribute("name") === "title");
+    titleIn.value = "Board in Org 2";
+    titleIn.fire("input");
+    modalForm.fire("submit");
+    await flush();
+
+    expect(createdBoards).toEqual([{ title: "Board in Org 2", memberRole: "viewer", tenant: "t-org2" }]);
     view.destroy();
   });
 });

@@ -41,3 +41,21 @@ export async function migrate(tx, schema, tables) {
     if (r === null) await tx.unsafe(`CREATE TABLE "${s}".${name} (${cols})`);
   }
 }
+
+/**
+ * Adds a column to an existing table only if it is missing (least-privilege safe: checks information_schema first
+ * so a runtime role without ALTER privileges never runs ALTER TABLE against an already-migrated schema).
+ * @param {*} tx  a Bun SQL transaction
+ * @param {string} schema
+ * @param {string} table
+ * @param {string} column
+ * @param {string} typeDef  e.g. "TEXT"
+ */
+export async function ensureColumn(tx, schema, table, column, typeDef) {
+  const s = needSchema(schema);
+  const rows = await tx.unsafe(
+    "SELECT 1 AS x FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+    [s, table, column],
+  );
+  if (!rows.length) await tx.unsafe(`ALTER TABLE "${s}".${table} ADD COLUMN IF NOT EXISTS ${column} ${typeDef}`);
+}

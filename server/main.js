@@ -252,6 +252,23 @@ export function announcingRegistry(registry, bus, log) {
       if (typeof board === "string") await announce(board, String(user));
       return out;
     },
+    // Org membership changes affect every board in the tenant (via memberRole): announce { board } only on actual changes.
+    async addTenantMember(tenant, email) {
+      const out = await registry.addTenantMember(tenant, email);
+      if (out?.added) {
+        const boards = await registry.listBoards(tenant).catch(() => []);
+        for (const b of boards) await announce(b.id);
+      }
+      return out;
+    },
+    async removeTenantMember(tenant, email) {
+      const out = await registry.removeTenantMember(tenant, email);
+      if (out) {
+        const boards = await registry.listBoards(tenant).catch(() => []);
+        for (const b of boards) await announce(b.id);
+      }
+      return out;
+    },
   };
 }
 

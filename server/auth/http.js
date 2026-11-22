@@ -71,8 +71,9 @@
 //   (server/admin/boards.js). Infrastructure errors (a Registry or verifier that throws) give 503 `unavailable`.
 //   This handler never throws (the engine would turn a throw into a 500).
 
-import { b64url, unb64url, utf8, fromUtf8 } from "./util.js";
+import { b64url, unb64url, utf8, fromUtf8, higher, isTenantAdminRecord } from "./util.js";
 import { AdminError, listBoards, createBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant, listBoardAudit, listTenantAudit } from "../admin/boards.js";
+import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../admin/tenants.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
@@ -380,6 +381,12 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
 
   // ---- routes ----
   const admin = { registry, now };
+  const firstAdminTenant = async who => {
+    const list = typeof tenancy.tenantsFor === "function" ? await tenancy.tenantsFor(who) : [];
+    const adm = list.find(t => isTenantAdminRecord(t, who));
+    if (adm) return adm;
+    return tenancy.tenantOf(who);
+  };
   function auditQuery(url) {
     let limit = 50;
     if (url.searchParams.has("limit") && url.searchParams.get("limit") !== "") {
@@ -394,33 +401,95 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       before = raw;
     }
     const rawBoard = url.searchParams.get("board");
-    return { limit, before, board: rawBoard ? rawBoard : null };
+    const rawTenant = url.searchParams.get("tenant");
+    return { limit, before, board: rawBoard ? rawBoard : null, tenant: rawTenant ? rawTenant : null };
   }
   const routes = [
     ["/auth/login", { GET: () => beginLogin(null) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],
     ["/auth/logout", { GET: () => redirect(postLogoutUrl, [clearLogin]) }],
+    ["/tenants", {
+      GET: async req => {
+        const who = await caller(req);
+        return json(200, await listTenants({ caller: who }, { tenancy }));
+      },
+      POST: async req => {
+        const who = await caller(req);
+        const b = await body(req, ["name"]);
+        const tenant = await createPersonalTenant({ caller: who, name: b.name }, admin);
+        return json(201, { tenant });
+      },
+    }],
+    ["/tenants/:tenant/members", {
+      GET: async (req, p) => {
+        const who = await caller(req);
+        return json(200, await listTenantMembers({ caller: who, tenant: p.tenant }, admin));
+      },
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["email"]);
+        return json(201, await addTenantMember({ caller: who, tenant: p.tenant, email: b.email }, admin));
+      },
+    }],
+    ["/tenants/:tenant/members/:email", {
+      DELETE: async (req, p) => {
+        const who = await caller(req);
+        await removeTenantMember({ caller: who, tenant: p.tenant, email: p.email }, admin);
+        return json(204);
+      },
+    }],
     ["/admin/audit", { GET: async (req, url) => {
       const who = await caller(req);
-      const { limit, before, board } = auditQuery(url);
-      const t = await tenancy.tenantOf(who);
-      if (!t) throw new AdminError("forbidden", "not allowed");
-      return json(200, await listTenantAudit({ caller: who, tenant: t.id, board, limit, before }, admin));
+      const { limit, before, board, tenant: askedTenant } = auditQuery(url);
+      const tid = askedTenant ?? (await firstAdminTenant(who))?.id ?? null;
+      if (!tid) throw new AdminError("forbidden", "not allowed");
+      return json(200, await listTenantAudit({ caller: who, tenant: tid, board, limit, before }, admin));
     } }],
     ["/boards", {
       GET: async req => {
         const who = await caller(req);
-        const t = await tenancy.tenantOf(who);
-        if (!t) return json(200, { boards: [], isAdmin: false });
-        return json(200, await listBoards({ caller: who, tenant: t.id }, admin));
+        const tenantIds = new Set();
+        if (typeof tenancy.tenantsFor === "function") {
+          for (const t of await tenancy.tenantsFor(who)) tenantIds.add(t.id);
+        } else {
+          const t = await tenancy.tenantOf(who);
+          if (t) tenantIds.add(t.id);
+        }
+        const byId = new Map();
+        const merge = b => {
+          const cur = byId.get(b.id);
+          if (!cur) byId.set(b.id, b);
+          else cur.role = higher(cur.role, b.role);
+        };
+        let isAdmin = false;
+        for (const tid of tenantIds) {
+          const res = await listBoards({ caller: who, tenant: tid }, admin);
+          if (res.isAdmin) isAdmin = true;
+          for (const b of res.boards) merge(b);
+        }
+        // Indexed lookup for any boards where the caller has a direct grant, live invite, or live link use
+        // (e.g. invited personal-tenant guest), without scanning unrelated personal tenants.
+        if (typeof registry.boardsForUser === "function") {
+          const email = who.emailVerified === false ? null : (who.email ?? null);
+          for (const b of await registry.boardsForUser(who.user, email, { at: now() })) merge(b);
+        }
+        const boards = [...byId.values()].sort((a, b) => (b.createdAt !== a.createdAt ? b.createdAt - a.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+        return json(200, { boards, isAdmin });
       },
       POST: async req => {
         const who = await caller(req);
-        const b = await body(req, ["title", "memberRole"]);
-        const t = await tenancy.tenantOf(who);
-        if (!t) throw new AdminError("forbidden", "not allowed");
-        const board = await createBoard(defined({ caller: who, tenant: t.id, title: b.title, memberRole: b.memberRole }), admin);
+        const b = await body(req, ["title", "memberRole", "tenant"]);
+        let tid;
+        if (b.tenant !== undefined && b.tenant !== null) {
+          if (typeof b.tenant !== "string" || !b.tenant) throw refuse(400, "bad-request");
+          tid = b.tenant;
+        } else {
+          const t = await firstAdminTenant(who);
+          if (!t) throw new AdminError("forbidden", "not allowed");
+          tid = t.id;
+        }
+        const board = await createBoard(defined({ caller: who, tenant: tid, title: b.title, memberRole: b.memberRole }), admin);
         return json(201, { board });
       },
     }],
@@ -494,7 +563,9 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
       if (e instanceof Refusal) return e.res;
       if (e instanceof AdminError) {
         if (e.code === "forbidden") return err(403, "forbidden");
+        if (e.code === "not-found") return err(404, "not-found");
         if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
+        if (e.code === "limit") return err(429, "limit", { message: String(e.message).slice(0, 200) });
         if (e.code === "last-owner") return err(409, "last-owner");
         if (e.code === "owner-grant-failed") return err(503, "owner-grant-failed", { board: e.board });
       }

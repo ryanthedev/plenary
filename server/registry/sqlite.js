@@ -81,10 +81,17 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
 
   onBusyRetry(db, deadline, () => db.transaction(() => {
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenants (
-      id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
+      id TEXT PRIMARY KEY, name TEXT, domain TEXT UNIQUE, created_at INTEGER NOT NULL)`);
+    const tenantCols = db.query("PRAGMA table_info(reg_tenants)").all();
+    if (!tenantCols.some(c => c.name === "name")) db.run("ALTER TABLE reg_tenants ADD COLUMN name TEXT");
     db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_admins (
       tenant TEXT NOT NULL REFERENCES reg_tenants(id), member TEXT NOT NULL, n INTEGER NOT NULL,
       PRIMARY KEY (tenant, member))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_tenant_admins_member ON reg_tenant_admins (member)");
+    db.run(`CREATE TABLE IF NOT EXISTS reg_tenant_members (
+      tenant TEXT NOT NULL REFERENCES reg_tenants(id) ON DELETE CASCADE, email TEXT NOT NULL, added_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant, email))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_tenant_members_email ON reg_tenant_members (email)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_boards (
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES reg_tenants(id), title TEXT NOT NULL,
       member_role TEXT, created_at INTEGER NOT NULL)`);
@@ -92,11 +99,13 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run(`CREATE TABLE IF NOT EXISTS reg_grants (
       board TEXT NOT NULL REFERENCES reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n INTEGER NOT NULL,
       PRIMARY KEY (board, member))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_grants_member ON reg_grants (member)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_invites (
       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
       email TEXT NOT NULL, role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT,
       created_at INTEGER NOT NULL)`);
     db.run("CREATE INDEX IF NOT EXISTS reg_invites_board ON reg_invites (board, email)");
+    db.run("CREATE INDEX IF NOT EXISTS reg_invites_email ON reg_invites (email)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_links (
       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
       role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`);
@@ -104,6 +113,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     db.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
       PRIMARY KEY (board, member, link))`);
+    db.run("CREATE INDEX IF NOT EXISTS reg_link_uses_member ON reg_link_uses (member)");
     db.run(`CREATE TABLE IF NOT EXISTS reg_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL REFERENCES reg_tenants(id), board TEXT,
       actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT, at INTEGER NOT NULL)`);
@@ -113,14 +123,24 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   db.run(`PRAGMA busy_timeout=${wait}`);                     // start-up spent part of it; runtime gets the whole budget
 
   const q = {
-    tenant: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE id = ?"),
-    tenantByDomain: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE domain = ?"),
-    personalTenants: db.query("SELECT id, domain, created_at FROM reg_tenants WHERE domain IS NULL ORDER BY created_at ASC, id ASC"),
+    tenant: db.query("SELECT id, name, domain, created_at FROM reg_tenants WHERE id = ?"),
+    tenantByDomain: db.query("SELECT id, name, domain, created_at FROM reg_tenants WHERE domain = ?"),
+    personalTenants: db.query("SELECT id, name, domain, created_at FROM reg_tenants WHERE domain IS NULL ORDER BY created_at ASC, id ASC"),
     tenantExists: db.query("SELECT 1 AS x FROM reg_tenants WHERE id = ?"),
-    insTenant: db.query("INSERT INTO reg_tenants (id, domain, created_at) VALUES (?, ?, ?)"),
+    insTenant: db.query("INSERT INTO reg_tenants (id, name, domain, created_at) VALUES (?, ?, ?, ?)"),
     admins: db.query("SELECT member FROM reg_tenant_admins WHERE tenant = ? ORDER BY n"),
     adminN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_tenant_admins WHERE tenant = ?"),
     insAdmin: db.query("INSERT INTO reg_tenant_admins (tenant, member, n) VALUES (?, ?, ?) ON CONFLICT (tenant, member) DO NOTHING"),
+    insMember: db.query("INSERT INTO reg_tenant_members (tenant, email, added_at) VALUES (?, ?, ?) ON CONFLICT (tenant, email) DO NOTHING"),
+    delMember: db.query("DELETE FROM reg_tenant_members WHERE tenant = ? AND email = ?"),
+    members: db.query("SELECT email FROM reg_tenant_members WHERE tenant = ? ORDER BY email ASC"),
+    isMember: db.query("SELECT 1 AS x FROM reg_tenant_members WHERE tenant = ? AND email = ?"),
+    tenantsForMember: db.query("SELECT t.id, t.name, t.domain, t.created_at FROM reg_tenant_members m JOIN reg_tenants t ON t.id = m.tenant WHERE m.email = ? ORDER BY t.created_at ASC, t.id ASC"),
+    tenantsForAdmin1: db.query("SELECT DISTINCT t.id, t.name, t.domain, t.created_at FROM reg_tenant_admins a JOIN reg_tenants t ON t.id = a.tenant WHERE a.member = ? ORDER BY t.created_at ASC, t.id ASC"),
+    tenantsForAdmin2: db.query("SELECT DISTINCT t.id, t.name, t.domain, t.created_at FROM reg_tenant_admins a JOIN reg_tenants t ON t.id = a.tenant WHERE a.member IN (?, ?) ORDER BY t.created_at ASC, t.id ASC"),
+    grantsForUserAll: db.query("SELECT b.id, b.tenant, b.title, b.member_role, b.created_at, g.role FROM reg_grants g JOIN reg_boards b ON b.id = g.board WHERE g.member = ?"),
+    invitesForEmailAll: db.query("SELECT b.id, b.tenant, b.title, b.member_role, b.created_at, i.role, i.expires_at, i.revoked FROM reg_invites i JOIN reg_boards b ON b.id = i.board WHERE i.email = ?"),
+    linksForUserAll: db.query("SELECT b.id, b.tenant, b.title, b.member_role, b.created_at, l.role, l.expires_at, l.revoked FROM reg_link_uses u JOIN reg_links l ON l.id = u.link JOIN reg_boards b ON b.id = l.board WHERE u.member = ?"),
 
     board: db.query("SELECT id, tenant, title, member_role, created_at FROM reg_boards WHERE id = ?"),
     boardsByTenant: db.query("SELECT id, tenant, title, member_role, created_at FROM reg_boards WHERE tenant = ? ORDER BY created_at DESC, id ASC"),
@@ -168,7 +188,7 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   /** A fresh server-minted id: retried on the (astronomically rare) collision. */
   const fresh = (f, exists) => { let id; do id = f(); while (exists(id)); return id; };
 
-  const rowTenant = r => r && { id: r.id, domain: r.domain, admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
+  const rowTenant = r => r && { id: r.id, name: r.name ?? r.domain ?? "Personal Workspace", domain: r.domain, admins: q.admins.all(r.id).map(a => a.member), createdAt: r.created_at };
   const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, createdAt: r.created_at };
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at };
   const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at };
@@ -176,10 +196,10 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   // undefined → null (bun:sqlite refuses undefined bindings); everything else as given.
   const nz = v => (v === undefined ? null : v);
 
-  const createTenantTx = db.transaction((domain, admins, createdAt) => {
+  const createTenantTx = db.transaction((name, domain, admins, createdAt) => {
     if (domain && q.tenantByDomain.get(domain)) throw new Error("registry: domain already has a tenant");
     const id = fresh(mint.tenant, i => !!q.tenantExists.get(i));
-    q.insTenant.run(id, domain, createdAt);
+    q.insTenant.run(id, name, domain, createdAt);
     for (const a of admins) q.insAdmin.run(id, a, q.adminN.get(id).n);
     return rowTenant(q.tenant.get(id));
   });
@@ -187,6 +207,11 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   const addAdminTx = db.transaction((tenant, user) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
     q.insAdmin.run(tenant, user, q.adminN.get(tenant).n);
+  });
+
+  const addMemberTx = db.transaction((tenant, email, addedAt) => {
+    if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
+    return { added: q.insMember.run(tenant, email, addedAt).changes > 0 };
   });
 
   const createBoardTx = db.transaction((tenant, title, memberRole, createdAt) => {
@@ -232,10 +257,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
   });
 
   return {
-    async createTenant({ domain, admins = [] }) {
+    async createTenant({ name = null, domain, admins = [] }) {
       ready();
       const d = domain ? String(domain).toLowerCase() : null;
-      return createTenantTx.immediate(d, [...admins].map(String), now());
+      const trimmedName = typeof name === "string" ? name.trim() : "";
+      const n = trimmedName || d || "Personal Workspace";
+      return createTenantTx.immediate(n, d, [...admins].map(String), now());
     },
     async tenant(id) { ready(); return str(id) ? rowTenant(q.tenant.get(id)) ?? null : null; },
     async tenantByDomain(domain) {
@@ -250,6 +277,39 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
       addAdminTx.immediate(tenant, String(user));
+    },
+    async addTenantMember(tenant, email) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      const e = normEmail(email);
+      if (!e) throw new Error("registry: bad email");
+      return addMemberTx.immediate(tenant, e, now());
+    },
+    async removeTenantMember(tenant, email) {
+      ready();
+      const e = normEmail(email);
+      return str(tenant) && e ? q.delMember.run(tenant, e).changes > 0 : false;
+    },
+    async isTenantMember(tenant, email) {
+      ready();
+      const e = normEmail(email);
+      return Boolean(str(tenant) && e && q.isMember.get(tenant, e));
+    },
+    async tenantMembers(tenant) {
+      ready();
+      return str(tenant) ? q.members.all(tenant).map(r => r.email) : [];
+    },
+    async tenantsForMember(email) {
+      ready();
+      const e = normEmail(email);
+      return e ? q.tenantsForMember.all(e).map(rowTenant) : [];
+    },
+    async tenantsForAdmin(user, email = null) {
+      ready();
+      if (!str(user) || !user) return [];
+      const e = normEmail(email);
+      const rows = e ? q.tenantsForAdmin2.all(user, "email:" + e) : q.tenantsForAdmin1.all(user);
+      return rows.map(rowTenant);
     },
 
     async createBoard({ tenant, title = "", memberRole = "viewer" }) {
@@ -293,6 +353,29 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
         if (r != null) out.push({ ...b, role: r });
       }
       return out;
+    },
+    async boardsForUser(user, email = null, { at } = {}) {
+      ready();
+      if (!str(user) || !user) return [];
+      const t = Number.isFinite(at) ? at : now();
+      const e = normEmail(email);
+      const byId = new Map();
+      const bump = (row, role) => {
+        if (!role) return;
+        const cur = byId.get(row.id);
+        if (!cur) byId.set(row.id, { ...rowBoard(row), role });
+        else cur.role = higher(cur.role, role);
+      };
+      for (const r of q.grantsForUserAll.all(user)) bump(r, capTo(r.role, ROLES));
+      if (e) {
+        for (const r of q.invitesForEmailAll.all(e)) {
+          if (!r.revoked && (r.expires_at == null || t < r.expires_at)) bump(r, capTo(r.role, INVITE_ROLES));
+        }
+      }
+      for (const r of q.linksForUserAll.all(user)) {
+        if (!r.revoked && (r.expires_at == null || t < r.expires_at)) bump(r, capTo(r.role, LINK_ROLES));
+      }
+      return [...byId.values()].sort((a, b) => (b.createdAt !== a.createdAt ? b.createdAt - a.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     },
 
     async setGrant(board, user, role) {

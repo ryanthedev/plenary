@@ -16,7 +16,7 @@
 // ceil(users / USE_CHUNK) link-use queries (or one per user where the Registry has no `linkUsesFor`). Both feed
 // the same pure `combine`, so they can't disagree (test/auth/role-cache.test.js checks it on random registries).
 
-import { higher, capTo, normEmail, ROLES, LINK_ROLES, INVITE_ROLES } from "./util.js";
+import { rank, higher, capTo, normEmail, verifiedEmail, isTenantAdminRecord, ROLES, LINK_ROLES, INVITE_ROLES } from "./util.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
 /** @typedef {import("./registry-port.js").Role} Role */
@@ -35,25 +35,32 @@ export const USE_CHUNK = 1000;
  * re-check pass groups connections by exactly this key and looks its answers up with it.
  * @param {{ user: string, email?: string|null, domain?: string|null }} id
  */
-export const identityKey = id => `${id.user}\n${id.email ?? ""}\n${id.domain ?? ""}`;
+export const identityKey = id => `${id.user}\n${id.email ?? ""}\n${id.domain ?? ""}${id.emailVerified === false ? "\n0" : ""}`;
 
 const live = (x, t) => x && !x.revoked && (x.expiresAt == null || t < x.expiresAt);
 const okIdentity = id => !!id && typeof id.user === "string";
 
 /**
  * The rule itself, pure. `invites`: this board's invites to the identity's email; `links`: the link records of the
- * identity's uses (any board; only this board's count). Every stored role is capped: unknown roles count for
- * nothing; invites and memberRole stay below owner; links stay within LINK_ROLES.
- * @param {{ board: Board, tenant: Tenant|null, grant: Role|null, invites: Invite[], links: (Link|null)[] }} rows
+ * identity's uses (any board; only this board's count); `members`: optional org member emails (Set or string[]).
+ * Every stored role is capped: unknown roles count for nothing; invites and memberRole stay below owner; links stay
+ * within LINK_ROLES.
+ * @param {{ board: Board, tenant: Tenant|null, grant: Role|null, invites: Invite[], links: (Link|null)[], members?: Set<string>|string[]|null }} rows
  * @param {Identity} identity @param {number} t
  * @returns {Resolved}
  */
-export function combine({ board, tenant, grant, invites, links }, identity, t) {
+export function combine({ board, tenant, grant, invites, links, members = null }, identity, t) {
   let r = capTo(grant, ROLES), until = Infinity;
   const dep = x => { if (x.expiresAt != null && x.expiresAt < until) until = x.expiresAt; };
   for (const i of invites) if (live(i, t)) { r = higher(r, capTo(i.role, INVITE_ROLES)); dep(i); }
   for (const l of links) if (l && l.board === board.id && live(l, t)) { r = higher(r, capTo(l.role, LINK_ROLES)); dep(l); }
-  if (identity.domain && board.memberRole && tenant?.domain && tenant.domain === identity.domain) r = higher(r, capTo(board.memberRole, INVITE_ROLES));
+  if (board.memberRole && tenant) {
+    const vEmail = verifiedEmail(identity);
+    const isDomainMember = Boolean(identity.domain && tenant.domain && tenant.domain === identity.domain);
+    const isEmailMember = Boolean(vEmail && members && (members instanceof Set ? members.has(vEmail) : members.includes(vEmail)));
+    const isAdmin = isTenantAdminRecord(tenant, identity);
+    if (isDomainMember || isEmailMember || isAdmin) r = higher(r, capTo(board.memberRole, INVITE_ROLES));
+  }
   return { role: r ?? null, until };
 }
 
@@ -70,12 +77,26 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     if (!board) return { role: null, until: Infinity };
     const t = now();
     const grant = await registry.grant(board.id, identity.user);
-    const invites = identity.email ? await registry.invitesFor(board.id, identity.email) : [];
+    const invites = identity.email && identity.emailVerified !== false ? await registry.invitesFor(board.id, identity.email) : [];
     const links = [];
     for (const id of await registry.linkUses(board.id, identity.user)) links.push(await registry.link(id));
-    const tenant = identity.domain && board.memberRole ? await registry.tenant(board.tenant) : null;
-    const r = combine({ board, tenant, grant, invites, links }, identity, t);
-    // Board and tenant: the fields read never change. Links can (revokeLink): cap by every link record read.
+    let r = combine({ board, tenant: null, grant, invites, links }, identity, t);
+    const memberCap = board.memberRole ? capTo(board.memberRole, INVITE_ROLES) : null;
+    if (memberCap != null && rank(memberCap) > rank(r.role)) {
+      const tenant = await registry.tenant(board.tenant);
+      const vEmail = verifiedEmail(identity);
+      const alreadyMember = Boolean(tenant && ((identity.domain && tenant.domain && tenant.domain === identity.domain) || isTenantAdminRecord(tenant, identity)));
+      let members = null;
+      if (tenant && !alreadyMember && vEmail) {
+        if (typeof registry.isTenantMember === "function") {
+          if (await registry.isTenantMember(board.tenant, vEmail)) members = [vEmail];
+        } else if (typeof registry.tenantMembers === "function") {
+          members = await registry.tenantMembers(board.tenant);
+        }
+      }
+      r = combine({ board, tenant, grant, invites, links, members }, identity, t);
+    }
+    // Board and tenant: links can change via revokeLink; cap by every link record read.
     for (const l of links) if (l) r.until = Math.min(r.until, recordUntil(l));
     return r;
   }
@@ -99,7 +120,7 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     const grants = new Map((await registry.grants(board.id)).map(g => [g.user, g.role]));
     /** @type {Map<string, Invite[]>} normalized email → invites */
     const invitesBy = new Map();
-    if (all.some(id => id.email)) for (const i of await registry.invites(board.id)) {
+    if (all.some(id => id.email && id.emailVerified !== false)) for (const i of await registry.invites(board.id)) {
       const e = normEmail(i.email);
       if (!invitesBy.has(e)) invitesBy.set(e, []);
       invitesBy.get(e).push(i);
@@ -115,13 +136,51 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
     } else for (const u of users) uses.set(u, await registry.linkUses(board.id, u));
     let linkById = new Map();
     for (const ls of uses.values()) if (ls.length) { linkById = new Map((await registry.links(board.id)).map(l => [l.id, l])); break; }
-    const tenant = board.memberRole && all.some(id => id.domain) ? await registry.tenant(board.tenant) : null;
+    const memberCap = board.memberRole ? capTo(board.memberRole, INVITE_ROLES) : null;
+    const tenant = memberCap != null ? await registry.tenant(board.tenant) : null;
+    let members = null;
+    if (tenant && typeof registry.tenantMembers === "function") {
+      const needsMembers = all.some(id => {
+        const vEmail = verifiedEmail(id);
+        if (!vEmail) return false;
+        if (id.domain && tenant.domain && tenant.domain === id.domain) return false;
+        if (isTenantAdminRecord(tenant, id)) return false;
+        return true;
+      });
+      if (needsMembers) members = new Set(await registry.tenantMembers(board.tenant));
+    }
     for (const [k, id] of ids) {
-      const invites = id.email ? invitesBy.get(normEmail(id.email)) ?? [] : [];
+      const invites = id.email && id.emailVerified !== false ? invitesBy.get(normEmail(id.email)) ?? [] : [];
       const links = (uses.get(id.user) ?? []).map(l => linkById.get(l) ?? null);
-      out.set(k, { ...combine({ board, tenant, grant: grants.get(id.user) ?? null, invites, links }, id, t), identity: id });
+      out.set(k, { ...combine({ board, tenant, grant: grants.get(id.user) ?? null, invites, links, members }, id, t), identity: id });
     }
     return out;
+  }
+
+  /**
+   * Every tenant this identity belongs to: Workspace domain tenant, personal tenants where the identity is an admin,
+   * and any tenant where the identity's verified email is in `reg_tenant_members`. Deduplicated by tenant id.
+   * @returns {Promise<Tenant[]>}
+   */
+  async function tenantsFor(identity) {
+    if (!okIdentity(identity)) return [];
+    const seen = new Map();
+    const add = t => { if (t && !seen.has(t.id)) seen.set(t.id, t); };
+    if (identity.domain) add(await registry.tenantByDomain(identity.domain));
+    const vEmail = verifiedEmail(identity);
+    if (typeof registry.tenantsForAdmin === "function") {
+      for (const t of await registry.tenantsForAdmin(identity.user, vEmail)) {
+        if (isTenantAdminRecord(t, identity)) add(t);
+      }
+    } else if (typeof registry.listPersonalTenants === "function") {
+      for (const t of await registry.listPersonalTenants()) {
+        if (isTenantAdminRecord(t, identity)) add(t);
+      }
+    }
+    if (vEmail && typeof registry.tenantsForMember === "function") {
+      for (const t of await registry.tenantsForMember(vEmail)) add(t);
+    }
+    return [...seen.values()];
   }
 
   return {
@@ -147,22 +206,27 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
       return { board: l.board };
     },
 
-    /** The tenant an identity belongs to by Workspace domain, or a personal (`domain: null`) tenant
-     *  where this verified identity is an admin (or has a board grant/invite/link); else null. */
+    tenantsFor,
+
+    /** The primary tenant an identity belongs to (Workspace domain, personal org admin, org member, or personal
+     *  tenant where this identity has a board grant/invite/link); else null. */
     async tenantOf(identity) {
       if (!okIdentity(identity)) return null;
       if (identity.domain) return registry.tenantByDomain(identity.domain);
-      if (typeof registry.listPersonalTenants !== "function") return null;
-      const personal = await registry.listPersonalTenants();
-      if (!personal.length) return null;
-      const email = identity.user.startsWith("google:") ? normEmail(identity.email) : null;
-      for (const t of personal) {
-        if (!identity.user.startsWith("email:") && t.admins.includes(identity.user)) return t;
-        if (email && t.admins.includes("email:" + email)) return t;
+      const list = await tenantsFor(identity);
+      if (list.length) return list[0];
+      const email = verifiedEmail(identity);
+      if (typeof registry.boardsForUser === "function") {
+        const boards = await registry.boardsForUser(identity.user, email, { at: now() });
+        for (const b of boards) {
+          const t = await registry.tenant(b.tenant);
+          if (t && t.domain === null) return t;
+        }
+        return null;
       }
-      if (typeof registry.listBoardsFor === "function") {
+      if (typeof registry.listPersonalTenants === "function" && typeof registry.listBoardsFor === "function") {
         const at = now();
-        for (const t of personal) {
+        for (const t of await registry.listPersonalTenants()) {
           const boards = await registry.listBoardsFor(t.id, identity.user, { email, isMember: false, at });
           if (boards.length > 0) return t;
         }
@@ -294,7 +358,11 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
     entries.set(k, { board: b, user: identity.user, role, until });
     index(byBoard, b, k); index(byUser, ukey(b, identity.user), k);
   }
-  function dropBoard(b) { for (const k of [...(byBoard.get(b) ?? [])]) remove(k); }
+  function dropBoard(b) {
+    for (const k of [...(byBoard.get(b) ?? [])]) remove(k);
+    const tid = records.get("board:" + b)?.value?.tenant;
+    if (tid) records.delete("tenant:" + tid);
+  }
 
   return {
     /** A role for a hello: cached, or read and cached. @returns {Promise<Role|null>} */

@@ -71,7 +71,7 @@
 import { SQL } from "bun";
 import { mint } from "../auth/registry-port.js";
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../auth/util.js";
-import { needSchema, migrate } from "../pg/schema.js";
+import { needSchema, migrate, ensureColumn } from "../pg/schema.js";
 
 /**
  * Thrown by `setGrant` when the change would leave a board with no owner ("last-owner"), by a call that ran out of time
@@ -100,8 +100,9 @@ const ms = v => Math.max(1, Math.floor(Number(v) || 0));
  * order; a runtime role needs no sequence grant for them (identity sequences are used through the table's INSERT).
  */
 const REGISTRY_TABLE_DDL = {
-  reg_tenants: "id TEXT PRIMARY KEY, domain TEXT UNIQUE, created_at BIGINT NOT NULL",
+  reg_tenants: "id TEXT PRIMARY KEY, name TEXT, domain TEXT UNIQUE, created_at BIGINT NOT NULL",
   reg_tenant_admins: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), member TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (tenant, member)",
+  reg_tenant_members: "tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id) ON DELETE CASCADE, email TEXT NOT NULL, added_at BIGINT NOT NULL, PRIMARY KEY (tenant, email)",
   reg_boards: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), title TEXT NOT NULL, member_role TEXT, created_at BIGINT NOT NULL",
   reg_grants: "board TEXT NOT NULL REFERENCES $S.reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member)",
   reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
@@ -111,9 +112,14 @@ const REGISTRY_TABLE_DDL = {
 };
 /** Index name → "table (columns)"; created after the tables, only if missing (to_regclass), like the tables. */
 export const REGISTRY_INDEXES = {
+  reg_tenant_admins_member: "reg_tenant_admins (member)",
+  reg_tenant_members_email: "reg_tenant_members (email)",
   reg_boards_tenant: "reg_boards (tenant, created_at DESC, id ASC)",
+  reg_grants_member: "reg_grants (member)",
   reg_invites_board: "reg_invites (board, email)",
+  reg_invites_email: "reg_invites (email)",
   reg_links_board: "reg_links (board)",
+  reg_link_uses_member: "reg_link_uses (member)",
   reg_audit_tenant: "reg_audit (tenant, at DESC, id DESC)",
   reg_audit_board: "reg_audit (tenant, board, at DESC, id DESC)",
 };
@@ -151,7 +157,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const db = sql ?? new SQL({ url, ...(max ? { max } : {}),
     connection: { lock_timeout: String(lockMs), statement_timeout: String(stmtMs) } });
   let open = true;
-  const T = `"${s}".reg_tenants`, A = `"${s}".reg_tenant_admins`, BD = `"${s}".reg_boards`, G = `"${s}".reg_grants`,
+  const T = `"${s}".reg_tenants`, A = `"${s}".reg_tenant_admins`, M = `"${s}".reg_tenant_members`, BD = `"${s}".reg_boards`, G = `"${s}".reg_grants`,
     I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`, AU = `"${s}".reg_audit`;
 
   try {
@@ -161,6 +167,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await tx.unsafe("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', '0', true)", [String(lockMs)]);
       await tx.unsafe("SELECT pg_advisory_xact_lock(hashtext($1))", [`plenary-schema:${s}`]);
       await migrate(tx, s, registryTables(s));
+      await ensureColumn(tx, s, "reg_tenants", "name", "TEXT");
       for (const [name, def] of Object.entries(REGISTRY_INDEXES)) {
         const [{ r }] = await tx.unsafe("SELECT to_regclass($1) AS r", [`"${s}".${name}`]);
         if (r === null) await tx.unsafe(`CREATE INDEX ${name} ON "${s}".${def}`);
@@ -209,10 +216,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   };
 
   const getTenant = async (q, id) => {
-    const r = await one(q, `SELECT id, domain, created_at FROM ${T} WHERE id = $1`, [id]);
+    const r = await one(q, `SELECT id, name, domain, created_at FROM ${T} WHERE id = $1`, [id]);
     if (!r) return null;
     const admins = (await q.unsafe(`SELECT member FROM ${A} WHERE tenant = $1 ORDER BY n`, [id])).map(a => a.member);
-    return { id: r.id, domain: r.domain, admins, createdAt: num(r.created_at) };
+    return { id: r.id, name: r.name ?? r.domain ?? "Personal Workspace", domain: r.domain, admins, createdAt: num(r.created_at) };
   };
   const rowBoard = r => r && { id: r.id, tenant: r.tenant, title: r.title, memberRole: r.member_role, createdAt: num(r.created_at) };
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
@@ -221,16 +228,18 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const boardExists = async (q, id) => key(id) && !!(await one(q, `SELECT 1 AS x FROM ${BD} WHERE id = $1`, [id]));
 
   const api = {
-    async createTenant({ domain, admins = [] }) {
+    async createTenant({ name = null, domain, admins = [] }) {
       ready();
       const d = domain ? String(domain).toLowerCase() : null;
+      const trimmedName = typeof name === "string" ? name.trim() : "";
+      const n = trimmedName || d || "Personal Workspace";
       const list = [...admins].map(String);
       const createdAt = now();
       try {
         return await write(async tx => {
           if (d && (await one(tx, `SELECT 1 AS x FROM ${T} WHERE domain = $1`, [d]))) throw new Error("registry: domain already has a tenant");
           const id = await fresh(tx, mint.tenant, T);
-          await tx.unsafe(`INSERT INTO ${T} (id, domain, created_at) VALUES ($1, $2, $3)`, [id, d, createdAt]);
+          await tx.unsafe(`INSERT INTO ${T} (id, name, domain, created_at) VALUES ($1, $2, $3, $4)`, [id, n, d, createdAt]);
           for (const a of list) await tx.unsafe(`INSERT INTO ${A} (tenant, member) VALUES ($1, $2) ON CONFLICT (tenant, member) DO NOTHING`, [id, a]);
           return getTenant(tx, id);
         });
@@ -264,6 +273,61 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         await tx.unsafe(`INSERT INTO ${A} (tenant, member) VALUES ($1, $2) ON CONFLICT (tenant, member) DO NOTHING`, [tenant, String(user)]);
       });
+    },
+    async addTenantMember(tenant, email) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      const e = normEmail(email);
+      if (!e || !key(e)) throw new Error("registry: bad email");
+      const addedAt = now();
+      return write(async tx => {
+        if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
+        const res = await tx.unsafe(`INSERT INTO ${M} (tenant, email, added_at) VALUES ($1, $2, $3) ON CONFLICT (tenant, email) DO NOTHING`, [tenant, e, addedAt]);
+        return { added: res.count > 0 };
+      });
+    },
+    async removeTenantMember(tenant, email) {
+      ready();
+      const e = normEmail(email);
+      if (!key(tenant) || !e || !key(e)) return false;
+      return write(async tx => (await tx.unsafe(`DELETE FROM ${M} WHERE tenant = $1 AND email = $2`, [tenant, e])).count > 0);
+    },
+    async isTenantMember(tenant, email) {
+      ready();
+      const e = normEmail(email);
+      if (!key(tenant) || !e || !key(e)) return false;
+      return !!(await one(db, `SELECT 1 AS x FROM ${M} WHERE tenant = $1 AND email = $2`, [tenant, e]));
+    },
+    async tenantMembers(tenant) {
+      ready();
+      if (!key(tenant)) return [];
+      return (await db.unsafe(`SELECT email FROM ${M} WHERE tenant = $1 ORDER BY email COLLATE "C" ASC`, [tenant])).map(r => r.email);
+    },
+    async tenantsForMember(email) {
+      ready();
+      const e = normEmail(email);
+      if (!e || !key(e)) return [];
+      const rows = await db.unsafe(`SELECT t.id FROM ${M} m JOIN ${T} t ON t.id = m.tenant WHERE m.email = $1 ORDER BY t.created_at ASC, t.id ASC`, [e]);
+      const out = [];
+      for (const r of rows) {
+        const t = await getTenant(db, r.id);
+        if (t) out.push(t);
+      }
+      return out;
+    },
+    async tenantsForAdmin(user, email = null) {
+      ready();
+      if (!key(user) || !user) return [];
+      const e = normEmail(email);
+      const rows = e && key(e)
+        ? await db.unsafe(`SELECT DISTINCT t.id, t.created_at FROM ${A} a JOIN ${T} t ON t.id = a.tenant WHERE a.member IN ($1, $2) ORDER BY t.created_at ASC, t.id ASC`, [user, "email:" + e])
+        : await db.unsafe(`SELECT DISTINCT t.id, t.created_at FROM ${A} a JOIN ${T} t ON t.id = a.tenant WHERE a.member = $1 ORDER BY t.created_at ASC, t.id ASC`, [user]);
+      const out = [];
+      for (const r of rows) {
+        const t = await getTenant(db, r.id);
+        if (t) out.push(t);
+      }
+      return out;
     },
 
     async createBoard({ tenant, title = "", memberRole = "viewer" }) {
@@ -316,6 +380,33 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         if (r != null) out.push({ ...b, role: r });
       }
       return out;
+    },
+    async boardsForUser(user, email = null, { at } = {}) {
+      ready();
+      if (!key(user) || !user) return [];
+      const t = Number.isFinite(at) ? at : now();
+      const e = normEmail(email);
+      const byId = new Map();
+      const bump = (row, role) => {
+        if (!role) return;
+        const cur = byId.get(row.id);
+        if (!cur) byId.set(row.id, { ...rowBoard(row), role });
+        else cur.role = higher(cur.role, role);
+      };
+      for (const r of await db.unsafe(`SELECT b.id, b.tenant, b.title, b.member_role, b.created_at, g.role FROM ${G} g JOIN ${BD} b ON b.id = g.board WHERE g.member = $1`, [user])) {
+        bump(r, capTo(r.role, ROLES));
+      }
+      if (e && key(e)) {
+        for (const r of await db.unsafe(`SELECT b.id, b.tenant, b.title, b.member_role, b.created_at, i.role, i.expires_at, i.revoked FROM ${I} i JOIN ${BD} b ON b.id = i.board WHERE i.email = $1`, [e])) {
+          const exp = num(r.expires_at);
+          if (!r.revoked && (exp == null || t < exp)) bump(r, capTo(r.role, INVITE_ROLES));
+        }
+      }
+      for (const r of await db.unsafe(`SELECT b.id, b.tenant, b.title, b.member_role, b.created_at, l.role, l.expires_at, l.revoked FROM ${U} u JOIN ${L} l ON l.id = u.link JOIN ${BD} b ON b.id = l.board WHERE u.member = $1`, [user])) {
+        const exp = num(r.expires_at);
+        if (!r.revoked && (exp == null || t < exp)) bump(r, capTo(r.role, LINK_ROLES));
+      }
+      return [...byId.values()].sort((a, b) => (b.createdAt !== a.createdAt ? b.createdAt - a.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     },
 
     async setGrant(board, user, role) {

@@ -29,6 +29,7 @@ const parseCursor = before => {
 export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Tenant>} */ const tenants = new Map();
   /** @type {Map<string, string>} */ const byDomain = new Map();
+  /** @type {Map<string, Set<string>>} tenant id → lower-cased member emails */ const tenantMembersMap = new Map();
   /** @type {Map<string, Board>} */ const boards = new Map();
   /** @type {Map<string, Map<string, Role>>} */ const grants = new Map();
   /** @type {Map<string, Invite>} */ const invites = new Map();
@@ -38,12 +39,15 @@ export function memoryRegistry({ now = Date.now } = {}) {
   let auditSeq = 0;
   const copy = x => (x ? structuredClone(x) : null);
   const fresh = (map, f) => { let id; do id = f(); while (map.has(id)); return id; };
+  const cmpTenant = (a, b) => (a.createdAt !== b.createdAt ? a.createdAt - b.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
   return {
-    async createTenant({ domain, admins = [] }) {
+    async createTenant({ name = null, domain, admins = [] }) {
       const d = domain ? domain.toLowerCase() : null;
       if (d && byDomain.has(d)) throw new Error("registry: domain already has a tenant");
-      const t = { id: fresh(tenants, mint.tenant), domain: d, admins: [...admins], createdAt: now() };
+      const trimmedName = typeof name === "string" ? name.trim() : "";
+      const n = trimmedName || d || "Personal Workspace";
+      const t = { id: fresh(tenants, mint.tenant), name: n, domain: d, admins: [...admins], createdAt: now() };
       tenants.set(t.id, t);
       if (d) byDomain.set(d, t.id);
       return copy(t);
@@ -56,13 +60,64 @@ export function memoryRegistry({ now = Date.now } = {}) {
     async listPersonalTenants() {
       return [...tenants.values()]
         .filter(t => t.domain === null)
-        .sort((a, b) => (a.createdAt !== b.createdAt ? a.createdAt - b.createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .sort(cmpTenant)
         .map(copy);
     },
     async addTenantAdmin(tenant, user) {
       const t = tenants.get(tenant);
       if (!t) throw new Error("registry: no such tenant");
       if (!t.admins.includes(user)) t.admins.push(user);
+    },
+    async addTenantMember(tenant, email) {
+      if (typeof tenant !== "string" || !tenants.has(tenant)) throw new Error("registry: no such tenant");
+      const e = normEmail(email);
+      if (!e) throw new Error("registry: bad email");
+      if (!tenantMembersMap.has(tenant)) tenantMembersMap.set(tenant, new Set());
+      const s = tenantMembersMap.get(tenant);
+      const added = !s.has(e);
+      s.add(e);
+      return { added };
+    },
+    async removeTenantMember(tenant, email) {
+      if (typeof tenant !== "string") return false;
+      const e = normEmail(email);
+      if (!e) return false;
+      const s = tenantMembersMap.get(tenant);
+      if (!s) return false;
+      return s.delete(e);
+    },
+    async isTenantMember(tenant, email) {
+      if (typeof tenant !== "string") return false;
+      const e = normEmail(email);
+      if (!e) return false;
+      return Boolean(tenantMembersMap.get(tenant)?.has(e));
+    },
+    async tenantMembers(tenant) {
+      if (typeof tenant !== "string") return [];
+      const s = tenantMembersMap.get(tenant);
+      return s ? [...s].sort() : [];
+    },
+    async tenantsForMember(email) {
+      const e = normEmail(email);
+      if (!e) return [];
+      const out = [];
+      for (const [tid, s] of tenantMembersMap) {
+        if (s.has(e)) {
+          const t = tenants.get(tid);
+          if (t) out.push(t);
+        }
+      }
+      return out.sort(cmpTenant).map(copy);
+    },
+    async tenantsForAdmin(user, email = null) {
+      if (typeof user !== "string" || !user) return [];
+      const e = normEmail(email);
+      const emailKey = e ? "email:" + e : null;
+      const out = [];
+      for (const t of tenants.values()) {
+        if (t.admins.includes(user) || (emailKey && t.admins.includes(emailKey))) out.push(t);
+      }
+      return out.sort(cmpTenant).map(copy);
     },
 
     async createBoard({ tenant, title = "", memberRole = "viewer" }) {
@@ -97,6 +152,43 @@ export function memoryRegistry({ now = Date.now } = {}) {
         if (r != null) out.push({ ...copy(b), role: r });
       }
       return out;
+    },
+    async boardsForUser(user, email = null, { at } = {}) {
+      if (typeof user !== "string" || !user) return [];
+      const t = Number.isFinite(at) ? at : now();
+      const e = normEmail(email);
+      /** @type {Map<string, Role>} */
+      const rolesByBoard = new Map();
+      const bump = (bid, role) => {
+        if (!role) return;
+        rolesByBoard.set(bid, higher(rolesByBoard.get(bid) ?? null, role));
+      };
+      for (const [bid, g] of grants) {
+        const r = capTo(g.get(user) ?? null, ROLES);
+        if (r) bump(bid, r);
+      }
+      if (e) {
+        for (const i of invites.values()) {
+          if (i.email === e && !i.revoked && (i.expiresAt == null || t < i.expiresAt))
+            bump(i.board, capTo(i.role, INVITE_ROLES));
+        }
+      }
+      for (const [k, lids] of uses) {
+        const sep = k.indexOf("\n");
+        if (sep < 0 || k.slice(sep + 1) !== user) continue;
+        const bid = k.slice(0, sep);
+        for (const lid of lids) {
+          const l = links.get(lid);
+          if (l && l.board === bid && !l.revoked && (l.expiresAt == null || t < l.expiresAt))
+            bump(bid, capTo(l.role, LINK_ROLES));
+        }
+      }
+      const out = [];
+      for (const [bid, role] of rolesByBoard) {
+        const b = boards.get(bid);
+        if (b && role) out.push({ ...copy(b), role });
+      }
+      return out.sort(cmpBoard);
     },
 
     async setGrant(board, user, role) {

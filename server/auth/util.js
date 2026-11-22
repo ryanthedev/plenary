@@ -58,5 +58,34 @@ export function randomId(n) {
   return s;
 }
 
-/** Normalise an email for invite matching. */
+/** Normalise an email for invite and org-member matching. */
 export const normEmail = e => (typeof e === "string" ? e.trim().toLowerCase() : null);
+
+/**
+ * Verified email for an Identity, or null if absent/unverified.
+ * Google OIDC (`google:<sub>`) populates `email` only when `email_verified === true` and Google is authoritative;
+ * an explicit `emailVerified: false` always rejects. Non-Google identities (e.g. dev tokens) are not IdP-verified
+ * unless `emailVerified === true` is explicitly set.
+ */
+export function verifiedEmail(identity) {
+  if (!identity || typeof identity.user !== "string") return null;
+  if (identity.emailVerified === false) return null;
+  const e = normEmail(identity.email);
+  if (!e) return null;
+  if (identity.user.startsWith("google:")) return e;
+  return identity.emailVerified === true ? e : null;
+}
+
+/**
+ * Whether `caller` is an admin of tenant record `t` (by user id or by verified `email:<addr>` entry).
+ * Workspace tenant: `email:` requires `caller.domain === t.domain`.
+ * Personal tenant (`t.domain === null`): `email:` requires a consumer Google account (`!caller.domain`).
+ */
+export function isTenantAdminRecord(t, caller) {
+  if (!t || !caller || typeof caller.user !== "string") return false;
+  if (!caller.user.startsWith("email:") && Array.isArray(t.admins) && t.admins.includes(caller.user)) return true;
+  if (!caller.user.startsWith("google:") || caller.emailVerified === false) return false;
+  const email = normEmail(caller.email);
+  if (!email || !Array.isArray(t.admins) || !t.admins.includes("email:" + email)) return false;
+  return t.domain === null ? !caller.domain : caller.domain === t.domain;
+}

@@ -72,13 +72,29 @@ export function httpAdmin({ origin = "", token, fetch }) {
   }
 
   return {
+    listTenants() {
+      return request("GET", "/tenants");
+    },
+    createTenant({ name }) {
+      return request("POST", "/tenants", { name });
+    },
+    listTenantMembers(tenant) {
+      return request("GET", `/tenants/${enc(tenant)}/members`);
+    },
+    addTenantMember(tenant, email) {
+      return request("POST", `/tenants/${enc(tenant)}/members`, { email });
+    },
+    removeTenantMember(tenant, email) {
+      return request("DELETE", `/tenants/${enc(tenant)}/members/${enc(email)}`);
+    },
     listBoards() {
       return request("GET", "/boards");
     },
-    createBoard({ title, memberRole } = {}) {
+    createBoard({ title, memberRole, tenant } = {}) {
       const payload = {};
       if (title !== undefined) payload.title = title;
       if (memberRole !== undefined) payload.memberRole = memberRole;
+      if (tenant !== undefined && tenant !== null && tenant !== "") payload.tenant = tenant;
       return request("POST", "/boards", payload);
     },
     listLinks(board) {
@@ -109,8 +125,8 @@ export function httpAdmin({ origin = "", token, fetch }) {
     boardAudit(board, { limit, before } = {}) {
       return request("GET", `/boards/${enc(board)}/audit${query({ limit, before })}`);
     },
-    adminAudit({ board, limit, before } = {}) {
-      return request("GET", `/admin/audit${query({ board, limit, before })}`);
+    adminAudit({ tenant, board, limit, before } = {}) {
+      return request("GET", `/admin/audit${query({ tenant, board, limit, before })}`);
     },
   };
 }

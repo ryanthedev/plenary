@@ -353,6 +353,57 @@ const ADMIN_CSS = `
   color: var(--fg-dim, #625F57);
   margin: 4px 0 0;
 }
+.adm-org-card, .adm-org-panel {
+  background: var(--surface, #FFFFFF);
+  border: 1px solid var(--border, #E3E0D8);
+  border-radius: 14px;
+  padding: 20px 22px;
+  box-shadow: var(--shadow-sm, 0 1px 3px rgba(24, 24, 27, 0.06));
+  margin-bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.adm-org-card {
+  border-color: var(--accent, #3B48E8);
+  background: linear-gradient(180deg, var(--accent-soft, rgba(59, 72, 232, 0.06)) 0%, var(--surface, #FFFFFF) 100%);
+}
+.adm-org-card h2, .adm-org-panel h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.adm-org-card p, .adm-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg-muted, #52504A);
+}
+.adm-org-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.adm-org-pill {
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border, #E3E0D8);
+  background: var(--surface-subtle, #F2F0EB);
+  color: var(--fg, #18181B);
+  font: 500 13px/1 inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.adm-org-pill:hover { background: var(--surface-hover, #EBE8E1); }
+.adm-org-pill.active {
+  background: var(--accent-soft, rgba(59, 72, 232, 0.12));
+  border-color: var(--accent, #3B48E8);
+  color: var(--accent, #3B48E8);
+  font-weight: 600;
+}
 .adm-ico {
   width: 16px;
   height: 16px;
@@ -470,6 +521,9 @@ const AUDIT_LABELS = {
   "invite.revoke": "Revoked invite",
   "link.create": "Created share link",
   "link.revoke": "Revoked share link",
+  "tenant.create": "Created workspace",
+  "tenant.member.add": "Added org member",
+  "tenant.member.remove": "Removed org member",
 };
 
 function auditSummary(ev) {
@@ -481,6 +535,9 @@ function auditSummary(ev) {
   if (ev.action === "link.create") return `${label} (${d.role ?? ""})`;
   if (ev.action === "link.revoke") return `${label} (${d.role ?? ""})`;
   if (ev.action === "grant.set") return `${label} for ${ev.target ?? ""} → ${d.role ?? "removed"}`;
+  if (ev.action === "tenant.create") return `${label}${d.name ? ` "${d.name}"` : ""}`;
+  if (ev.action === "tenant.member.add") return `${label} ${d.email ?? ev.target ?? ""}`;
+  if (ev.action === "tenant.member.remove") return `${label} ${d.email ?? ev.target ?? ""}`;
   return `${label}${ev.target ? ` (${ev.target})` : ""}`;
 }
 
@@ -880,6 +937,8 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
   const state = {
     tab: "boards",
     boards: [],
+    tenants: [],
+    activeTenantId: null,
     isAdmin: false,
     loading: true,
     error: null,
@@ -890,8 +949,16 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     newOpen: false,
     newTitle: "",
     newMemberRole: "viewer",
+    newTenantId: "",
     creating: false,
     createError: null,
+    orgName: "",
+    creatingOrg: false,
+    orgError: null,
+    membersByTenant: {},
+    memberEmail: "",
+    memberBusy: false,
+    memberError: null,
     audit: [],
     auditNext: null,
     auditLoaded: false,
@@ -917,12 +984,22 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
   shell.append(navSlot, mainSlot);
   replace(root, shell, modalSlot);
 
+  const adminTenants = () => state.tenants.filter(t => t.isAdmin);
+  const activeTenant = () => state.tenants.find(t => t.id === state.activeTenantId) ?? adminTenants()[0] ?? state.tenants[0] ?? null;
+
   async function loadBoards() {
     state.loading = true; state.error = null; state.authExpired = false; render();
     try {
-      const res = await admin.listBoards();
+      const [res, tRes] = await Promise.all([
+        admin.listBoards(),
+        typeof admin.listTenants === "function" ? admin.listTenants().catch(() => ({ tenants: [] })) : Promise.resolve({ tenants: [] }),
+      ]);
       state.boards = Array.isArray(res?.boards) ? res.boards : [];
-      state.isAdmin = Boolean(res?.isAdmin);
+      state.tenants = Array.isArray(tRes?.tenants) ? tRes.tenants : [];
+      if (!state.activeTenantId || !state.tenants.some(t => t.id === state.activeTenantId)) {
+        state.activeTenantId = (adminTenants()[0] ?? state.tenants[0])?.id ?? null;
+      }
+      state.isAdmin = Boolean(res?.isAdmin) || adminTenants().length > 0;
     } catch (err) {
       state.authExpired = err?.status === 401;
       state.error = state.authExpired ? "Your sign-in has expired." : errMessage(err, "Failed to load boards");
@@ -932,10 +1009,115 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     }
   }
 
+  async function loadTenantMembers(tenantId) {
+    if (!tenantId || typeof admin.listTenantMembers !== "function") return;
+    const prev = state.membersByTenant[tenantId] ?? { members: [], admins: [], loaded: false, loading: false, error: null };
+    state.membersByTenant[tenantId] = { ...prev, loading: true, error: null };
+    render();
+    try {
+      const res = await admin.listTenantMembers(tenantId);
+      state.membersByTenant[tenantId] = {
+        members: Array.isArray(res?.members) ? res.members : [],
+        admins: Array.isArray(res?.admins) ? res.admins : [],
+        loaded: true,
+        loading: false,
+        error: null,
+      };
+    } catch (err) {
+      state.authExpired = err?.status === 401;
+      state.membersByTenant[tenantId] = {
+        ...prev,
+        loading: false,
+        error: state.authExpired ? "Your sign-in has expired." : errMessage(err, "Failed to load org members"),
+      };
+    } finally {
+      if (!destroyed) render();
+    }
+  }
+
+  async function submitCreateOrg(e) {
+    e?.preventDefault?.();
+    if (state.creatingOrg || typeof admin.createTenant !== "function") return;
+    const name = state.orgName.trim();
+    if (!name) { state.orgError = "Please enter a workspace name."; renderMain(); return; }
+    state.creatingOrg = true; state.orgError = null; render();
+    try {
+      const res = await admin.createTenant({ name });
+      if (res?.tenant) {
+        state.tenants = [...state.tenants, res.tenant];
+        state.activeTenantId = res.tenant.id;
+        state.isAdmin = true;
+        state.orgName = "";
+        state.notice = `Workspace "${res.tenant.name}" created.`;
+        state.auditLoaded = false;
+      }
+    } catch (err) {
+      state.orgError = errMessage(err, "Failed to create workspace");
+    } finally {
+      state.creatingOrg = false;
+      if (!destroyed) render();
+    }
+  }
+
+  async function submitAddMember(e) {
+    e?.preventDefault?.();
+    const t = activeTenant();
+    const email = state.memberEmail.trim();
+    if (!t || !email || state.memberBusy || typeof admin.addTenantMember !== "function") return;
+    state.memberBusy = true; state.memberError = null; render();
+    try {
+      const res = await admin.addTenantMember(t.id, email);
+      const added = res?.email ?? email.toLowerCase();
+      const cur = state.membersByTenant[t.id] ?? { members: [], admins: [], loaded: true, loading: false, error: null };
+      const members = cur.members.includes(added) ? cur.members : [...cur.members, added].sort();
+      state.membersByTenant[t.id] = { ...cur, members, loaded: true };
+      state.memberEmail = "";
+      state.notice = `Added ${added} to ${t.name}.`;
+    } catch (err) {
+      state.memberError = errMessage(err, "Failed to add member");
+    } finally {
+      state.memberBusy = false;
+      if (!destroyed) render();
+    }
+  }
+
+  async function onRemoveMember(tenantId, email) {
+    if (state.memberBusy || typeof admin.removeTenantMember !== "function") return;
+    state.memberBusy = true; state.memberError = null; render();
+    try {
+      await admin.removeTenantMember(tenantId, email);
+      const cur = state.membersByTenant[tenantId];
+      if (cur) {
+        state.membersByTenant[tenantId] = { ...cur, members: cur.members.filter(m => m !== email) };
+      }
+      state.notice = `Removed ${email}.`;
+    } catch (err) {
+      state.memberError = errMessage(err, "Failed to remove member");
+    } finally {
+      state.memberBusy = false;
+      if (!destroyed) render();
+    }
+  }
+
+  function selectTenant(tenantId) {
+    state.activeTenantId = tenantId;
+    state.memberError = null;
+    state.auditLoaded = false;
+    render();
+    const t = activeTenant();
+    if (state.tab === "org" && t?.isAdmin) {
+      const slot = state.membersByTenant[t.id];
+      if (!slot?.loaded && !slot?.loading) loadTenantMembers(t.id);
+    }
+  }
+
   async function loadTenantAudit(append = false) {
     state.auditLoading = true; state.auditError = null; render();
     try {
-      const res = await admin.adminAudit({ limit: 50, before: append ? state.auditNext : null });
+      const opts = { limit: 50, before: append ? state.auditNext : null };
+      const cur = activeTenant();
+      if (adminTenants().length > 1 && cur?.isAdmin) opts.tenant = cur.id;
+      const res = await admin.adminAudit(opts);
       const rows = Array.isArray(res?.events) ? res.events : [];
       state.audit = append ? [...state.audit, ...rows] : rows;
       state.auditNext = res?.nextBefore ?? null;
@@ -955,7 +1137,12 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     state.creating = true; state.createError = null; render();
     try {
       const memberRole = state.newMemberRole === "" ? null : state.newMemberRole;
-      const res = await admin.createBoard({ title: state.newTitle.trim(), memberRole });
+      const payload = { title: state.newTitle.trim(), memberRole };
+      const admList = adminTenants();
+      if (admList.length > 1) {
+        payload.tenant = state.newTenantId || (activeTenant()?.isAdmin ? activeTenant().id : admList[0].id);
+      }
+      const res = await admin.createBoard(payload);
       if (res?.board) {
         state.boards = [{ ...res.board, role: "owner" }, ...state.boards];
         state.newOpen = false;
@@ -1007,6 +1194,8 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
   function renderNewBoardModal() {
     if (!state.newOpen) { replace(modalSlot); return; }
     const close = () => { state.newOpen = false; state.createError = null; render(); };
+    const admList = adminTenants();
+    const chosenTenant = state.newTenantId || (activeTenant()?.isAdmin ? activeTenant().id : admList[0]?.id ?? "");
     replace(modalSlot,
       h("div.adm-veil", { onclick: e => { if (e.target === e.currentTarget) close(); } },
         h("form.adm-modal", { role: "dialog", "aria-modal": "true", "aria-label": "New Board", onsubmit: submitNewBoard },
@@ -1015,6 +1204,14 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
             h("button.adm-btn.sm", { type: "button", "data-action": "close-new", "aria-label": "Close", onclick: close }, ICONS.close())),
           h("div.adm-modal-body", {},
             state.createError ? h("div.adm-error", { role: "alert" }, h("span", {}, state.createError)) : null,
+            admList.length > 1 ? h("div.adm-field", {},
+              h("label", { for: "adm-new-tenant" }, "Workspace"),
+              h("select.adm-select", {
+                id: "adm-new-tenant",
+                name: "tenant",
+                value: chosenTenant,
+                onchange: e => { state.newTenantId = e.target.value; },
+              }, admList.map(t => h("option", { value: t.id, selected: chosenTenant === t.id }, t.name)))) : null,
             h("div.adm-field", {},
               h("label", { for: "adm-new-title" }, "Board title"),
               h("input.adm-input", {
@@ -1043,35 +1240,134 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
             h("button.adm-btn.primary", { type: "submit", "data-action": "submit-new-board", disabled: state.creating }, state.creating ? "Creating…" : "Create board")))));
   }
 
+  function renderCreateOrgCard() {
+    if (state.loading || state.error || state.isAdmin || typeof admin.createTenant !== "function") return null;
+    return h("section.adm-org-card", { "data-create-org-card": "" },
+      h("h2", {}, "Create Org / Workspace"),
+      h("p", {}, "Start your own workspace to create boards and invite collaborators by email."),
+      state.orgError ? h("div.adm-error", { role: "alert" }, h("span", {}, state.orgError)) : null,
+      h("form.adm-form-row", { "data-form": "create-org", onsubmit: submitCreateOrg },
+        h("input.adm-input", {
+          type: "text",
+          name: "orgName",
+          placeholder: "Workspace name (e.g. Design Studio)",
+          value: state.orgName,
+          oninput: e => { state.orgName = e.target.value; },
+        }),
+        h("button.adm-btn.primary", { type: "submit", "data-action": "create-org", disabled: state.creatingOrg },
+          ICONS.plus(), state.creatingOrg ? "Creating…" : "Create Workspace")));
+  }
+
+  function renderOrgView() {
+    const t = activeTenant();
+    const slot = t ? state.membersByTenant[t.id] : null;
+    const members = slot?.members ?? [];
+    const admins = slot?.admins ?? [];
+
+    const switcherPanel = h("section.adm-org-panel", {},
+      h("h2", {}, "Your Workspaces"),
+      state.tenants.length
+        ? h("div.adm-org-pills", {}, state.tenants.map(org => h("button.adm-org-pill" + (t && org.id === t.id ? ".active" : ""), {
+          type: "button",
+          "data-tenant-id": org.id,
+          onclick: () => selectTenant(org.id),
+        }, org.name, org.isAdmin ? h("span.adm-badge.owner", {}, "Admin") : h("span.adm-badge", {}, "Member"))))
+        : h("p.adm-hint", {}, "No workspaces yet."),
+      typeof admin.createTenant === "function" ? [
+        h("div.adm-section-label", {}, "Create another workspace"),
+        state.orgError ? h("div.adm-error", { role: "alert" }, h("span", {}, state.orgError)) : null,
+        h("form.adm-form-row", { "data-form": "create-org", onsubmit: submitCreateOrg },
+          h("input.adm-input", {
+            type: "text",
+            name: "orgName",
+            placeholder: "New workspace name",
+            value: state.orgName,
+            oninput: e => { state.orgName = e.target.value; },
+          }),
+          h("button.adm-btn.primary", { type: "submit", "data-action": "create-org", disabled: state.creatingOrg },
+            ICONS.plus(), state.creatingOrg ? "Creating…" : "Create Workspace")),
+      ] : null);
+
+    if (!t || !t.isAdmin) {
+      return h("div", {}, switcherPanel,
+        t ? h("div.adm-empty", {}, h("h3", {}, t.name), h("p", {}, "Only workspace admins can manage org members.")) : null);
+    }
+
+    const membersPanel = h("section.adm-org-panel", { "data-org-members-panel": t.id },
+      h("h2", {}, `Members · ${t.name}`),
+      h("p.adm-hint", {}, "Org members automatically get each board's default org role (memberRole)."),
+      state.memberError ? h("div.adm-error", { role: "alert" }, h("span", {}, state.memberError)) : null,
+      slot?.error ? renderErrorBanner(slot.error, "retry-members", () => loadTenantMembers(t.id)) : null,
+      h("form.adm-form-row", { "data-form": "add-member", onsubmit: submitAddMember },
+        h("input.adm-input", {
+          type: "email",
+          name: "memberEmail",
+          placeholder: "Add member by email (e.g. friend@gmail.com)",
+          value: state.memberEmail,
+          oninput: e => { state.memberEmail = e.target.value; },
+        }),
+        h("button.adm-btn.primary", { type: "submit", "data-action": "add-member", disabled: state.memberBusy },
+          ICONS.plus(), state.memberBusy ? "Adding…" : "Add member")),
+      slot?.loading && !slot?.loaded
+        ? h("div.adm-loading", {}, "Loading members…")
+        : h("div.adm-list", {},
+          members.length === 0
+            ? h("div.adm-empty", {}, h("p", {}, "No org members added yet."))
+            : members.map(email => h("div.adm-row", { "data-member-email": email },
+              h("div.adm-row-main", {},
+                h("div.adm-row-title", {}, email),
+                h("div.adm-row-sub", {}, "Org member")),
+              h("div.adm-row-acts", {},
+                h("button.adm-btn.sm.danger", {
+                  type: "button",
+                  "data-action": "remove-member",
+                  disabled: state.memberBusy,
+                  onclick: () => onRemoveMember(t.id, email),
+                }, "Remove"))))),
+      admins.length ? [
+        h("div.adm-section-label", {}, `Admins (${admins.length})`),
+        h("div.adm-list", {}, admins.map(a => h("div.adm-row", { "data-admin-entry": a },
+          h("div.adm-row-main", {}, h("div.adm-row-title", {}, a)),
+          h("span.adm-badge.owner", {}, "Admin")))),
+      ] : null);
+
+    return h("div", {}, switcherPanel, membersPanel);
+  }
+
   function renderBoardsView() {
     if (state.loading) return h("div.adm-loading", {}, "Loading boards…");
     const items = filteredBoards();
+    const createOrgCard = renderCreateOrgCard();
     if (!items.length) {
       const searching = state.search.trim().length > 0;
-      return h("div.adm-empty", {},
-        h("h3", {}, searching ? "No matching boards" : "No boards yet"),
-        h("p", {}, searching ? `No boards match "${state.search.trim()}".` : state.isAdmin ? "Create your first board to start collaborating." : "Boards shared with you will appear here."),
-        !searching && state.isAdmin ? h("button.adm-btn.primary", {
-          type: "button",
-          "data-action": "new-board-empty",
-          onclick: () => { state.newOpen = true; render(); },
-        }, ICONS.plus(), "New Board") : null);
+      return h("div", {},
+        createOrgCard,
+        h("div.adm-empty", {},
+          h("h3", {}, searching ? "No matching boards" : "No boards yet"),
+          h("p", {}, searching ? `No boards match "${state.search.trim()}".` : state.isAdmin ? "Create your first board to start collaborating." : "Boards shared with you will appear here."),
+          !searching && state.isAdmin ? h("button.adm-btn.primary", {
+            type: "button",
+            "data-action": "new-board-empty",
+            onclick: () => { state.newOpen = true; render(); },
+          }, ICONS.plus(), "New Board") : null));
     }
-    return h("div.adm-grid", {}, items.map(b => {
-      const title = b.title || "Untitled board";
-      const canShare = b.role === "owner" || state.isAdmin;
-      return h("article.adm-card", { "data-board-id": b.id },
-        h("div.adm-thumb", { onclick: () => onOpenBoard?.(b.id) }, boardPreviewSvg()),
-        h("div.adm-card-body", {},
-          h("div.adm-card-top", {},
-            h("span.adm-card-title", { title, onclick: () => onOpenBoard?.(b.id) }, title),
-            b.role ? h("span.adm-badge" + (b.role === "owner" ? ".owner" : ""), {}, b.role) : null),
-          h("div.adm-card-meta", {},
-            h("span", {}, formatDate(b.createdAt)),
-            h("div.adm-card-acts", {},
-              canShare ? h("button.adm-btn.sm", { type: "button", "data-action": "share-board", onclick: () => openShare(b) }, ICONS.share(), "Share") : null,
-              h("button.adm-btn.sm", { type: "button", "data-action": "open-board", onclick: () => onOpenBoard?.(b.id) }, "Open")))));
-    }));
+    return h("div", {},
+      createOrgCard,
+      h("div.adm-grid", {}, items.map(b => {
+        const title = b.title || "Untitled board";
+        const canShare = b.role === "owner" || state.isAdmin;
+        return h("article.adm-card", { "data-board-id": b.id },
+          h("div.adm-thumb", { onclick: () => onOpenBoard?.(b.id) }, boardPreviewSvg()),
+          h("div.adm-card-body", {},
+            h("div.adm-card-top", {},
+              h("span.adm-card-title", { title, onclick: () => onOpenBoard?.(b.id) }, title),
+              b.role ? h("span.adm-badge" + (b.role === "owner" ? ".owner" : ""), {}, b.role) : null),
+            h("div.adm-card-meta", {},
+              h("span", {}, formatDate(b.createdAt)),
+              h("div.adm-card-acts", {},
+                canShare ? h("button.adm-btn.sm", { type: "button", "data-action": "share-board", onclick: () => openShare(b) }, ICONS.share(), "Share") : null,
+                h("button.adm-btn.sm", { type: "button", "data-action": "open-board", onclick: () => onOpenBoard?.(b.id) }, "Open")))));
+      })));
   }
 
   function renderErrorBanner(msg, retryAction, retryFn) {
@@ -1105,16 +1401,19 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
   }
 
   function renderMain() {
+    const active = activeTenant();
+    const heading = state.tab === "boards" ? "Boards" : state.tab === "org" ? "Org & Members" : "Tenant Audit Log";
+    const subtitle = active?.name ?? me?.domain ?? null;
     replace(mainSlot,
       h("div.adm-head", {},
         h("div", {},
-          h("h1.adm-title", {}, state.tab === "boards" ? "Boards" : "Tenant Audit Log"),
-          me?.domain ? h("p.adm-sub", {}, me.domain) : null)),
+          h("h1.adm-title", {}, heading),
+          subtitle ? h("p.adm-sub", {}, subtitle) : null)),
       state.notice ? h("div.adm-notice", { role: "status" },
         h("span", {}, state.notice),
         h("button.adm-btn.sm", { type: "button", "data-action": "dismiss-notice", "aria-label": "Dismiss notice", onclick: () => { state.notice = null; renderMain(); } }, ICONS.close())) : null,
       state.tab === "boards" && state.error ? renderErrorBanner(state.error, "retry", loadBoards) : null,
-      state.tab === "boards" ? renderBoardsView() : renderAuditView());
+      state.tab === "boards" ? renderBoardsView() : state.tab === "org" ? renderOrgView() : renderAuditView());
   }
 
   function render() {
@@ -1127,6 +1426,7 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     searchInput.setAttribute("aria-label", state.tab === "boards" ? "Search boards" : "Search audit log");
     searchInput.setAttribute("placeholder", state.tab === "boards" ? "Search boards…" : "Filter activity…");
     if (searchInput.value !== state.search) searchInput.value = state.search;
+    const canManageOrg = state.isAdmin && typeof admin.listTenantMembers === "function";
     const nav = h("header.adm-nav", {},
       h("div.adm-brand", {},
         h("span.adm-brand-mark", {}, ICONS.brand()),
@@ -1136,6 +1436,17 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
           type: "button", role: "tab", "aria-selected": String(state.tab === "boards"), "data-tab": "boards",
           onclick: () => { state.tab = "boards"; render(); },
         }, "Boards"),
+        canManageOrg ? h("button.adm-tab" + (state.tab === "org" ? ".active" : ""), {
+          type: "button", role: "tab", "aria-selected": String(state.tab === "org"), "data-tab": "org",
+          onclick: () => {
+            state.tab = "org"; render();
+            const t = activeTenant();
+            if (t?.isAdmin) {
+              const slot = state.membersByTenant[t.id];
+              if (!slot?.loaded && !slot?.loading) loadTenantMembers(t.id);
+            }
+          },
+        }, "Org & Members") : null,
         state.isAdmin ? h("button.adm-tab" + (state.tab === "audit" ? ".active" : ""), {
           type: "button", role: "tab", "aria-selected": String(state.tab === "audit"), "data-tab": "audit",
           onclick: () => {

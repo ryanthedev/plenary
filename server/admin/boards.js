@@ -10,7 +10,7 @@
 // Refusals throw AdminError. For anything naming a board, an unknown board and a caller without rights get the
 // same `forbidden` error, so existence doesn't leak.
 
-import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail } from "../auth/util.js";
+import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail, verifiedEmail, isTenantAdminRecord } from "../auth/util.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
 /** @typedef {import("../auth/idp-port.js").Identity} Identity */
@@ -42,13 +42,7 @@ const bad = m => new AdminError("bad-request", m);
 async function isTenantAdmin(registry, caller, tenantId) {
   if (!caller || typeof caller.user !== "string" || typeof tenantId !== "string") return false;
   const t = await registry.tenant(tenantId);
-  if (!t) return false;
-  if (!caller.user.startsWith("email:") && t.admins.includes(caller.user)) return true;
-  if (!caller.user.startsWith("google:")) return false;
-  const email = normEmail(caller.email);
-  if (!email || !t.admins.includes("email:" + email)) return false;
-  // Workspace tenant: caller's hd must match t.domain. Personal tenant (t.domain === null): consumer Google account (no hd).
-  return t.domain === null ? !caller.domain : caller.domain === t.domain;
+  return isTenantAdminRecord(t, caller);
 }
 
 /** The board, if the caller may manage it; else throws `forbidden` (unknown board included). */
@@ -79,11 +73,17 @@ async function recordAudit(registry, entry) {
 export async function listBoards({ caller, tenant }, { registry, now = Date.now }) {
   if (!caller || typeof caller.user !== "string" || typeof tenant !== "string") return { boards: [], isAdmin: false };
   const t = await registry.tenant(tenant);
-  const isMember = Boolean(t && t.domain && caller.domain && t.domain === caller.domain);
-  const [boards, isAdmin] = await Promise.all([
-    registry.listBoardsFor(tenant, caller.user, { email: caller.email ?? null, isMember, at: now() }),
-    isTenantAdmin(registry, caller, tenant),
-  ]);
+  const isAdmin = isTenantAdminRecord(t, caller);
+  const vEmail = verifiedEmail(caller);
+  const isDomainMember = Boolean(t && t.domain && caller.domain && t.domain === caller.domain);
+  let isEmailMember = false;
+  if (t && !isAdmin && !isDomainMember && vEmail) {
+    if (typeof registry.isTenantMember === "function") isEmailMember = await registry.isTenantMember(tenant, vEmail);
+    else if (typeof registry.tenantMembers === "function") isEmailMember = (await registry.tenantMembers(tenant)).includes(vEmail);
+  }
+  const isMember = Boolean(isDomainMember || isAdmin || isEmailMember);
+  const email = caller.emailVerified === false ? null : (caller.email ?? null);
+  const boards = await registry.listBoardsFor(tenant, caller.user, { email, isMember, at: now() });
   return { boards, isAdmin };
 }
 

@@ -16,7 +16,8 @@
 //                  the tenant's own domain (anything else could never match, so it is refused).
 // A bare address (`alice@acme.com`) is taken as email:<addr>. Emails are lower-cased. Control characters are refused.
 
-import { normEmail } from "../auth/util.js";
+import { normEmail, verifiedEmail, isTenantAdminRecord } from "../auth/util.js";
+import { AdminError } from "./boards.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
 /** @typedef {import("../auth/registry-port.js").Tenant} Tenant */
@@ -148,4 +149,147 @@ export async function bootstrapTenant({ registry, domain, personal = false, admi
     added.push(a);
   }
   return { tenant: (await registry.tenant(t.id)) ?? t, created, added };
+}
+
+// ---- Self-serve personal orgs & email-based org membership ----
+
+const MEMBER_EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const ORG_NAME_MAX = 80;
+export const MAX_PERSONAL_ORGS_PER_USER = 20;
+export const MAX_TENANT_MEMBERS = 500;
+
+const okAuthenticatedCaller = caller =>
+  Boolean(caller && typeof caller.user === "string" && (caller.user.startsWith("google:") || caller.user.startsWith("dev:")));
+
+async function recordAudit(registry, entry) {
+  if (typeof registry.appendAudit === "function") await registry.appendAudit(entry);
+}
+
+/**
+ * POST /tenants — any authenticated Google or dev user creates their own personal org (`domain: null`).
+ * @param {{ caller: import("../auth/idp-port.js").Identity, name: unknown }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function createPersonalTenant({ caller, name }, { registry, now = Date.now }) {
+  if (!okAuthenticatedCaller(caller)) throw new AdminError("forbidden", "not allowed");
+  if (typeof name !== "string" || CONTROL.test(name)) throw new AdminError("bad-request", "bad org name");
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > ORG_NAME_MAX) throw new AdminError("bad-request", `org name must be 1..${ORG_NAME_MAX} characters`);
+  const vEmail = verifiedEmail(caller);
+  const existing = typeof registry.tenantsForAdmin === "function"
+    ? await registry.tenantsForAdmin(caller.user, vEmail)
+    : (typeof registry.listPersonalTenants === "function" ? await registry.listPersonalTenants() : []);
+  const personalCount = existing.filter(t => t.domain === null && isTenantAdminRecord(t, caller)).length;
+  if (personalCount >= MAX_PERSONAL_ORGS_PER_USER) {
+    throw new AdminError("limit", `maximum of ${MAX_PERSONAL_ORGS_PER_USER} personal workspaces reached`);
+  }
+  const admins = [caller.user];
+  if (vEmail) admins.push("email:" + vEmail);
+  const t = await registry.createTenant({ name: trimmed, domain: null, admins });
+  await recordAudit(registry, {
+    tenant: t.id,
+    board: null,
+    actor: caller.user,
+    action: "tenant.create",
+    target: t.id,
+    detail: { name: t.name },
+    at: now(),
+  });
+  return { id: t.id, name: t.name, domain: t.domain, isAdmin: true };
+}
+
+/**
+ * GET /tenants — every org the authenticated caller is an admin of or a member of (domain or reg_tenant_members).
+ * @param {{ caller: import("../auth/idp-port.js").Identity }} req
+ * @param {{ tenancy: { tenantsFor(id: object): Promise<Tenant[]> } }} deps
+ */
+export async function listTenants({ caller }, { tenancy }) {
+  if (!caller || typeof caller.user !== "string") return { tenants: [] };
+  const list = typeof tenancy.tenantsFor === "function" ? await tenancy.tenantsFor(caller) : [];
+  return {
+    tenants: list.map(t => ({
+      id: t.id,
+      name: t.name ?? t.domain ?? "Personal Workspace",
+      domain: t.domain,
+      isAdmin: isTenantAdminRecord(t, caller),
+    })),
+  };
+}
+
+/**
+ * GET /tenants/:tenant/members — org admins only; 404 for unknown tenant, 403 for non-admin.
+ * Returns human-friendly admin identifiers (stripped `email:` addresses and non-`google:` ids) without leaking raw
+ * internal `google:<sub>` ids.
+ * @param {{ caller: import("../auth/idp-port.js").Identity, tenant: string }} req
+ * @param {{ registry: Registry }} deps
+ */
+export async function listTenantMembers({ caller, tenant }, { registry }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!isTenantAdminRecord(t, caller)) throw new AdminError("forbidden", "not allowed");
+  const members = await registry.tenantMembers(t.id);
+  const emailAdmins = t.admins.filter(a => a.startsWith("email:")).map(a => a.slice(6));
+  const otherAdmins = t.admins.filter(a => !a.startsWith("email:") && !a.startsWith("google:"));
+  const admins = [...new Set([...emailAdmins, ...otherAdmins])];
+  return { members, admins };
+}
+
+/**
+ * POST /tenants/:tenant/members — org admins only; personal orgs (`domain === null`) only; validates email, enforces
+ * member cap, adds to reg_tenant_members, and audits only when newly added.
+ * @param {{ caller: import("../auth/idp-port.js").Identity, tenant: string, email: unknown }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function addTenantMember({ caller, tenant, email }, { registry, now = Date.now }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!isTenantAdminRecord(t, caller)) throw new AdminError("forbidden", "not allowed");
+  if (t.domain !== null) throw new AdminError("bad-request", "domain workspaces manage membership via their workspace domain");
+  if (typeof email !== "string" || CONTROL.test(email)) throw new AdminError("bad-request", "bad email");
+  const e = normEmail(email);
+  if (!e || e.length > 320 || !MEMBER_EMAIL.test(e)) throw new AdminError("bad-request", "bad email");
+  const current = await registry.tenantMembers(t.id);
+  if (!current.includes(e) && current.length >= MAX_TENANT_MEMBERS) {
+    throw new AdminError("limit", `maximum of ${MAX_TENANT_MEMBERS} org members reached`);
+  }
+  const res = await registry.addTenantMember(t.id, e);
+  if (res?.added !== false) {
+    await recordAudit(registry, {
+      tenant: t.id,
+      board: null,
+      actor: caller.user,
+      action: "tenant.member.add",
+      target: e,
+      detail: { email: e },
+      at: now(),
+    });
+  }
+  return { email: e };
+}
+
+/**
+ * DELETE /tenants/:tenant/members/:email — org admins only; 404 if tenant or member not found; audits.
+ * @param {{ caller: import("../auth/idp-port.js").Identity, tenant: string, email: unknown }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function removeTenantMember({ caller, tenant, email }, { registry, now = Date.now }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!isTenantAdminRecord(t, caller)) throw new AdminError("forbidden", "not allowed");
+  const e = normEmail(email);
+  if (!e) throw new AdminError("bad-request", "bad email");
+  const removed = await registry.removeTenantMember(t.id, e);
+  if (!removed) throw new AdminError("not-found", "member not found");
+  await recordAudit(registry, {
+    tenant: t.id,
+    board: null,
+    actor: caller.user,
+    action: "tenant.member.remove",
+    target: e,
+    detail: { email: e },
+    at: now(),
+  });
 }

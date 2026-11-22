@@ -235,23 +235,54 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     $("#canvas").addEventListener(t, stopGesture, { passive: false });
   }
 
+  const tagOf = el => (typeof el?.tagName === "string" ? el.tagName.toUpperCase() : "");
+  const attrOf = (el, name) => (typeof el?.getAttribute === "function" ? el.getAttribute(name) : el?.attrs?.[name] ?? null);
+  const hasClass = (el, cls) => (typeof el?.classList?.contains === "function" ? el.classList.contains(cls) : false);
+  const matchUp = (el, pred) => {
+    for (let x = el; x; x = x.parentNode ?? null) if (pred(x)) return true;
+    return false;
+  };
+  const isContentEditableAttr = el => {
+    const v = attrOf(el, "contenteditable");
+    return v != null && v.toLowerCase() !== "false";
+  };
+  const isEditable = el => matchUp(el, x =>
+    /^(INPUT|TEXTAREA|SELECT)$/.test(tagOf(x)) || x.isContentEditable === true || isContentEditableAttr(x)
+  );
+  const inDialog = el => matchUp(el, x =>
+    hasClass(x, "dialog") || hasClass(x, "dialog-veil") || attrOf(x, "role") === "dialog" || tagOf(x) === "DIALOG"
+  );
+  const isInteractive = el => matchUp(el, x =>
+    /^(BUTTON|A|SUMMARY)$/.test(tagOf(x)) || attrOf(x, "role") === "button"
+  );
+
+  const hasOpenDialog = () => Boolean($("#dialogs")?.childNodes?.length);
+
   document.addEventListener("keydown", e => {
     const t = e.target;
-    if (t !== canvas && t !== document.body && t !== document.documentElement) return;   // inputs, dialogs keep their keys
-    if (e.key === " ") space = true;
+    if (hasOpenDialog() || isEditable(t) || inDialog(t)) return;   // inputs, dialogs keep their keys
+    if (isInteractive(t) && (e.key === "Enter" || e.key === " " || e.code === "Space")) return;   // let focused buttons/links activate
+    if (e.key === " " || e.code === "Space") space = true;
     const k = keyName(e), m = mods(e);
-    if ((m.cmd || m.ctrl) && m.shift && k === "e") { e.preventDefault(); if (S.role === "presenter") openDialog("export"); return; }
-    if (!m.cmd && !m.ctrl && !m.alt && k === "i" && S.role === "presenter") { setPanel({ type: "open" }); return; }
-    if (S.key(k, m)) { e.preventDefault(); chromeDirty = true; }
+    if ((m.cmd || m.ctrl) && m.shift && k === "e") { e.preventDefault(); e.stopPropagation?.(); if (S.role === "presenter") openDialog("export"); return; }
+    if (!m.cmd && !m.ctrl && !m.alt && k === "i" && S.role === "presenter") { e.preventDefault(); e.stopPropagation?.(); setPanel({ type: "open" }); return; }
+    if (S.key(k, m)) { e.preventDefault(); e.stopPropagation?.(); chromeDirty = true; }
   });
-  document.addEventListener("keyup", e => { if (e.key === " ") space = false; });
+  document.addEventListener("keyup", e => { if (e.key === " " || e.code === "Space") space = false; });
 
   // Clipboard: the browser's own events (so paste runs once), images included.
-  const onCanvas = () => [canvas, document.body, document.documentElement].includes(document.activeElement);
-  document.addEventListener("copy", e => { if (!onCanvas()) return; const t = S.copy(); if (t) { e.clipboardData.setData("text/plain", t); e.preventDefault(); } });
-  document.addEventListener("cut", e => { if (!onCanvas() || !S.may()) return; const t = S.cut(); if (t) { e.clipboardData.setData("text/plain", t); e.preventDefault(); } });
+  const hasSelection = () => Boolean(globalThis.getSelection?.()?.toString());
+  const onCanvas = (e, { checkSelection = false } = {}) => {
+    const t = e?.target ?? document.activeElement;
+    if (hasOpenDialog() || isEditable(t) || inDialog(t)) return false;
+    if (document.activeElement && (isEditable(document.activeElement) || inDialog(document.activeElement))) return false;
+    if (checkSelection && document.activeElement !== canvas && hasSelection()) return false;
+    return true;
+  };
+  document.addEventListener("copy", e => { if (!onCanvas(e, { checkSelection: true })) return; const t = S.copy(); if (t) { e.clipboardData.setData("text/plain", t); e.preventDefault(); } });
+  document.addEventListener("cut", e => { if (!onCanvas(e, { checkSelection: true }) || !S.may()) return; const t = S.cut(); if (t) { e.clipboardData.setData("text/plain", t); e.preventDefault(); } });
   document.addEventListener("paste", e => {
-    if (!onCanvas()) return;
+    if (!onCanvas(e)) return;
     e.preventDefault();
     if (!S.may()) return toast("View only: nothing is pasted");
     const files = [...(e.clipboardData?.files ?? [])].filter(f => f.type.startsWith("image/"));
@@ -586,7 +617,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           h("div.hint", {}, "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
         h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, "Download")))));
       exportPreview(cv);
-    } else d.replaceChildren();
+    } else { ui.dialog = null; d.replaceChildren(); }
   }
 
   // Sign in again (C-9): a link (so it reads as one and opens in a new tab if asked), whose click remembers this

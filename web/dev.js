@@ -1,3 +1,4 @@
+// @ts-check
 // Dev page: two core Editors side by side, each bound (web/core/sync.js) to one in-process reference Room
 // (web/adapters/transport/local.js), each painted by web/adapters/dom/paint.js. A composition root. A bare tool picker from TOOLS and nothing else: the product chrome comes after
 // the design mock. Everything protocol-side goes through web/core/sync.js.
@@ -30,11 +31,13 @@ function addPane(token, label) {
 
   const editor = new Editor();
   const pane = { editor, canvas, dirty: true, seen: -1, space: false };
-  const sync = bindEditor(editor, { transport: net.join(), token, board: "b1", client: label, clock, onStatus: () => { pane.dirty = true; } });
+  /** @type {{ cancelGesture(): void, status: string, pending: number }} */
+  const sync = /** @type {any} */ (bindEditor(editor, { transport: net.join(), token, board: "b1", client: label, clock, onStatus: () => { pane.dirty = true; } }));
   pane.sync = sync;
   const image = imageCache(() => editor.doc.files, () => { pane.dirty = true; });
 
   // Tool picker: TOOLS as they are, nothing more.
+  /** @type {[string, HTMLButtonElement][]} */
   const buttons = TOOLS.map(t => {
     const b = document.createElement("button"); b.type = "button"; b.textContent = t.icon; b.title = `${t.name} (${t.keys.join(", ")})`;
     b.onclick = () => { editor.setTool(t.id); canvas.focus(); };

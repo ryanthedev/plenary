@@ -1,3 +1,4 @@
+// @ts-check
 // Custom Color Picker (Issue #105): pure color conversions, saved custom swatches via storage port,
 // 2D SV pad, Hue + Opacity sliders, Hex/RGB/HSL mode inputs, and EyeDropper with canvas pixel-sampling fallback.
 

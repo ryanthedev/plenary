@@ -1,3 +1,4 @@
+// @ts-check
 // The New board, New space and General access dialogs over the DOM, rendering web/core/spaces.js's models. A dialog is a modal
 // (`role="dialog"`, `aria-modal`, labelled by its heading): focus moves in, Tab stays inside, Escape and a click on the backdrop close
 // it, and focus goes back to whatever opened it. Text goes in through textContent only (names are other people's words).
@@ -84,7 +85,7 @@ export function createDialogs({ host, api, hrefs, go, newKey = randomKey }) {
 
     /** New space: name, Group (where the person is an editor, or none), general access. */
     newSpace({ opener = null, group = null } = {}) {
-      const model = createNewSpaceModel({ api, group, newKey });
+      const model = createNewSpaceModel(/** @type {any} */ ({ api, group, newKey }));
       const S = model.state;
       const name = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Name", oninput: e => model.setName(e.target.value) });
       const groupSel = h("select.field", { "aria-label": "Group", onchange: e => model.setGroup(e.target.value) });
@@ -120,7 +121,7 @@ export function createDialogs({ host, api, hrefs, go, newKey = randomKey }) {
 
     /** New group (offered only to people who may create one): a name and who in the organization can open it. */
     newGroup({ opener = null } = {}) {
-      const model = createNewGroupModel({ api, newKey });
+      const model = createNewGroupModel(/** @type {any} */ ({ api, newKey }));
       const S = model.state;
       const name = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Name", oninput: e => model.setName(e.target.value) });
       const sel = h("select.field", { "aria-label": "General access", onchange: e => model.setGeneral(e.target.value) },

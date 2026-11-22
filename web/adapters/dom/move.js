@@ -1,3 +1,4 @@
+// @ts-check
 // The Move dialog and the Undo toast over the DOM, rendering web/core/move.js's model. Rules this file keeps: a real modal (openDialog: role="dialog", aria-modal, labelled
 // by its heading, focus moves in, Tab stays inside, Escape closes, focus returns to the opener on cancel); destinations are a radio group; choosing one loads the access diff,
 // whose three lists are headed, plain-text lists (no colour-only meaning) and are said once through the page's polite live region; Move stays off until that diff has loaded;
@@ -96,6 +97,6 @@ export function showMoveToast({ host, move, board, result, clock, newKey = null,
 export function startMove({ host, move, board, opener = null, reload, restoreFocus = () => {}, toastHost = globalThis.document.body }) {
   const model = createMoveModel({ move: move.port, board, newKey: move.newKey });
   return openMove({ host, model, opener, onMoved: result => {
-    Promise.resolve(reload()).catch(() => {}).then(() => showMoveToast({ host: toastHost, move: move.port, board, result, clock: move.clock, newKey: move.newKey, onChange: reload, restoreFocus }));
+    Promise.resolve(reload()).catch(() => {}).then(() => showMoveToast({ host: toastHost, move: move.port, board, result: /** @type {import("../../ports/move.js").MoveResult} */ (result), clock: move.clock, newKey: move.newKey, onChange: reload, restoreFocus }));
   } });
 }

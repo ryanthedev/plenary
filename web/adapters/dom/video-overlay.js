@@ -1,3 +1,4 @@
+// @ts-check
 // Mobile-safe inline <video> DOM overlay manager for canvas video elements.
 // Aligns real <video> elements to each visible video element's exact world-to-screen transform
 // (or directly from paintScene's projected `t: "video"` display-list items), culls off-screen videos,
@@ -101,6 +102,7 @@ export function isVideoVisible(rect, viewport, margin = 64) {
 /**
  * Mount the DOM overlay manager that renders inline <video> elements over the board canvas.
  * Dependencies (`doc`, `win`, `urlApi`, `BlobCtor`) are injectable for headless unit tests.
+ * @param {{ root?: HTMLElement, doc?: Document, win?: typeof globalThis, urlApi?: typeof URL, BlobCtor?: typeof Blob, cullMargin?: number }} [opts]
  */
 export function createVideoOverlay({
   root,

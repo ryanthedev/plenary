@@ -1,3 +1,4 @@
+// @ts-check
 // Export: the board stream as SVG or PNG. Core's exportScene says what to paint, cropped (export.js);
 // writing pixels or markup is the adapter's job. The SVG writer is herdr-draw's adapters/svg/svg.js, ported
 // with its sanitising intact (board content is untrusted: an exported SVG opened in a browser must not run
@@ -23,7 +24,11 @@ function d(cmds) {
   return cmds.map(c => (c[0] === "Q" ? `Q${f(c[3])} ${f(c[4])} ${f(c[1])} ${f(c[2])}` : `${c[0] === "L" ? "L" : "M"}${f(c[1])} ${f(c[2])}`)).join("");
 }
 
-/** Display list → SVG text. `scale`: pixels per unit; the viewBox stays in drawing units. */
+/**
+ * Display list → SVG text. `scale`: pixels per unit; the viewBox stays in drawing units.
+ * @param {any[]} items
+ * @param {{ width?: number, height?: number, background?: string, files?: Record<string, any>, scale?: number, faces?: Record<string, string> }} [opts]
+ */
 export function toSvg(items, { width, height, background, files = {}, scale = 1, faces = FACES } = {}) {
   width = num(width, 800); height = num(height, 600); scale = num(scale, 1) > 0 ? num(scale, 1) : 1;
   const px = v => +(v * scale).toFixed(2), face = k => esc(faces[k] ?? faces.sans);
@@ -83,19 +88,26 @@ export function exportSvg(doc, opts = {}) {
   return toSvg(s.items, s);
 }
 
-/** The board as a valid Excalidraw v2 JSON string (`.excalidraw`), with embedded image `files`. */
+/**
+ * The board as a valid Excalidraw v2 JSON string (`.excalidraw`), with embedded image `files`.
+ * @param {any} doc
+ * @param {{ page?: string, theme?: string, source?: string }} [opts]
+ */
 export function exportExcalidraw(doc, { page = "board", theme = "light", source } = {}) {
   const own = /^#[0-9a-f]{6}$/i.test(doc.appState?.viewBackgroundColor ?? "");
   const viewBackgroundColor = page === "white"
     ? "#ffffff"
     : own ? doc.appState.viewBackgroundColor : (theme === "dark" ? DARK.bg : LIGHT.bg);
-  return JSON.stringify(exportToExcalidraw(doc, { viewBackgroundColor, ...(source ? { source } : {}) }), null, 2);
+  return JSON.stringify(exportToExcalidraw(doc, /** @type {any} */ ({ viewBackgroundColor, ...(source ? { source } : {}) })), null, 2);
 }
 
 /**
  * The board as PNG pixels: paints into `canvas` (a browser canvas, or anything with width/height/getContext).
  * `loadImage(fileId)` returns a decoded image or null (pictures still loading are skipped).
  * Returns the canvas, sized width·scale × height·scale.
+ * @param {any} doc
+ * @param {any} canvas
+ * @param {{ loadImage?: (fileId: string) => any, page?: string, theme?: string, scale?: number }} [opts]
  */
 export function paintPng(doc, canvas, { loadImage = () => null, ...opts } = {}) {
   const s = exportOptions(doc, opts);
@@ -108,8 +120,8 @@ export function paintPng(doc, canvas, { loadImage = () => null, ...opts } = {}) 
 export async function loadPictures(files) {
   const map = new Map();
   await Promise.all(Object.values(files ?? {}).map(f => new Promise(res => {
-    if (typeof f?.dataURL !== "string" || !DATA_URL.test(f.dataURL)) return res();
-    const img = new Image(); img.onload = () => { map.set(f.id, img); res(); }; img.onerror = () => res(); img.src = f.dataURL;
+    if (typeof f?.dataURL !== "string" || !DATA_URL.test(f.dataURL)) return res(undefined);
+    const img = new Image(); img.onload = () => { map.set(f.id, img); res(undefined); }; img.onerror = () => res(undefined); img.src = f.dataURL;
   })));
   return id => map.get(id) ?? null;
 }

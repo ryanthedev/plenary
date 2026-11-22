@@ -1,3 +1,4 @@
+// @ts-check
 // Timeline playback bar adapter (DOM): play/pause, step start/end, smooth pointer + keyboard
 // scrubber, per-element span bars & start markers, mm:ss.t readout, loop toggle, playback speed,
 // and prefers-reduced-motion awareness. Pure math lives in packages/core/anim.js.

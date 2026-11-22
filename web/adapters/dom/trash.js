@@ -1,3 +1,4 @@
+// @ts-check
 // Trash over the DOM, rendering web/core/trash.js's models: the Trash page (a list with a Restore button per row) and the "This board is in Trash" notice a board's URL shows once the board has refused the visit.
 // Rules this file keeps: names and titles are other people's words (textContent only); every control is a real button or link (keyboard); a Restore button names its row
 // ("Restore Roadmap") so a screen reader reads it in a list; outcomes go through the page's polite live region (`announce`), never colour alone; focus is placed on purpose (the next row

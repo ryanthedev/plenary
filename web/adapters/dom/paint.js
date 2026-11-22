@@ -1,3 +1,4 @@
+// @ts-check
 // Display list → Canvas2D. Paints what core's render.js / Editor.displayList emits, already in screen
 // pixels (logical, zoom 1), so the board's own view is never applied here:
 //   { t: "path", cmds, stroke, width, dash?, opacity? }   cmds: ["M",x,y] ["L",x,y] ["Q",x,y,cx,cy]
@@ -60,7 +61,7 @@ function rotated(ctx, it, draw) {
 /**
  * Paint a display list.
  * @param {CanvasRenderingContext2D} ctx
- * @param {object[]} items  editor.displayList(theme)
+ * @param {any[]} items  editor.displayList(theme)
  * @param {{ width: number, height: number, dpr?: number, background?: string,
  *           image?: (fileId: string) => CanvasImageSource | null, faces?: Record<string, string> }} view
  */
@@ -149,6 +150,8 @@ export const DATA_URL = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=
 /**
  * A browser-side picture cache for view.image: decodes each file once, calls onLoad when one is ready.
  * @param {() => Record<string, { dataURL?: string }>} files  the Editor's doc.files (read each time)
+ * @param {(fileId: string) => void} [onLoad]
+ * @param {() => HTMLImageElement} [make]
  */
 export function imageCache(files, onLoad = () => {}, make = () => new Image()) {
   const cache = new Map();

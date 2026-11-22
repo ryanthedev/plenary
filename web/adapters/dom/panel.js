@@ -1,3 +1,4 @@
+// @ts-check
 // The side panel: core's SECTIONS (panel.js) in stack or tabs mode through applyPanel, styled as the mock.
 // The model (what's on, what's available) is pure and tested; render() builds DOM with ./dom.js.
 // Every write goes through session.act(stream, fn): the role and connection gate it, not the disabled look.
@@ -42,7 +43,10 @@ export function availableFor(session) {
   };
 }
 
-/** The style patches each Properties control sends (core setStyle). */
+/**
+ * The style patches each Properties control sends (core setStyle).
+ * @type {[string, string, string, [string, any][]][]}
+ */
 export const STYLE_ROWS = [
   ["Stroke", "C", "strokeColor", STROKES.map(c => [c, c])],
   ["Fill", "B", "backgroundColor", FILLS.map(c => [c, c])],

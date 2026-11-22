@@ -1,3 +1,4 @@
+// @ts-check
 // The Undo toast, shared by Move and Move to Trash (web/adapters/dom/move.js, trash.js). A sentence announced once through the page's polite live region (the toast is not a live region
 // itself), an Undo button, Dismiss; never traps focus; lasts UNDO_MS, counted on clock.mono(), and the countdown HOLDS whenever focus is inside the toast or the pointer is over it (a person
 // reading or aiming at Undo is never cut off) and resumes with what was left. Escape or Dismiss end it; Tab off either end of it leaves it; when it goes away while focus was inside it,
@@ -67,7 +68,7 @@ export function showUndoToast({ host, text: sentence, label, className = "move-t
 
 /**
  * The Undo toast after a Move to Trash. `result` is the trash call's answer (its `undo` says whether Undo is offered). Returns `{ dismiss, el }`.
- * @param {{ host: HTMLElement, api: import("../../ports/trash.js").TrashPort, kind: "board"|"space", result: object, clock: import("../../ports/clock.js").Clock,
+ * @param {{ host: HTMLElement, api: import("../../ports/trash.js").TrashPort, kind: "board"|"space", result: { board?: { id: string, title: string }, space?: { id: string, name: string }, undo?: any, boards?: number }, clock: import("../../ports/clock.js").Clock,
  *   newKey?: (() => string)|null, onChange?(): void, restoreFocus?(): void }} o
  */
 export function showTrashToast({ host, api, kind, result, clock, newKey = null, onChange = () => {}, restoreFocus = () => {} }) {

@@ -1,3 +1,4 @@
+// @ts-check
 // mountCollab: the collaboration UI over a collab port (port.js). p7-wire mounts it in app.js; dev.html mounts
 // it over the fake port. DOM is built with dom.js (text only, never HTML); canvas overlays come from draw.js.
 //
@@ -199,7 +200,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
     placed = { ox: o.x, oy: o.y, scale: sc, box, rev: rvRev, open: S.open, cap: pinCap };
     setShift("");
     const keep = new Set();
-    for (const t of lay.pins) {
+    for (const t of /** @type {any[]} */ (lay.pins)) {
       keep.add(t.id);
       let rec = pinEls.get(t.id);
       if (!rec) { rec = { el: h("button.pin", { "data-thread": t.id, onclick: ev => { ev.stopPropagation?.(); openThread(S.open === t.id ? null : t.id); } }), at: {} }; pinEls.set(t.id, rec); pins.append(rec.el); }

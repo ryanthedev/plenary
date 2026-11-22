@@ -1,3 +1,4 @@
+// @ts-check
 // The leaver screen (driving adapter over the DOM), rendering web/core/offboard.js: find a person, see what they solely own, pick who takes each item (the default is the manager, else you),
 // review exactly what moves where in a confirm dialog, apply it one item at a time, then remove the person. Plain on purpose (#56 restyles).
 //

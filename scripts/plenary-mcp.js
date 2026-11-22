@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+// @ts-check
 // Plenary MCP Server (JSON-RPC 2.0 over stdio).
 // Exposes Plenary HTTP Admin API & Protocol v1.1 board operations as MCP tools.
 // Never writes non-JSON-RPC output to stdout; diagnostics go to stderr only.
@@ -176,7 +177,13 @@ export const TOOLS = [
 
 const TOOL_NAMES = new Set(TOOLS.map(t => t.name));
 
-/** Dispatch one MCP tool call against a Plenary client instance. */
+/**
+ * Dispatch one MCP tool call against a Plenary client instance.
+ * @param {any} client
+ * @param {string} name
+ * @param {Record<string, any>} [args]
+ * @param {{ signal?: AbortSignal }} [opts]
+ */
 export async function executeTool(client, name, args = {}, { signal } = {}) {
   const withSig = { ...(args ?? {}), ...(signal ? { signal } : {}) };
   switch (name) {
@@ -204,6 +211,7 @@ const errResp = (id, code, message, data) => ({
  * Create a JSON-RPC 2.0 request handler for the Plenary MCP server.
  * Supports concurrent dispatch and `notifications/cancelled` via per-request AbortControllers.
  * Returns `null` for notifications, client responses, and cancelled requests.
+ * @param {{ env?: Record<string, string | undefined>, clientFactory?: () => any }} [opts]
  */
 export function createMcpHandler({ env = process.env, clientFactory } = {}) {
   /** @type {Map<string|number, AbortController>} */
@@ -312,7 +320,10 @@ export function createMcpHandler({ env = process.env, clientFactory } = {}) {
   };
 }
 
-/** Run the line-delimited JSON-RPC 2.0 stdio transport loop with concurrent dispatch and line-size cap. */
+/**
+ * Run the line-delimited JSON-RPC 2.0 stdio transport loop with concurrent dispatch and line-size cap.
+ * @param {{ env?: Record<string, string | undefined>, stdin?: any, stdout?: any, stderr?: any, clientFactory?: () => any, maxLineBytes?: number }} [opts]
+ */
 export async function runStdioServer({
   env = process.env,
   stdin = process.stdin,
@@ -396,7 +407,7 @@ export async function runStdioServer({
         }
       }
       buffer = "";
-      Promise.allSettled([...inFlight]).then(() => resolve(), reject);
+      Promise.allSettled([...inFlight]).then(() => resolve(undefined), reject);
     });
     stdin.on("error", reject);
   });

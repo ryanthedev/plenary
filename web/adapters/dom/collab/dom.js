@@ -1,3 +1,4 @@
+// @ts-check
 // A tiny element builder for web/collab. Names, comment text and note text are untrusted: text goes in only as
 // text nodes, tags are literals in this package's code, and nothing here can set HTML.
 //   h("button.tb.on", { title: "x", onclick }, "label", child, …)

@@ -1,3 +1,4 @@
+// @ts-check
 // What the canvas page does for the collab UI once per animation frame (web/adapters/dom/app.js's loop), kept apart so
 // it is tested without a DOM:
 //   - my selection goes out as presence whenever it changed, whatever changed it (a click, Escape, select-all, a tool
@@ -15,7 +16,7 @@
 import { MAX_SELECT_IDS } from "../../../core/collab/limits.js";
 
 /**
- * @param {{ active: string, eds: Record<string, { sel: Set<string>, view: { x: number, y: number, scale: number }, version?: number }>, version(): number }} S
+ * @param {{ active: string, eds: Record<string, { sel: Set<string>, view: { x: number, y: number, scale: number }, version?: number, doc?: { rev?: any } }>, version(): number }} S
  * @param {{ selection(stream: string, ids: string[]): boolean, layout(o?: { board?: boolean }): void, statusRev?: number }} collab
  * @returns {() => void} call once per frame
  */

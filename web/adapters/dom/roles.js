@@ -1,3 +1,4 @@
+// @ts-check
 // The Roles screen (driving adapter over the DOM), rendering web/core/role-admin.js: the roles as named list items, the selected role's
 // permission matrix (a real checkbox per management permission, cells that say where it applies), duplicate, edit, save, delete, and the
 // many-people confirmation. Plain on purpose (#56 restyles); structure follows design/orgs/mock.html [roles].

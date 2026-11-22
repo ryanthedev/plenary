@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+// @ts-check
 // Plenary Agent CLI: interact with a Plenary server's HTTP Admin API and Protocol v1.1 WebSocket rooms.
 //
 // Auth: PLENARY_URL and PLENARY_TOKEN env vars, or --url / --token flags.
@@ -123,6 +124,9 @@ function parseIntOpt(val, name) {
 
 /**
  * Execute the Plenary CLI with explicit argv, env, and IO streams (easy to test).
+ * @param {string[]} argv
+ * @param {Record<string, string | undefined>} [env]
+ * @param {{ out?: (s: string) => void, err?: (s: string) => void, clientFactory?: (o: { url?: string, token?: string }) => any }} [io]
  * @returns {Promise<number>} process exit code
  */
 export async function runCli(

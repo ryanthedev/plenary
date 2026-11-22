@@ -1,3 +1,4 @@
+// @ts-check
 // PRODUCTION composition root of the canvas page (index.html's entry; served by server/static.js, whose allowlist is
 // index.html + this file's import graph). The only page file that picks adapters and wires them: the browser clock,
 // session storage for the sign-in session, local storage for preferences, the HTTP auth adapter, the WebSocket net to
@@ -48,6 +49,7 @@ import { createSession } from "./core/session.js";
 import { rememberBoard, takeReturnBoard } from "./core/roles.js";
 
 const clock = browserClock();
+const fetchNow = /** @type {typeof globalThis.fetch} */ ((input, init) => globalThis.fetch(input, init));
 
 // Never a blank page: the gate shows before the exchange starts (p6-hexv MEDIUM; worst case ~22 s of retries).
 if (location.hash) showGate({ title: "Signing in…" });
@@ -58,13 +60,13 @@ const fromCode = await takeSignIn({
   fragment: location.hash,
   replaceFragment: () => { if (location.hash) history.replaceState(history.state, "", location.pathname + location.search); },
   storage: sessionStore(),
-  auth: httpAuth({ fetch: (...a) => globalThis.fetch(...a), timers: clock }),
+  auth: httpAuth({ fetch: fetchNow, timers: clock }),
   clock,
 });
 
 // Dev sign-in: only when the SERVER offers it (the menu is null on a production server). Asked for when this tab has
 // no session yet or the URL has `?as=` (a production server answers 404, which is null).
-const devConfig = httpDevConfig({ fetch: (...a) => globalThis.fetch(...a), timers: clock });
+const devConfig = httpDevConfig({ fetch: fetchNow, timers: clock });
 let menuAsked = null;
 const devMenu = () => (menuAsked ??= devConfig.get());
 const menu = !fromCode.token || asParam(location.search) !== null ? await devMenu() : null;
@@ -94,7 +96,7 @@ if (!signIn.token) {
   const hint = menu ? (wanted ? `There is no dev user "${wanted}" on this server. ` : "") + "Dev sign-in is on: pick a user." : null;
   showGate({
     title: "Sign in to Plenary",
-    detail: signInNotice({ ...signIn, dev: null }) ?? hint ?? "Sign in with your work Google account to open this board.",
+    detail: signInNotice(/** @type {any} */ ({ ...signIn, dev: null })) ?? hint ?? "Sign in with your work Google account to open this board.",
     link: menu ? null : signInLink, links: menu ? devLinks(menu, board ?? menu.board) : [],
   });
 } else if (!board) {
@@ -102,7 +104,6 @@ if (!signIn.token) {
   document.querySelector(".app")?.remove();
   const root = document.createElement("div");
   document.body.append(root);
-  const fetchNow = (...a) => globalThis.fetch(...a);
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
   const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
     team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), offboard: hrefTo({ offboard: "1" }), trash: hrefTo({ trash: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
@@ -125,7 +126,7 @@ if (!signIn.token) {
     const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
     if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load(); }
     else if (teamId) { const model = createTeamModel({ api, id: teamId }); mountTeamPage({ root, model, api, hrefs, signIn: signInLink }); hideGate(); model.load(); }
-    else { const model = createAccessModel({ api, type: accessArg[1], id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey() }); hideGate(); model.load(); }
+    else { const model = createAccessModel({ api, type: /** @type {"unit"|"group"|"space"|"board"} */ (accessArg[1]), id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey() }); hideGate(); model.load(); }
   } else if (spaceId || groupId) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
@@ -146,7 +147,7 @@ if (!signIn.token) {
 } else {
   const id = signIn.identity;
   const me = { role: null, user: id?.user ?? "me", name: id?.name ?? id?.email ?? "You", email: id?.email ?? null, domain: id?.domain ?? null };
-  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: (...a) => globalThis.fetch(...a), inflate: browserInflate() });
+  const net = wsNet({ url: sameOriginWsUrl(location), WebSocket: globalThis.WebSocket, clock, fetch: fetchNow, inflate: browserInflate() });
   let inTrash = false;   // the Trash notice is showing: the room's "refused" banner would send the person to sign in for nothing
   const app = mountApp({
     trashShown: () => inTrash,
@@ -155,27 +156,28 @@ if (!signIn.token) {
       let session = null, asked = false;
       const trashNotice = () => {
         asked = true;
-        const model = createNoticeModel({ api: httpTrash({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), board, newKey: () => randomKey() });
+        const model = createNoticeModel({ api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), board, newKey: () => randomKey() });
         mountTrashNotice({ host: document.body, model, homeHref: location.pathname, onRestored: () => location.reload() });
         model.subscribe(() => { inTrash = model.state.status === "ready" || model.state.status === "restored"; onChange(); });   // the page redraws its banners
         model.load();
       };
       session = createSession({
-        join: () => net.join(), fetchSnapshot: net.fetchSnapshot, uploadBlob: net.uploadBlob, fetchBlob: net.fetchBlob, token: signIn.token, board, client: "web", user: me.user, mine, clock,
-        onChange: (...a) => { onChange(...a); if (!asked && session?.status === "refused") trashNotice(); },
+        join: () => net.join(), token: signIn.token, board, client: "web", user: me.user, mine, clock,
+        .../** @type {any} */ ({ fetchSnapshot: net.fetchSnapshot, uploadBlob: net.uploadBlob, fetchBlob: net.fetchBlob }),
+        onChange: () => { onChange(); if (!asked && session?.status === "refused") trashNotice(); },
       });
       return session;
     },
     net, board, me, prefs: localStore(), theme: q.get("theme"),
     // Why the pill says "View only" (PROTOCOL.md § Access explanation and requests): looked up when the pill is opened, with Ask for access.
-    access: httpAccess({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), newKey: () => randomKey(),
+    access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey(),
     // The Share dialog's calls (PROTOCOL.md § Share dialog).
-    share: httpShare({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }),
+    share: httpShare({ fetch: fetchNow, token: signIn.token, timers: clock }),
     // Move to… in the More menu (PROTOCOL.md § Move board, "Where it appears"): the same port as the Space page and Home.
-    move: { port: httpMove({ fetch: (...a) => globalThis.fetch(...a), token: signIn.token, timers: clock }), clock, newKey: () => randomKey() },
+    move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() },
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
-    notice: signInNotice({ ...signIn, dev: null }, me.name),
+    notice: signInNotice(/** @type {any} */ ({ ...signIn, dev: null }), me.name),
     clock,
     // exp: seconds (the sign-in contract); the page warns before it on the clock's ms scale.
     expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null,

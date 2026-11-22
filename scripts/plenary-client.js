@@ -1,3 +1,4 @@
+// @ts-check
 // Shared Plenary HTTP Admin API + Protocol v1.1 WebSocket client for AI agents (CLI & MCP).
 // Zero extra dependencies: only Bun/Node built-ins and workspace packages.
 
@@ -225,6 +226,11 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
   const wsUrl = toWsUrl(baseUrl);
   const safeWsUrl = redactUrl(wsUrl);
 
+  /**
+   * @param {string} method
+   * @param {string} path
+   * @param {{ query?: Record<string, any>, body?: any, signal?: AbortSignal }} [opts]
+   */
   async function requestJson(method, path, { query, body, signal } = {}) {
     if (signal?.aborted) {
       throw new PlenaryError("request cancelled", { code: "cancelled" });
@@ -270,6 +276,9 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
   /**
    * Open a short-lived Protocol v1.1 WebSocket session on `board`, catch up via Replica,
    * run `fn(session)`, and always close the socket and clear timers cleanly.
+   * @param {string} board
+   * @param {(session: { replica: Replica, commitOp: (stream: string, op: any) => Promise<{ opId: string, seq: number }>, board: string }) => Promise<any>} fn
+   * @param {{ signal?: AbortSignal }} [opts]
    */
   async function withBoardSession(board, fn, { signal } = {}) {
     const boardId = assertBoardId(board);
@@ -324,7 +333,7 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
 
     const sendFrame = msg => {
       if (closed || ws.readyState !== WebSocket.OPEN) return;
-      ws.send(jsonCodec.encode(msg));
+      ws.send(/** @type {string | ArrayBufferView<ArrayBuffer>} */ (jsonCodec.encode(msg)));
     };
 
     const pump = () => {
@@ -370,7 +379,7 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
         closed = true;
         if (pumpTimer) { clearTimeout(pumpTimer); pumpTimer = null; }
         failAll(new PlenaryError(`WebSocket closed (${e.code}${e.reason ? `: ${e.reason}` : ""})`, { code: "ws-closed" }));
-        resolve();
+        resolve(undefined);
       };
     });
 
@@ -457,12 +466,18 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
     baseUrl,
     wsUrl,
 
-    /** GET /boards */
+    /**
+     * GET /boards
+     * @param {{ signal?: AbortSignal }} [opts]
+     */
     async listBoards(opts = {}) {
       return requestJson("GET", "/boards", { signal: opts.signal });
     },
 
-    /** POST /boards */
+    /**
+     * POST /boards
+     * @param {{ title?: string, memberRole?: string, signal?: AbortSignal }} [opts]
+     */
     async createBoard({ title, memberRole, signal } = {}) {
       const body = {};
       if (title !== undefined) body.title = title;
@@ -470,7 +485,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       return requestJson("POST", "/boards", { body, signal });
     },
 
-    /** POST /boards/:board/links */
+    /**
+     * POST /boards/:board/links
+     * @param {{ board?: string, role?: string, expiresAt?: string | number | null, signal?: AbortSignal }} [opts]
+     */
     async createShareLink({ board, role = "viewer", expiresAt, signal } = {}) {
       const boardId = assertBoardId(board);
       const body = { role };
@@ -478,7 +496,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       return requestJson("POST", `/boards/${encodeURIComponent(boardId)}/links`, { body, signal });
     },
 
-    /** GET /boards/:board/audit (board-scoped) or GET /admin/audit (tenant-scoped) */
+    /**
+     * GET /boards/:board/audit (board-scoped) or GET /admin/audit (tenant-scoped)
+     * @param {{ board?: string, limit?: number, before?: string | number, scope?: "board" | "tenant" | string, signal?: AbortSignal }} [opts]
+     */
     async getAudit({ board, limit, before, scope, signal } = {}) {
       if (scope !== undefined && scope !== "board" && scope !== "tenant") {
         throw new PlenaryError("scope must be 'board' or 'tenant'", { code: "bad-request" });
@@ -494,7 +515,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       return requestJson("GET", `/boards/${encodeURIComponent(boardId)}/audit`, { query: { limit, before }, signal });
     },
 
-    /** Connect via Protocol v1.1 WS, catch up via Replica, return full board state. */
+    /**
+     * Connect via Protocol v1.1 WS, catch up via Replica, return full board state.
+     * @param {{ board?: string, signal?: AbortSignal }} [opts]
+     */
     async readBoard({ board, signal } = {}) {
       return withBoardSession(board, async ({ replica, board: boardId }) => {
         const elements = [...replica.streams.board.byId.values()]
@@ -517,7 +541,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       }, { signal });
     },
 
-    /** Connect via Protocol v1.1 WS, push element ops, wait for ack/commit. */
+    /**
+     * Connect via Protocol v1.1 WS, push element ops, wait for ack/commit.
+     * @param {{ board?: string, elements?: any[], stream?: string, signal?: AbortSignal }} [opts]
+     */
     async addElements({ board, elements, stream = "board", signal } = {}) {
       if (!ELEMENT_STREAMS.includes(stream)) {
         throw new PlenaryError(`stream must be one of: ${ELEMENT_STREAMS.join(", ")}`, { code: "bad-request" });
@@ -552,7 +579,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       }, { signal });
     },
 
-    /** Parse Mermaid flowchart via packages/core/mermaid.js and push resulting elements over WS. */
+    /**
+     * Parse Mermaid flowchart via packages/core/mermaid.js and push resulting elements over WS.
+     * @param {{ board?: string, source?: string, origin?: { x?: number, y?: number }, layer?: string, elbow?: boolean, signal?: AbortSignal }} [opts]
+     */
     async addMermaid({ board, source, origin, layer, elbow = false, signal } = {}) {
       if (typeof source !== "string" || !source.trim()) {
         throw new PlenaryError("source (Mermaid flowchart text) is required", { code: "bad-request" });
@@ -596,7 +626,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       }, { signal });
     },
 
-    /** Push a sticky note (rectangle + bound text) on the `notes` stream over WS. */
+    /**
+     * Push a sticky note (rectangle + bound text) on the `notes` stream over WS.
+     * @param {{ board?: string, text?: string, x?: number, y?: number, width?: number, height?: number, backgroundColor?: string, strokeColor?: string, signal?: AbortSignal }} [opts]
+     */
     async addNote({
       board,
       text,
@@ -658,7 +691,10 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
       }, { signal });
     },
 
-    /** Push a comment thread (or reply to an existing thread) on the `records` stream over WS. */
+    /**
+     * Push a comment thread (or reply to an existing thread) on the `records` stream over WS.
+     * @param {{ board?: string, text?: string, x?: number, y?: number, thread?: string, element?: string, stream?: string, signal?: AbortSignal }} [opts]
+     */
     async addComment({ board, text, x = 0, y = 0, thread, element, stream = "board", signal } = {}) {
       if (typeof text !== "string" || !text.length) {
         throw new PlenaryError("text is required for add_comment", { code: "bad-request" });

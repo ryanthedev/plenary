@@ -1,3 +1,4 @@
+// @ts-check
 // The Teams list, a Team's page and the access page of a scope (driving adapter over the DOM), rendering web/core/access.js's models. One role
 // picker serves every scope: "Add people or teams" searches the directory, then offers only the roles the server lists for this scope.
 //
@@ -35,10 +36,11 @@ const who = (s, keys, extra = "") => keys.mark(h("span.who", { tabindex: "-1" },
 /**
  * The picker: a search box over the directory, a list of matches (people and Teams), the chosen one, a role from `rolesFor(subjectType)`, and Add.
  * It is built once and kept across page renders (typing must not lose focus); `refresh()` re-reads the role list.
- * @param {{ api: any, teams: boolean, rolesFor?: (t: string) => { id: string, name: string, summary: string }[], onAdd: (subject: object, role: string|null) => Promise<boolean>, label: string, setTimer?: typeof setTimeout, delayMs?: number }} o
+ * @param {{ api: any, teams: boolean, rolesFor?: ((t: string) => { id: string, name: string, summary: string }[]) | null, onAdd: (subject: any, role: string|null) => Promise<boolean>, label: string, setTimer?: (fn: () => void, ms: number) => any, delayMs?: number }} o
  */
 export function pickerView({ api, teams, rolesFor = null, onAdd, label, setTimer = (f, ms) => setTimeout(f, ms), delayMs = 200 }) {
   const model = createPickerModel({ api, teams });
+  /** @type {any} */
   const S = model.state;
   let timer = null, busy = false, role = null;
   const input = h("input.field", { type: "search", "aria-label": `Search ${teams ? "people or teams" : "people"}`, autocomplete: "off", maxlength: "100", placeholder: teams ? "Name or email, or a team" : "Name or email",

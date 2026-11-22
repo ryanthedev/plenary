@@ -1,3 +1,4 @@
+// @ts-check
 // The Share dialog over the DOM, rendering web/core/share.js's model: invite by email (guests tagged), link access, the read-only "who else has access" rows, and revoke.
 //
 // Rules this file keeps: a real modal (openDialog: role="dialog", aria-modal, labelled by its heading, focus moves in, Tab stays inside, Escape closes, focus returns to

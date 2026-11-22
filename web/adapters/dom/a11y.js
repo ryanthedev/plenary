@@ -1,3 +1,4 @@
+// @ts-check
 // Reusable accessibility helpers for dialogs and bottom sheets (part of the dom adapter group).
 // Provides focusable-element discovery, modal focus trapping (Tab / Shift+Tab wrapping, Escape-to-close,
 // and focus restoration to the triggering control), working in both real browsers and headless DOM stubs.
@@ -146,7 +147,7 @@ export function createFocusTrap(container, {
       container?.focus?.();
       return;
     }
-    const current = doc?.activeElement ?? null;
+    const current = /** @type {HTMLElement | null} */ (doc?.activeElement ?? null);
     const index = list.indexOf(current);
     if (e.shiftKey) {
       if (index <= 0) {

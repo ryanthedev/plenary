@@ -24,6 +24,7 @@
 // is skipped, never queued: the next move or the commit supersedes it. Hello and real ops are never gated.
 
 import { Replica } from "../../packages/protocol/replica.js";
+import { MAX_OP_BYTES, utf8Bytes } from "../../packages/protocol/envelope.js";
 export { BLOB_PENDING_MS } from "../../packages/protocol/envelope.js";   // the one number clients and servers share for how long an upload is pending (re-offered after it)
 import { presenceProblem, presenceLimiter, MAX_PREVIEW_ELEMENTS } from "../../packages/protocol/presence.js";
 import { clone } from "../../packages/core/model.js";
@@ -33,6 +34,8 @@ import { PRESENCE_BACKLOG_BYTES } from "../ports/transport.js";
 // core is untouched.
 const GESTURE_ENDS = ["pointerDown", "pointerUp", "key", "setTool"];
 const SHA1_RE = /^[0-9a-f]{40}$/;
+const OP_CHUNK_TARGET_BYTES = 512 * 1024;
+const OP_WRAPPER_BYTES = 16;
 
 /**
  * Bind an Editor to a board stream over a transport: one link (openLink) with this one Editor on it. Takes over
@@ -415,6 +418,8 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
     element: (s, id) => { const el = replica.streams[s]?.getAny(id); return el && !el.isDeleted ? el : null; },
     /** The live elements of a stream (not deleted). Not clones: read only. */
     elements: s => [...(replica.streams[s]?.byId.values() ?? [])].filter(e => !e.isDeleted),
+    /** The stream's Doc (read only, preserves rev and elbow-routing cache for geometry queries), or null. */
+    streamDoc: s => replica.streams[s] ?? null,
     /** Ops dropped without knowing whether they landed (forgotten client, `stale`): a count for the UI. */
     get unconfirmed() { return replica.unconfirmed; },
     /** Ops dropped because another user signed in on this client (rule 13): a count for the UI. */
@@ -541,15 +546,38 @@ export function openLink({ transport, fetchSnapshot = null, token: firstToken, b
       const elements = op.elements?.length ? [...new Map(op.elements.map(el => [el.id, el])).values()] : null;
       if (op.transient) { if (elements) sendPreview(elements); return; }
       if (!elements && !op.appState) return;         // files only: pictures go through the blob port, never in ops
-      const out = {};
-      if (elements) out.elements = elements;
-      if (op.appState) out.appState = op.appState;
-      const msg = replica.local(stream, out);         // versions: one past what the Replica knows, fresh nonce
-      for (const [i, el] of (msg.op.elements ?? []).entries()) {
-        const was = elements[i], mine = editor.doc.getAny(el.id);
-        if (mine && mine.version === was.version && mine.versionNonce === was.versionNonce) { mine.version = el.version; mine.versionNonce = el.versionNonce; }
+      let queued = false;
+      if (elements) {
+        // Chunk element batches to stay comfortably below MAX_OP_BYTES (1 MB); never send a single
+        // oversized element that would trigger server `too-large` refusal and replica reset.
+        const chunks = [];
+        let cur = [], curBytes = OP_WRAPPER_BYTES;
+        for (const el of elements) {
+          const elBytes = utf8Bytes(JSON.stringify(el));
+          if (elBytes + OP_WRAPPER_BYTES > MAX_OP_BYTES) continue;
+          if (cur.length && curBytes + 1 + elBytes > OP_CHUNK_TARGET_BYTES) {
+            chunks.push(cur);
+            cur = [];
+            curBytes = OP_WRAPPER_BYTES;
+          }
+          cur.push(el);
+          curBytes += (cur.length > 1 ? 1 : 0) + elBytes;
+        }
+        if (cur.length) chunks.push(cur);
+        for (const chunk of chunks) {
+          const msg = replica.local(stream, { elements: chunk });         // versions: one past what the Replica knows, fresh nonce
+          for (const [i, el] of (msg.op.elements ?? []).entries()) {
+            const was = chunk[i], mine = editor.doc.getAny(el.id);
+            if (mine && mine.version === was.version && mine.versionNonce === was.versionNonce) { mine.version = el.version; mine.versionNonce = el.versionNonce; }
+          }
+          queued = true;
+        }
       }
-      pump();
+      if (op.appState) {
+        replica.local(stream, { appState: op.appState });
+        queued = true;
+      }
+      if (queued) pump();
     };
 
     // The handle: the link's members (own getters, so a test may redefine one), then this stream's.

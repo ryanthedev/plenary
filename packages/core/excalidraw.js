@@ -14,7 +14,7 @@
 
 import {
   DEFAULT_STROKE, BASE_LAYER, makeElement, clone, newId, randomInt,
-  clampPressure, textSize, isLinear,
+  clampPressure, textSize, isLinear, utf8Bytes,
 } from "./model.js";
 import { Doc } from "./doc.js";
 import { normalize, normAngle, fileScene } from "./geometry.js";
@@ -27,8 +27,9 @@ export const TEXT_CONTAINERS = new Set(["rectangle", "diamond", "ellipse", "arro
 export const BINDABLE_TARGETS = new Set(["rectangle", "diamond", "ellipse", "frame", "image", "video"]);
 export const MAX_EXCALIDRAW_INPUT_BYTES = 50 * 1024 * 1024;
 export const MAX_EXCALIDRAW_ELEMENTS = 20_000;
-export const MAX_EXCALIDRAW_POINTS_PER_EL = 50_000;
+export const MAX_EXCALIDRAW_POINTS_PER_EL = 20_000;
 export const MAX_EXCALIDRAW_TOTAL_POINTS = 250_000;
+export const MAX_EXCALIDRAW_ELEMENT_BYTES = 950_000;
 export const MAX_EXCALIDRAW_FILE_BYTES = 10 * 1024 * 1024;
 export const MAX_EXCALIDRAW_TOTAL_FILE_BYTES = 40 * 1024 * 1024;
 
@@ -50,6 +51,7 @@ const VIDEO_MIMES = new Set(["video/mp4", "video/webm", "video/quicktime"]);
 const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)$/;
 const HEX_COLOR_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const SHA1_RE = /^[0-9a-f]{40}$/;
+const SAFE_LINK_RE = /^https?:\/\/[^\s\u0000-\u001f\u007f]+$/i;
 
 const MAX_COORD = 1e7;
 const MAX_DIM = 1e6;
@@ -314,7 +316,8 @@ function sanitizeElement(raw, { allowVideo = false, now = Date.now() } = {}) {
     ? raw.groupIds.map(g => safeId(g)).filter(Boolean).slice(0, MAX_GROUP_IDS)
     : [];
   const frameId = safeId(raw.frameId);
-  const link = typeof raw.link === "string" && raw.link.length > 0 && raw.link.length <= 2048 ? raw.link : null;
+  const rawLink = typeof raw.link === "string" ? raw.link.trim() : "";
+  const link = rawLink.length > 0 && rawLink.length <= 2048 && SAFE_LINK_RE.test(rawLink) ? rawLink : null;
   const boundElements = Array.isArray(raw.boundElements)
     ? raw.boundElements
       .filter(b => isPlainObj(b) && safeId(b.id) && (b.type === "text" || b.type === "arrow" || b.type === "line"))
@@ -517,6 +520,9 @@ export function parseExcalidraw(input, {
       if (totalPoints > maxTotalPoints) {
         return { ok: false, error: `Aggregate point count exceeds ${maxTotalPoints} limit`, elements: [], files: {}, appState: {}, skipped: 0 };
       }
+    }
+    if (utf8Bytes(JSON.stringify(el)) + 16 > MAX_EXCALIDRAW_ELEMENT_BYTES) {
+      return { ok: false, error: "Element exceeds maximum op size (1 MB)", elements: [], files: {}, appState: {}, skipped: 0 };
     }
     // Deduplicate colliding IDs within the same payload cleanly.
     if (seenIds.has(el.id)) el.id = newId();

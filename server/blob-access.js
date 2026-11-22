@@ -121,7 +121,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     /** @returns {Promise<{ ok: true, created: boolean } | { ok: false, code: string }>} */
     async put(token, bytes) {
       const v = await verify(token, "PUT");
-      if ("code" in v) return v;
+      if (!v.ok || "code" in v) return "code" in v ? v : { ok: false, code: "bad-token" };
       if (!(bytes instanceof Uint8Array) || !bytes.byteLength) return { ok: false, code: "bad-length" };
       if (bytes.byteLength > (videoKind(bytes) ? MAX_VIDEO_BLOB_BYTES : MAX_BLOB_BYTES)) return { ok: false, code: "too-large" };
       let st;
@@ -145,7 +145,7 @@ export function blobAccess({ blobs, key, origin = "", now = Date.now, quotaBytes
     /** @returns {Promise<{ ok: true, bytes: Uint8Array, type: string } | { ok: false, code: string }>} */
     async get(token) {
       const v = await verify(token, "GET");
-      if ("code" in v) return v;
+      if (!v.ok || "code" in v) return "code" in v ? v : { ok: false, code: "bad-token" };
       try {
         const bytes = await blobs.get(v.tenant, v.sha1);
         if (!bytes) return { ok: false, code: "not-found" };

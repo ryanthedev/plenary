@@ -89,3 +89,18 @@ export function textSize(text, fontSize, lineHeight = 1.25, fontFamily = 2) {
   const lines = String(text ?? "").split("\n");
   return { w: Math.max(fontSize * 0.5, ...lines.map(l => textWidth(l, fontSize, fontFamily))), h: lines.length * fontSize * lineHeight };
 }
+
+/** Pure UTF-8 byte length of a string (no TextEncoder dependency). */
+export function utf8Bytes(str) {
+  let n = 0;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const d = str.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) { n += 4; i++; } else n += 3;
+    } else n += 3;
+  }
+  return n;
+}

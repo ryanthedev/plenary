@@ -55,6 +55,7 @@ export const LINK_CARD_PROVIDERS = Object.freeze({
 
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
 const WHITESPACE_RE = /\s/;
+const UNSAFE_URL_CHAR_RE = /["<>]/;
 const HTTPS_URL_RE = /^https:\/\/([^/?#]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i;
 const HOSTNAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
@@ -107,7 +108,7 @@ function parseStrictHttpsUrl(raw) {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length > MAX_LINK_CARD_URL_LENGTH) return null;
-  if (CONTROL_CHAR_RE.test(trimmed) || WHITESPACE_RE.test(trimmed) || trimmed.includes("\\")) return null;
+  if (CONTROL_CHAR_RE.test(trimmed) || WHITESPACE_RE.test(trimmed) || UNSAFE_URL_CHAR_RE.test(trimmed) || trimmed.includes("\\")) return null;
   const m = HTTPS_URL_RE.exec(trimmed);
   if (!m) return null;
   const authority = m[1];
@@ -293,12 +294,13 @@ export function buildLinkCard(parsedOrUrl, opts = {}) {
  */
 export function parseLinkCardFromElement(el) {
   if (!el || el.type !== "rectangle" || typeof el.link !== "string" || !el.link) return null;
-  // Recognize explicit rich link cards (`customData.linkCard`) or any rectangle whose `link`
-  // is a supported Jira/Linear/GitHub URL (so cards survive external round-trips cleanly).
+  // Only recognize explicit Plenary rich link cards (`customData.linkCard`); never hijack
+  // arbitrary imported Excalidraw rectangles that happen to carry a Jira/Linear/GitHub `link`.
+  const custom = el.customData?.linkCard;
+  if (!custom || typeof custom !== "object" || Array.isArray(custom)) return null;
   const parsed = parseLinkCardUrl(el.link);
   if (!parsed) return null;
-  const custom = el.customData?.linkCard;
-  const customTitle = custom && typeof custom.title === "string" ? sanitizeCardText(custom.title, 96) : "";
+  const customTitle = typeof custom.title === "string" ? sanitizeCardText(custom.title, 96) : "";
   return {
     ...parsed,
     title: customTitle || parsed.title,

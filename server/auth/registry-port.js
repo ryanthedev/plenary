@@ -63,6 +63,8 @@ export const mint = {
  *   tenantsForMember(email: string): Promise<Tenant[]>,
  *   tenantsForAdmin(user: string, email?: string|null): Promise<Tenant[]>,
  *   createBoard(o: { tenant: string, title?: string, memberRole?: Role|null }): Promise<Board>,
+ *   updateBoard(id: string, patch: { title?: string, memberRole?: Role|"none"|null }): Promise<Board|null>,
+ *   deleteBoard(id: string): Promise<boolean>,
  *   board(id: string): Promise<Board|null>,
  *   listBoards(tenant: string): Promise<Board[]>,
  *   listBoardsFor(tenant: string, user: string, opts?: { email?: string|null, isMember?: boolean, at?: number }): Promise<BoardAccess[]>,

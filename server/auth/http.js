@@ -72,7 +72,7 @@
 //   This handler never throws (the engine would turn a throw into a 500).
 
 import { b64url, unb64url, utf8, fromUtf8, higher, isTenantAdminRecord } from "./util.js";
-import { AdminError, listBoards, createBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant, listBoardAudit, listTenantAudit } from "../admin/boards.js";
+import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, revokeInvite, createLink, listLinks, revokeLink, setGrant, listBoardAudit, listTenantAudit } from "../admin/boards.js";
 import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../admin/tenants.js";
 
 export const LOGIN_COOKIE = "__Host-plen_login";
@@ -491,6 +491,19 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, now = Dat
         }
         const board = await createBoard(defined({ caller: who, tenant: tid, title: b.title, memberRole: b.memberRole }), admin);
         return json(201, { board });
+      },
+    }],
+    ["/boards/:board", {
+      PATCH: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["title", "memberRole"]);
+        const board = await updateBoard({ caller: who, board: p.board, title: b.title, memberRole: b.memberRole }, admin);
+        return json(200, { board });
+      },
+      DELETE: async (req, p) => {
+        const who = await caller(req);
+        await deleteBoard({ caller: who, board: p.board }, admin);
+        return json(204);
       },
     }],
     ["/boards/:board/audit", { GET: async (req, p, url) => {

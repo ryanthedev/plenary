@@ -430,8 +430,11 @@ test("createBoard: an owner grant that fails twice reports the board id (503); o
 // ---- mounting ----
 
 test("not my route: /health, /ws, /blobs/*, /metrics and unknown paths give null; wrong method 405", async () => {
-  for (const p of ["/health", "/ws", "/blobs/abc", "/blobs/t/x/y", "/metrics", "/", "/auth", "/auth/other", "/boards/x", "/boards/x/y", "/links", "/links/a/b", "/varz"])
+  for (const p of ["/health", "/ws", "/blobs/abc", "/blobs/t/x/y", "/metrics", "/", "/auth", "/auth/other", "/boards/x/y", "/links", "/links/a/b", "/varz"])
     for (const m of ["GET", "POST", "PUT", "DELETE"]) expect(await call(p, { method: m })).toBe(null);
+  const rb = await call("/boards/x", { method: "GET" });
+  expect(rb.status).toBe(405);
+  expect(rb.headers.get("allow")).toBe("PATCH, DELETE");
   const r = await call("/boards", { method: "DELETE" });
   expect(r.status).toBe(405);
   expect(r.headers.get("allow")).toBe("GET, POST");

@@ -19,6 +19,8 @@
  * @property {(tenant: string, email: string) => Promise<void>} removeTenantMember
  * @property {() => Promise<{ boards: AdminBoard[], isAdmin: boolean }>} listBoards
  * @property {(o?: { title?: string, memberRole?: string | null, tenant?: string }) => Promise<{ board: AdminBoard }>} createBoard
+ * @property {(board: string, patch: { title?: string, memberRole?: string | null }) => Promise<{ board: AdminBoard }>} updateBoard
+ * @property {(board: string) => Promise<void>} deleteBoard
  * @property {(board: string) => Promise<{ links: AdminLink[] }>} listLinks
  * @property {(board: string, o: { role: string, expiresAt?: number | null }) => Promise<{ link: AdminLink, url?: string }>} createLink
  * @property {(board: string, id: string) => Promise<void>} revokeLink

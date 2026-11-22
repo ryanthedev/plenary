@@ -97,6 +97,15 @@ export function httpAdmin({ origin = "", token, fetch }) {
       if (tenant !== undefined && tenant !== null && tenant !== "") payload.tenant = tenant;
       return request("POST", "/boards", payload);
     },
+    updateBoard(board, { title, memberRole } = {}) {
+      const payload = {};
+      if (title !== undefined) payload.title = title;
+      if (memberRole !== undefined) payload.memberRole = memberRole;
+      return request("PATCH", `/boards/${enc(board)}`, payload);
+    },
+    deleteBoard(board) {
+      return request("DELETE", `/boards/${enc(board)}`);
+    },
     listLinks(board) {
       return request("GET", `/boards/${enc(board)}/links`);
     },

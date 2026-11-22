@@ -247,16 +247,17 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
 //     (time-based loss sends no message); and the end of the memo of every link record it was built from (p5-load2v
 //     MEDIUM 0: a joiner of an in-flight link read counts from that read's start), so with linkTtlMs ≤ ttlMs no
 //     entry rests on link data more than ttlMs old. Bounded by `maxEntries` (oldest dropped first).
-//   - the records whose read fields can't change once written: board and tenant for 10 min (board.id, memberRole,
-//     tenant, tenant.domain have no update method; `admins` does change and is never served from here), and link
-//     records by id for 30 s (a link changes only by revokeLink, which announces on `grants`). `live()` is evaluated
-//     on every use, so a memoized link still expires on time. Lookups of the same record share one read, unless an
-//     invalidation came between.
+//   - board and tenant records for 10 min (tenant.domain has no update method; `admins` does change and is never
+//     served from here; board.memberRole and deleteBoard announce `{ board }` on `grants` and `invalidate(board)`
+//     drops the board record too), and link records by id for 30 s (a link changes only by revokeLink, which announces
+//     on `grants`). `live()` is evaluated on every use, so a memoized link still expires on time. Lookups of the same
+//     record share one read, unless an invalidation came between.
 //
 // Consistency (the one rule that matters: a revoke is never hidden longer than without the cache):
 //   - `invalidate(board)` (a `grants` message `{ board }`, and the gateway releasing its watch of a board) drops
-//     the board's roles and link records; `invalidate(board, user)` drops every identity of one user. The gateway calls it
-//     synchronously in its `grants` subscriber, BEFORE bumping its hello generation and before its re-check pass.
+//     the board's roles, board/tenant records, and link records; `invalidate(board, user)` drops every identity of one
+//     user. The gateway calls it synchronously in its `grants` subscriber, BEFORE bumping its hello generation and before
+//     its re-check pass.
 //   - A read in flight across an invalidation never fills the cache (stamps per board and per (board, user), so a
 //     stream of per-user invalidations doesn't starve the rest of the board).
 //   - The timed re-check calls `invalidate(board)`, then `rolesFor` (always fresh, written through) per chunk of its
@@ -270,14 +271,11 @@ const tenancyOver = (registry, now, recordUntil) => tenancy({ registry, now, rec
  *     30 s; keep it ≤ the gateway's 60 s re-check, see the report). An entry built from a memoized link record ends no
  *     later than that record's memo (p5-load2v MEDIUM 0), so with linkTtlMs ≤ ttlMs a role is never served from data
  *     more than ttlMs old;
- *   recordTtlMs: board and tenant records (default 10 min, above the 60 s pass, so a pass reads them from memory). The
- *     fields the cache reads from them (board.id, board.memberRole, board.tenant, tenant.domain) never change: the
- *     port has no update or delete for either (p5-loadv finding 6). `tenant.admins` DOES change at runtime
- *     (addTenantAdmin, add-only): never serve `admins` (or any field but those four) from this memo; admin checks
- *     read the Registry (server/admin/boards.js). IF a future port adds one (setMemberRole,
- *     deleteBoard, a tenant domain change), that write must announce `{ board }` (every board of the tenant, for a
- *     tenant change) and `invalidate(board)` must then also drop the board and tenant records: today it drops roles
- *     and links only;
+ *   recordTtlMs: board and tenant records (default 10 min, above the 60 s pass, so a pass reads them from memory).
+ *     `tenant.admins` DOES change at runtime (addTenantAdmin, add-only): never serve `admins` from this memo; admin
+ *     checks read the Registry (server/admin/boards.js). Board mutations (`updateBoard` changing `memberRole`,
+ *     `deleteBoard`) announce `{ board }` on `grants`, and `invalidate(board)` drops the cached board record, tenant
+ *     record, roles, and links together;
  *   linkTtlMs: link records (default 30 s; a link changes by revokeLink, which announces `{ board }` and drops them).
  */
 const STAMP_MAX = 10_000;
@@ -312,12 +310,13 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
         const c0 = clock;
         reading++;
         p = fetch(id).then(v => {
-          const board = kind === "link" ? v?.board ?? null : null;
-          // null is not memoized (a link created later must be found); a link whose board was invalidated meanwhile neither
+          const board = kind === "link" ? v?.board ?? null : kind === "board" ? id : null;
+          // null is not memoized (a board/link created later must be found); a record whose board was invalidated meanwhile neither
           if (v && !(board && (boardStamp.get(board) ?? 0) > c0)) {
             if (records.size >= maxRecords) { const [ok, ov] = records.entries().next().value; records.delete(ok); if (ov.board) linksOf.get(ov.board)?.delete(ok); }
-            records.set(k, { value: v, until: t + ttlOf(kind), board });
-            if (board) { if (!linksOf.has(board)) linksOf.set(board, new Set()); linksOf.get(board).add(k); }
+            const linkBoard = kind === "link" ? board : null;
+            records.set(k, { value: v, until: t + ttlOf(kind), board: linkBoard });
+            if (linkBoard) { if (!linksOf.has(linkBoard)) linksOf.set(linkBoard, new Set()); linksOf.get(linkBoard).add(k); }
           }
           return v;
         }).finally(() => { if (recordReads.get(k)?.p === p) recordReads.delete(k); endRead(); });
@@ -361,6 +360,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
   function dropBoard(b) {
     for (const k of [...(byBoard.get(b) ?? [])]) remove(k);
     const tid = records.get("board:" + b)?.value?.tenant;
+    records.delete("board:" + b);
     if (tid) records.delete("tenant:" + tid);
   }
 
@@ -417,7 +417,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       return new Map([...m].map(([k, r]) => [k, r.role]));
     },
 
-    /** Drop a board's cached roles and link records, or one user's role. Synchronous; call it before re-reading. */
+    /** Drop a board's cached roles, board/tenant records, and link records, or one user's role. Synchronous; call it before re-reading. */
     invalidate(boardId, user) {
       if (typeof boardId !== "string") return;
       if (typeof user === "string") {
@@ -433,7 +433,7 @@ export function roleCache({ registry, now = Date.now, ttlMs = 30_000, recordTtlM
       if (reading) boardStamp.set(boardId, ++clock); else clock++;   // clock moves either way: no read joins across it
     },
 
-    /** The board record, memoized (the gateway's own hello lookup may use it: board records never change). */
+    /** The board record, memoized until `invalidate(boardId)` drops it or `recordTtlMs` elapses. */
     board,
     stats: () => ({ ...stats, entries: entries.size, records: records.size }),
   };

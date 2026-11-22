@@ -70,18 +70,23 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   const isPhone = () => matchMedia("(max-width: 640px)").matches;
   const isCoarse = () => matchMedia("(pointer: coarse)").matches;
+  const INK_KEYBOARD_PAD_PX = 24;
+  let lastPointerTouch = false;
+  let onViewportChange = () => {};
   // Sync Chrome-on-iOS / WKWebView visual viewport (dynamic toolbar & software keyboard) to CSS custom properties.
   const vv = globalThis.visualViewport;
   const syncVisualViewport = () => {
     const root = document.documentElement?.style;
-    if (!root) return;
-    if (vv && Number.isFinite(vv.height) && vv.height > 0) {
-      root.setProperty("--vv-height", `${Math.round(vv.height)}px`);
-      root.setProperty("--vv-top", `${Math.max(0, Math.round(vv.offsetTop || 0))}px`);
-    } else {
-      root.setProperty("--vv-height", "100dvh");
-      root.setProperty("--vv-top", "0px");
+    if (root) {
+      if (vv && Number.isFinite(vv.height) && vv.height > 0) {
+        root.setProperty("--vv-height", `${Math.round(vv.height)}px`);
+        root.setProperty("--vv-top", `${Math.max(0, Math.round(vv.offsetTop || 0))}px`);
+      } else {
+        root.setProperty("--vv-height", "100dvh");
+        root.setProperty("--vv-top", "0px");
+      }
     }
+    onViewportChange();
   };
   syncVisualViewport();
   if (vv && typeof vv.addEventListener === "function") {
@@ -159,15 +164,41 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     syncText();
   }
 
+  function ensureInkVisible({ forceFocused = false } = {}) {
+    const curVv = globalThis.visualViewport;
+    if (!curVv || !Number.isFinite(curVv.height) || curVv.height <= 0) return;
+    if (!isCoarse() && !lastPointerTouch) return;
+    const ed = S.textEditor();
+    if (!ed || !ed.textBox()) return;
+    if (ink.style.display === "none") return;
+    if (!forceFocused && document.activeElement !== ink) return;
+    const rect = ink.getBoundingClientRect();
+    const vvTop = Math.max(0, curVv.offsetTop || 0);
+    const visibleBottom = vvTop + curVv.height - INK_KEYBOARD_PAD_PX;
+    if (rect.bottom <= visibleBottom) return;
+    const overflowPx = rect.bottom - visibleBottom;
+    const maxUpPx = Math.max(0, rect.top - (vvTop + 16));
+    const shiftPx = Math.min(overflowPx, maxUpPx);
+    if (shiftPx <= 1) return;
+    const B = S.eds.board;
+    const scale = B.view.scale || 1;
+    S.eds.notes.cancelCamera();
+    B.animateViewTo({ ...B.view, y: B.view.y - shiftPx / scale });
+    dirty = true;
+  }
+  onViewportChange = () => ensureInkVisible();
+
   function syncText() {
     const ed = S.textEditor(), box = ed?.textBox();
     if (!box) { if (ink.style.display !== "none") { ink.style.display = "none"; ink.value = ""; } return; }
+    const wasHidden = ink.style.display === "none" || !ink.style.display;
     const fontSize = isCoarse() ? Math.max(16, box.size) : box.size;
     Object.assign(ink.style, { display: "block", left: `${box.x}px`, top: `${box.y}px`, width: `${box.w}px`, height: `${box.h}px`, fontSize: `${fontSize}px`, textAlign: box.align });
     if (ink.value !== ed.text.value) ink.value = ed.text.value;
     if (document.activeElement !== ink) { ink.focus(); ink.setSelectionRange(ink.value.length, ink.value.length); }
+    if (wasHidden) ensureInkVisible({ forceFocused: true });
   }
-  ink.addEventListener("input", () => S.textEditor()?.setText(ink.value));
+  ink.addEventListener("input", () => { S.textEditor()?.setText(ink.value); ensureInkVisible(); });
   ink.addEventListener("keydown", e => {
     e.stopPropagation();
     if (e.key === "Escape" || (e.key === "Enter" && (e.metaKey || e.ctrlKey))) { e.preventDefault(); S.textEditor()?.commitText(); canvas.focus(); }
@@ -201,6 +232,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   // Pointer input: core Editor owns multi-touch (pinch-zoom/pan, 2/3-finger tap undo/redo, palm rejection).
   canvas.addEventListener("pointerdown", e => {
+    lastPointerTouch = e.pointerType === "touch";
     canvas.focus(); canvas.setPointerCapture?.(e.pointerId); e.preventDefault();
     if (ui.sheet) { ui.sheet = null; chromeDirty = true; }
     clicks = Math.max(e.detail || 0, countClick(e));

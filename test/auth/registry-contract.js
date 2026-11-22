@@ -141,6 +141,57 @@ export function registryContract(name, makeRegistry, opts = {}) {
       await expect(r.createBoard({ tenant: "t-nope00000000" })).rejects.toThrow();
     });
 
+    test("updateBoard: updates title (trimmed/capped) and memberRole (none -> null); unknown returns null; bad input rejects", async () => {
+      const { b } = await tenantWithBoard({ title: "Initial", memberRole: "viewer" });
+      const u1 = await r.updateBoard(b.id, { title: "  Renamed Board  " });
+      expect(u1).toMatchObject({ id: b.id, title: "Renamed Board", memberRole: "viewer" });
+      expect(await r.board(b.id)).toEqual(u1);
+
+      const u2 = await r.updateBoard(b.id, { memberRole: "editor" });
+      expect(u2).toMatchObject({ id: b.id, title: "Renamed Board", memberRole: "editor" });
+
+      const u3 = await r.updateBoard(b.id, { memberRole: "none" });
+      expect(u3).toMatchObject({ id: b.id, title: "Renamed Board", memberRole: null });
+
+      const u4 = await r.updateBoard(b.id, { title: "x".repeat(250), memberRole: "commenter" });
+      expect(u4.title.length).toBe(200);
+      expect(u4.memberRole).toBe("commenter");
+
+      expect(await r.updateBoard("b-nope000000000000", { title: "Ghost" })).toBe(null);
+      await expect(r.updateBoard(b.id, { title: 123 })).rejects.toThrow();
+      await expect(r.updateBoard(b.id, { memberRole: "owner" })).rejects.toThrow();
+      await expect(r.updateBoard(b.id, { memberRole: "superadmin" })).rejects.toThrow();
+    });
+
+    test("deleteBoard: cascades grants, invites, links, and linkUses while preserving reg_audit; unknown returns false", async () => {
+      const { t, b } = await tenantWithBoard({ title: "Doomed" });
+      await r.setGrant(b.id, "google:root", "owner");
+      await r.setGrant(b.id, "google:ann", "editor");
+      const inv = await r.createInvite({ board: b.id, email: "bob@acme.com", role: "viewer", by: "google:root" });
+      const lnk = await r.createLink({ board: b.id, role: "annotator", by: "google:root" });
+      await r.addLinkUse(lnk.id, "google:cy");
+      const ev1 = await r.appendAudit({ tenant: t.id, board: b.id, actor: "google:root", action: "board.create", target: b.id, detail: { title: "Doomed" } });
+      const ev2 = await r.appendAudit({ tenant: t.id, board: b.id, actor: "google:root", action: "board.delete", target: b.id, detail: { title: "Doomed" } });
+
+      expect(await r.deleteBoard(b.id)).toBe(true);
+      expect(await r.deleteBoard(b.id)).toBe(false);
+      expect(await r.deleteBoard("b-nope000000000000")).toBe(false);
+
+      expect(await r.board(b.id)).toBe(null);
+      expect(await r.listBoards(t.id)).toEqual([]);
+      expect(await r.grants(b.id)).toEqual([]);
+      expect(await r.grant(b.id, "google:root")).toBe(null);
+      expect(await r.invites(b.id)).toEqual([]);
+      expect(await r.invite(inv.id)).toBe(null);
+      expect(await r.links(b.id)).toEqual([]);
+      expect(await r.link(lnk.id)).toBe(null);
+      expect(await r.linkUses(b.id, "google:cy")).toEqual([]);
+
+      // reg_audit rows for the deleted board must remain completely intact!
+      const audit = await r.listAudit({ tenant: t.id, board: b.id });
+      expect(audit.events.map(e => e.id)).toEqual([ev2.id, ev1.id]);
+    });
+
     test("reads return copies: mutating a result doesn't change the registry", async () => {
       const { t, b } = await tenantWithBoard();
       (await r.board(b.id)).title = "hacked";

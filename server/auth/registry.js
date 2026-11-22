@@ -126,6 +126,37 @@ export function memoryRegistry({ now = Date.now } = {}) {
       boards.set(b.id, b);
       return copy(b);
     },
+    async updateBoard(id, patch = {}) {
+      const hasTitle = patch != null && patch.title !== undefined;
+      const hasRole = patch != null && patch.memberRole !== undefined;
+      let nextTitle;
+      if (hasTitle) {
+        if (typeof patch.title !== "string") throw new Error("registry: bad title");
+        nextTitle = patch.title.trim().slice(0, 200);
+      }
+      let nextMemberRole;
+      if (hasRole) {
+        if (patch.memberRole === null || patch.memberRole === "none") nextMemberRole = null;
+        else if (typeof patch.memberRole === "string" && INVITE_ROLES.includes(patch.memberRole)) nextMemberRole = patch.memberRole;
+        else throw new Error("registry: bad memberRole");
+      }
+      if (typeof id !== "string") return null;
+      const b = boards.get(id);
+      if (!b) return null;
+      if (hasTitle) b.title = nextTitle;
+      if (hasRole) b.memberRole = nextMemberRole;
+      return copy(b);
+    },
+    async deleteBoard(id) {
+      if (typeof id !== "string" || !boards.has(id)) return false;
+      boards.delete(id);
+      grants.delete(id);
+      for (const [iid, inv] of invites) if (inv.board === id) invites.delete(iid);
+      for (const [lid, lnk] of links) if (lnk.board === id) links.delete(lid);
+      const prefix = id + "\n";
+      for (const k of [...uses.keys()]) if (k.startsWith(prefix)) uses.delete(k);
+      return true;
+    },
     async board(id) { return copy(boards.get(id)); },
     async listBoards(tenant) {
       if (typeof tenant !== "string") return [];

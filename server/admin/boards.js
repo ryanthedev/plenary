@@ -55,6 +55,19 @@ async function managed(registry, caller, boardId) {
   throw forbidden();
 }
 
+/** Strict board-owner check (unknown board or non-owner throws `forbidden`). */
+async function requireOwner(registry, caller, boardId) {
+  if (!caller || typeof caller.user !== "string" || typeof boardId !== "string") throw forbidden();
+  const b = await registry.board(boardId);
+  if (!b) throw forbidden();
+  if ((await registry.grant(b.id, caller.user)) === "owner") return b;
+  throw forbidden();
+}
+
+// Control characters (C0, DEL, C1), line/paragraph separators, and bidi control characters (keeps ZWJ/emoji intact).
+const CONTROL = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/u;
+const UPDATE_TITLE_MAX = 120;
+
 const expiry = (v, now) => {
   if (v == null) return null;
   if (!Number.isFinite(v) || v <= now) throw bad("expiresAt must be a future time (ms)");
@@ -117,6 +130,66 @@ export async function createBoard({ caller, tenant, title = "", memberRole = "vi
     at: now(),
   });
   return board;
+}
+
+/**
+ * PATCH /boards/:board. Board owner only; unknown board or non-owner throws `forbidden`.
+ * Validates non-empty patch (`title` and/or `memberRole`), trims/caps `title` (<= 120 chars, no control/bidi),
+ * normalizes `memberRole` (`"none"` / `null` -> `null`, or viewer|commenter|annotator|editor), and logs `board.update`.
+ * @param {{ caller: Identity, board: string, title?: unknown, memberRole?: unknown }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function updateBoard({ caller, board, title, memberRole }, { registry, now = Date.now }) {
+  const b = await requireOwner(registry, caller, board);
+  const hasTitle = title !== undefined;
+  const hasRole = memberRole !== undefined;
+  if (!hasTitle && !hasRole) throw bad("nothing to update");
+  const patch = {};
+  if (hasTitle) {
+    if (typeof title !== "string" || CONTROL.test(title)) throw bad("bad title");
+    const trimmed = title.trim();
+    if (trimmed.length > UPDATE_TITLE_MAX) throw bad("bad title");
+    patch.title = trimmed;
+  }
+  if (hasRole) {
+    if (!(await isTenantAdmin(registry, caller, b.tenant))) throw forbidden();
+    if (memberRole === null || memberRole === "none") patch.memberRole = null;
+    else if (typeof memberRole === "string" && INVITE_ROLES.includes(memberRole)) patch.memberRole = memberRole;
+    else throw bad("bad memberRole");
+  }
+  const updated = await registry.updateBoard(b.id, patch);
+  if (!updated) throw forbidden();
+  await recordAudit(registry, {
+    tenant: updated.tenant,
+    board: updated.id,
+    actor: caller.user,
+    action: "board.update",
+    target: updated.id,
+    detail: { title: updated.title, memberRole: updated.memberRole },
+    at: now(),
+  });
+  return updated;
+}
+
+/**
+ * DELETE /boards/:board. Board owner only; unknown board or non-owner throws `forbidden`.
+ * Writes `board.delete` audit only after `deleteBoard` succeeds (reg_audit.board has no FK, so tenant & board ID are preserved).
+ * @param {{ caller: Identity, board: string }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function deleteBoard({ caller, board }, { registry, now = Date.now }) {
+  const b = await requireOwner(registry, caller, board);
+  const deleted = await registry.deleteBoard(b.id);
+  if (!deleted) throw forbidden();
+  await recordAudit(registry, {
+    tenant: b.tenant,
+    board: b.id,
+    actor: caller.user,
+    action: "board.delete",
+    target: b.id,
+    detail: { title: b.title },
+    at: now(),
+  });
 }
 
 /** Give a user an explicit role on a board (or remove it with null). See the rules at the top. */

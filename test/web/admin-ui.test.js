@@ -109,6 +109,8 @@ describe("httpAdmin (web/adapters/admin/http.js)", () => {
     await api.removeTenantMember("t-1", "friend@gmail.com");
     await api.listBoards();
     await api.createBoard({ title: "Roadmap", memberRole: "editor", tenant: "t-1" });
+    await api.updateBoard("b-1", { title: "Roadmap v2", memberRole: "viewer" });
+    await api.deleteBoard("b-1");
     await api.listLinks("b-1");
     await api.createLink("b-1", { role: "viewer", expiresAt: 999999 });
     await api.revokeLink("b-1", "lnk-1");
@@ -128,6 +130,8 @@ describe("httpAdmin (web/adapters/admin/http.js)", () => {
       "DELETE https://plenary.example/tenants/t-1/members/friend%40gmail.com",
       "GET https://plenary.example/boards",
       "POST https://plenary.example/boards",
+      "PATCH https://plenary.example/boards/b-1",
+      "DELETE https://plenary.example/boards/b-1",
       "GET https://plenary.example/boards/b-1/links",
       "POST https://plenary.example/boards/b-1/links",
       "DELETE https://plenary.example/boards/b-1/links/lnk-1",
@@ -141,7 +145,8 @@ describe("httpAdmin (web/adapters/admin/http.js)", () => {
     expect(calls[1].body).toEqual({ name: "Design Lab" });
     expect(calls[3].body).toEqual({ email: "friend@gmail.com" });
     expect(calls[6].body).toEqual({ title: "Roadmap", memberRole: "editor", tenant: "t-1" });
-    expect(calls[13].body).toEqual({ role: "editor" });
+    expect(calls[7].body).toEqual({ title: "Roadmap v2", memberRole: "viewer" });
+    expect(calls[15].body).toEqual({ role: "editor" });
   });
 
   test("throws structured { status, code, message } errors on HTTP failure, malformed JSON, and network failure", async () => {
@@ -422,6 +427,99 @@ describe("mountBoardsHome (web/adapters/dom/admin.js)", () => {
     await flush();
 
     expect(createdBoards).toEqual([{ title: "Board in Org 2", memberRole: "viewer", tenant: "t-org2" }]);
+    view.destroy();
+  });
+
+  test("owner cards support inline rename and styled delete confirmation; non-owner cards hide rename/delete", async () => {
+    const { root } = installStubDom();
+    const opened = [];
+    const updatedCalls = [];
+    const deletedCalls = [];
+    const admin = {
+      listBoards: async () => ({
+        isAdmin: true,
+        boards: [
+          { id: "b-own", tenant: "t-1", title: "Owner Board", memberRole: "viewer", role: "owner", createdAt: Date.UTC(2026, 5, 1) },
+          { id: "b-ed", tenant: "t-1", title: "Shared Editor Board", memberRole: "editor", role: "editor", createdAt: Date.UTC(2026, 5, 2) },
+        ],
+      }),
+      updateBoard: async (id, patch) => {
+        updatedCalls.push([id, patch]);
+        return { board: { id, tenant: "t-1", title: patch.title, memberRole: "viewer", createdAt: Date.UTC(2026, 5, 1) } };
+      },
+      deleteBoard: async id => {
+        deletedCalls.push(id);
+      },
+      adminAudit: async () => ({
+        events: [
+          { id: 2, tenant: "t-1", board: "b-own", actor: "google:1", action: "board.delete", target: "b-own", detail: { title: "Renamed Board" }, at: 2000 },
+          { id: 1, tenant: "t-1", board: "b-own", actor: "google:1", action: "board.update", target: "b-own", detail: { title: "Renamed Board" }, at: 1000 },
+        ],
+        nextBefore: null,
+      }),
+    };
+
+    const view = mountBoardsHome({
+      root,
+      admin,
+      me: { user: "google:1", name: "Alice" },
+      onOpenBoard: id => opened.push(id),
+    });
+    await view.ready;
+
+    const ownerCard = () => root.find(e => e.getAttribute("data-board-id") === "b-own");
+    const editorCard = () => root.find(e => e.getAttribute("data-board-id") === "b-ed");
+
+    // Non-owner card hides Rename and Delete
+    expect(editorCard().find(e => e.getAttribute("data-action") === "rename-board")).toBe(null);
+    expect(editorCard().find(e => e.getAttribute("data-action") === "delete-board")).toBe(null);
+
+    // Owner card shows Rename and Delete
+    const renameBtn = ownerCard().find(e => e.getAttribute("data-action") === "rename-board");
+    expect(renameBtn).not.toBe(null);
+    expect(ownerCard().find(e => e.getAttribute("data-action") === "delete-board")).not.toBe(null);
+
+    // Inline rename updates card title immediately without opening the board
+    renameBtn.click();
+    expect(opened).toEqual([]);
+    const renameForm = ownerCard().find(e => e.getAttribute("data-form") === "rename-board");
+    expect(renameForm).not.toBe(null);
+    const renameInput = renameForm.find(e => e.getAttribute("name") === "renameTitle");
+    renameInput.value = "  Renamed Board  ";
+    renameInput.fire("input");
+    renameForm.fire("submit");
+    await flush();
+
+    expect(updatedCalls).toEqual([["b-own", { title: "Renamed Board" }]]);
+    expect(ownerCard().find(e => e.className === "adm-card-title").textContent).toBe("Renamed Board");
+    expect(opened).toEqual([]);
+
+    // Delete opens styled confirmation dialog (cancel does nothing, confirm deletes and removes card)
+    ownerCard().find(e => e.getAttribute("data-action") === "delete-board").click();
+    expect(opened).toEqual([]);
+    const dlg = root.find(e => e.getAttribute("data-dialog") === "delete-board");
+    expect(dlg).not.toBe(null);
+    expect(dlg.textContent).toContain("Renamed Board");
+
+    dlg.findAll(e => e.getAttribute("data-action") === "cancel-delete")[1].click();
+    expect(root.find(e => e.getAttribute("data-dialog") === "delete-board")).toBe(null);
+    expect(deletedCalls).toEqual([]);
+    expect(ownerCard()).not.toBe(null);
+
+    ownerCard().find(e => e.getAttribute("data-action") === "delete-board").click();
+    root.find(e => e.getAttribute("data-action") === "confirm-delete").click();
+    await flush();
+
+    expect(deletedCalls).toEqual(["b-own"]);
+    expect(ownerCard()).toBe(null);
+    expect(editorCard()).not.toBe(null);
+
+    // Audit tab shows human-friendly labels for board.update and board.delete
+    root.find(e => e.getAttribute("data-tab") === "audit").click();
+    await flush();
+    expect(root.textContent).toContain('Updated board "Renamed Board"');
+    expect(root.textContent).toContain('Deleted board "Renamed Board"');
+
     view.destroy();
   });
 });

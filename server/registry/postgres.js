@@ -343,6 +343,45 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         return rowBoard(await one(tx, `SELECT * FROM ${BD} WHERE id = $1`, [id]));
       });
     },
+    async updateBoard(id, patch = {}) {
+      ready();
+      const hasTitle = patch != null && patch.title !== undefined;
+      const hasRole = patch != null && patch.memberRole !== undefined;
+      let nextTitle;
+      if (hasTitle) {
+        if (typeof patch.title !== "string" || !key(patch.title)) throw new Error("registry: bad title");
+        nextTitle = patch.title.trim().slice(0, 200);
+      }
+      let nextMemberRole;
+      if (hasRole) {
+        if (patch.memberRole === null || patch.memberRole === "none") nextMemberRole = null;
+        else if (typeof patch.memberRole === "string" && INVITE_ROLES.includes(patch.memberRole)) nextMemberRole = patch.memberRole;
+        else throw new Error("registry: bad memberRole");
+      }
+      if (!key(id)) return null;
+      return write(async tx => {
+        const cur = await one(tx, `SELECT id, tenant, title, member_role, created_at FROM ${BD} WHERE id = $1 FOR UPDATE`, [id]);
+        if (!cur) return null;
+        const t = hasTitle ? nextTitle : cur.title;
+        const r = hasRole ? nextMemberRole : cur.member_role;
+        await tx.unsafe(`UPDATE ${BD} SET title = $2, member_role = $3 WHERE id = $1`, [id, t, r]);
+        return rowBoard(await one(tx, `SELECT id, tenant, title, member_role, created_at FROM ${BD} WHERE id = $1`, [id]));
+      });
+    },
+    async deleteBoard(id) {
+      ready();
+      if (!key(id)) return false;
+      return write(async tx => {
+        const cur = await one(tx, `SELECT id FROM ${BD} WHERE id = $1 FOR UPDATE`, [id]);
+        if (!cur) return false;
+        await tx.unsafe(`DELETE FROM ${U} WHERE board = $1 OR link IN (SELECT id FROM ${L} WHERE board = $1)`, [id]);
+        await tx.unsafe(`DELETE FROM ${L} WHERE board = $1`, [id]);
+        await tx.unsafe(`DELETE FROM ${I} WHERE board = $1`, [id]);
+        await tx.unsafe(`DELETE FROM ${G} WHERE board = $1`, [id]);
+        const res = await tx.unsafe(`DELETE FROM ${BD} WHERE id = $1`, [id]);
+        return res.count > 0;
+      });
+    },
     async board(id) { ready(); return key(id) ? rowBoard(await one(db, `SELECT * FROM ${BD} WHERE id = $1`, [id])) : null; },
     async listBoards(tenant) {
       ready();

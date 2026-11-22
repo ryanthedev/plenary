@@ -146,6 +146,12 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     boardsByTenant: db.query("SELECT id, tenant, title, member_role, created_at FROM reg_boards WHERE tenant = ? ORDER BY created_at DESC, id ASC"),
     boardExists: db.query("SELECT 1 AS x FROM reg_boards WHERE id = ?"),
     insBoard: db.query("INSERT INTO reg_boards (id, tenant, title, member_role, created_at) VALUES (?, ?, ?, ?, ?)"),
+    updBoard: db.query("UPDATE reg_boards SET title = ?, member_role = ? WHERE id = ?"),
+    delBoardUses: db.query("DELETE FROM reg_link_uses WHERE board = ? OR link IN (SELECT id FROM reg_links WHERE board = ?)"),
+    delBoardLinks: db.query("DELETE FROM reg_links WHERE board = ?"),
+    delBoardInvites: db.query("DELETE FROM reg_invites WHERE board = ?"),
+    delBoardGrants: db.query("DELETE FROM reg_grants WHERE board = ?"),
+    delBoard: db.query("DELETE FROM reg_boards WHERE id = ?"),
 
     grant: db.query("SELECT role FROM reg_grants WHERE board = ? AND member = ?"),
     grants: db.query("SELECT member, role FROM reg_grants WHERE board = ? ORDER BY n"),
@@ -219,6 +225,24 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
     const id = fresh(mint.board, i => !!q.boardExists.get(i));
     q.insBoard.run(id, tenant, title, memberRole, createdAt);
     return rowBoard(q.board.get(id));
+  });
+
+  const updateBoardTx = db.transaction((id, hasTitle, nextTitle, hasRole, nextMemberRole) => {
+    const cur = q.board.get(id);
+    if (!cur) return null;
+    const t = hasTitle ? nextTitle : cur.title;
+    const r = hasRole ? nextMemberRole : cur.member_role;
+    q.updBoard.run(t, r, id);
+    return rowBoard(q.board.get(id));
+  });
+
+  const deleteBoardTx = db.transaction(id => {
+    if (!q.boardExists.get(id)) return false;
+    q.delBoardUses.run(id, id);
+    q.delBoardLinks.run(id);
+    q.delBoardInvites.run(id);
+    q.delBoardGrants.run(id);
+    return q.delBoard.run(id).changes > 0;
   });
 
   // The last-owner check and the write share one IMMEDIATE transaction (the write lock is held from the first read).
@@ -316,6 +340,29 @@ export function sqliteRegistry({ path, now = Date.now, fullfsync = true, busyTim
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
       return createBoardTx.immediate(tenant, String(title), nz(memberRole), now());
+    },
+    async updateBoard(id, patch = {}) {
+      ready();
+      const hasTitle = patch != null && patch.title !== undefined;
+      const hasRole = patch != null && patch.memberRole !== undefined;
+      let nextTitle = null;
+      if (hasTitle) {
+        if (typeof patch.title !== "string") throw new Error("registry: bad title");
+        nextTitle = patch.title.trim().slice(0, 200);
+      }
+      let nextMemberRole = null;
+      if (hasRole) {
+        if (patch.memberRole === null || patch.memberRole === "none") nextMemberRole = null;
+        else if (typeof patch.memberRole === "string" && INVITE_ROLES.includes(patch.memberRole)) nextMemberRole = patch.memberRole;
+        else throw new Error("registry: bad memberRole");
+      }
+      if (!str(id)) return null;
+      return updateBoardTx.immediate(id, hasTitle, nextTitle, hasRole, nextMemberRole);
+    },
+    async deleteBoard(id) {
+      ready();
+      if (!str(id)) return false;
+      return deleteBoardTx.immediate(id);
     },
     async board(id) { ready(); return str(id) ? rowBoard(q.board.get(id)) ?? null : null; },
     async listBoards(tenant) {

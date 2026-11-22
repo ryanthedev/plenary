@@ -208,7 +208,26 @@ const ADMIN_CSS = `
   font-size: 12px;
   color: var(--fg-dim, #625F57);
 }
-.adm-card-acts { display: flex; gap: 6px; }
+.adm-card-acts { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.adm-rename-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+.adm-rename-input {
+  height: 30px;
+  padding: 0 8px;
+  font-size: 13px;
+  flex: 1 1 120px;
+}
+.adm-btn.danger.solid {
+  background: var(--bad, #C81E1E);
+  border-color: var(--bad, #C81E1E);
+  color: #FFFFFF;
+}
+.adm-btn.danger.solid:hover:not(:disabled) { opacity: 0.9; background: var(--bad, #C81E1E); }
 .adm-error {
   padding: 12px 14px;
   border-radius: 10px;
@@ -463,6 +482,8 @@ const ICONS = {
   link: () => icon(["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"]),
   sun: () => icon(["M12 3v2", "M12 19v2", "M4.93 4.93l1.41 1.41", "M17.66 17.66l1.41 1.41", "M3 12h2", "M19 12h2", "M4.93 19.07l1.41-1.41", "M17.66 6.34l1.41-1.41", "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"]),
   moon: () => icon(["M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"]),
+  edit: () => icon(["M12 20h9", "M16.5 3.5a2.12 2.12 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5z"]),
+  trash: () => icon(["M3 6h18", "M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2", "M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"]),
 };
 
 function boardPreviewSvg() {
@@ -516,6 +537,8 @@ function errMessage(err, fallback = "Something went wrong") {
 
 const AUDIT_LABELS = {
   "board.create": "Created board",
+  "board.update": "Updated board",
+  "board.delete": "Deleted board",
   "grant.set": "Updated role",
   "invite.create": "Sent invite",
   "invite.revoke": "Revoked invite",
@@ -530,6 +553,8 @@ function auditSummary(ev) {
   const label = AUDIT_LABELS[ev.action] ?? ev.action;
   const d = ev.detail && typeof ev.detail === "object" ? ev.detail : {};
   if (ev.action === "board.create") return `${label}${d.title ? ` "${d.title}"` : ""}`;
+  if (ev.action === "board.update") return `${label}${d.title ? ` "${d.title}"` : ""}`;
+  if (ev.action === "board.delete") return `${label}${d.title ? ` "${d.title}"` : ""}`;
   if (ev.action === "invite.create") return `${label} to ${d.email ?? ev.target ?? ""} (${d.role ?? ""})`;
   if (ev.action === "invite.revoke") return `${label} for ${d.email ?? ev.target ?? ""}`;
   if (ev.action === "link.create") return `${label} (${d.role ?? ""})`;
@@ -952,6 +977,13 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     newTenantId: "",
     creating: false,
     createError: null,
+    renamingId: null,
+    renameTitle: "",
+    renameBusy: false,
+    renameError: null,
+    deleteTarget: null,
+    deleting: false,
+    deleteError: null,
     orgName: "",
     creatingOrg: false,
     orgError: null,
@@ -1175,6 +1207,79 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     });
   }
 
+  function startRename(b) {
+    state.renamingId = b.id;
+    state.renameTitle = b.title || "";
+    state.renameError = null;
+    renderMain();
+    const inp = mainSlot.querySelector?.('input[name="renameTitle"]');
+    inp?.focus?.();
+    inp?.select?.();
+  }
+
+  function cancelRename() {
+    state.renamingId = null;
+    state.renameTitle = "";
+    state.renameError = null;
+    renderMain();
+  }
+
+  async function submitRename(e, b) {
+    e?.preventDefault?.();
+    e?.stopPropagation?.();
+    if (state.renameBusy || typeof admin.updateBoard !== "function") return;
+    const trimmed = state.renameTitle.trim();
+    state.renameBusy = true;
+    state.renameError = null;
+    renderMain();
+    try {
+      const res = await admin.updateBoard(b.id, { title: trimmed });
+      const updated = res?.board;
+      const nextTitle = updated?.title ?? trimmed;
+      state.boards = state.boards.map(x => (x.id === b.id ? { ...x, ...(updated || { title: trimmed }), role: x.role } : x));
+      state.renamingId = null;
+      state.renameTitle = "";
+      state.notice = `Renamed board to "${nextTitle || "Untitled board"}".`;
+    } catch (err) {
+      state.renameError = errMessage(err, "Failed to rename board");
+    } finally {
+      state.renameBusy = false;
+      if (!destroyed) renderMain();
+    }
+  }
+
+  function openDeleteConfirm(b) {
+    state.deleteTarget = b;
+    state.deleteError = null;
+    render();
+  }
+
+  function closeDeleteConfirm() {
+    state.deleteTarget = null;
+    state.deleteError = null;
+    render();
+  }
+
+  async function confirmDeleteBoard() {
+    const target = state.deleteTarget;
+    if (!target || state.deleting || typeof admin.deleteBoard !== "function") return;
+    state.deleting = true;
+    state.deleteError = null;
+    render();
+    try {
+      await admin.deleteBoard(target.id);
+      state.boards = state.boards.filter(x => x.id !== target.id);
+      if (state.renamingId === target.id) { state.renamingId = null; state.renameTitle = ""; }
+      state.deleteTarget = null;
+      state.notice = `Deleted board "${target.title || "Untitled board"}".`;
+    } catch (err) {
+      state.deleteError = errMessage(err, "Failed to delete board");
+    } finally {
+      state.deleting = false;
+      if (!destroyed) render();
+    }
+  }
+
   function filteredBoards() {
     const q = state.search.trim().toLowerCase();
     if (!q) return state.boards;
@@ -1191,7 +1296,26 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
       || auditSummary(ev).toLowerCase().includes(q));
   }
 
+  function renderDeleteConfirmModal() {
+    const target = state.deleteTarget;
+    if (!target) return null;
+    const title = target.title || "Untitled board";
+    return h("div.adm-veil", { onclick: e => { if (e.target === e.currentTarget && !state.deleting) closeDeleteConfirm(); } },
+      h("div.adm-modal", { role: "dialog", "aria-modal": "true", "aria-label": "Delete Board", "data-dialog": "delete-board" },
+        h("div.adm-modal-head", {},
+          h("h2", {}, "Delete Board"),
+          h("button.adm-btn.sm", { type: "button", "data-action": "cancel-delete", "aria-label": "Close", disabled: state.deleting, onclick: closeDeleteConfirm }, ICONS.close())),
+        h("div.adm-modal-body", {},
+          state.deleteError ? h("div.adm-error", { role: "alert" }, h("span", {}, state.deleteError)) : null,
+          h("p", { style: { margin: "0" } }, `Are you sure you want to delete "${title}"?`),
+          h("p.adm-hint", {}, "This removes the board and revokes all access, share links, and invites.")),
+        h("div.adm-modal-foot", {},
+          h("button.adm-btn", { type: "button", "data-action": "cancel-delete", disabled: state.deleting, onclick: closeDeleteConfirm }, "Cancel"),
+          h("button.adm-btn.danger.solid", { type: "button", "data-action": "confirm-delete", disabled: state.deleting, onclick: confirmDeleteBoard }, state.deleting ? "Deleting…" : "Delete board"))));
+  }
+
   function renderNewBoardModal() {
+    if (state.deleteTarget) { replace(modalSlot, renderDeleteConfirmModal()); return; }
     if (!state.newOpen) { replace(modalSlot); return; }
     const close = () => { state.newOpen = false; state.createError = null; render(); };
     const admList = adminTenants();
@@ -1355,17 +1479,52 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
       createOrgCard,
       h("div.adm-grid", {}, items.map(b => {
         const title = b.title || "Untitled board";
-        const canShare = b.role === "owner" || state.isAdmin;
+        const isOwner = b.role === "owner";
+        const canShare = isOwner || state.isAdmin;
+        const isRenaming = state.renamingId === b.id;
         return h("article.adm-card", { "data-board-id": b.id },
           h("div.adm-thumb", { onclick: () => onOpenBoard?.(b.id) }, boardPreviewSvg()),
           h("div.adm-card-body", {},
-            h("div.adm-card-top", {},
-              h("span.adm-card-title", { title, onclick: () => onOpenBoard?.(b.id) }, title),
-              b.role ? h("span.adm-badge" + (b.role === "owner" ? ".owner" : ""), {}, b.role) : null),
+            isRenaming
+              ? [
+                h("form.adm-rename-form", {
+                  "data-form": "rename-board",
+                  onclick: e => e.stopPropagation?.(),
+                  onsubmit: e => submitRename(e, b),
+                },
+                h("input.adm-input.adm-rename-input", {
+                  type: "text",
+                  name: "renameTitle",
+                  maxlength: "120",
+                  "aria-label": "Board title",
+                  value: state.renameTitle,
+                  disabled: state.renameBusy,
+                  oninput: e => { state.renameTitle = e.target.value; },
+                  onkeydown: e => { if (e.key === "Escape") { e.preventDefault?.(); cancelRename(); } },
+                }),
+                h("button.adm-btn.sm.primary", { type: "submit", "data-action": "save-rename", disabled: state.renameBusy }, state.renameBusy ? "Saving…" : "Save"),
+                h("button.adm-btn.sm", { type: "button", "data-action": "cancel-rename", disabled: state.renameBusy, onclick: e => { e.stopPropagation?.(); cancelRename(); } }, "Cancel")),
+                state.renameError ? h("div.adm-error", { role: "alert", style: { marginBottom: "0", padding: "6px 10px", fontSize: "12px" } }, h("span", {}, state.renameError)) : null,
+              ]
+              : h("div.adm-card-top", {},
+                h("span.adm-card-title", { title, onclick: () => onOpenBoard?.(b.id) }, title),
+                b.role ? h("span.adm-badge" + (isOwner ? ".owner" : ""), {}, b.role) : null),
             h("div.adm-card-meta", {},
               h("span", {}, formatDate(b.createdAt)),
               h("div.adm-card-acts", {},
-                canShare ? h("button.adm-btn.sm", { type: "button", "data-action": "share-board", onclick: () => openShare(b) }, ICONS.share(), "Share") : null,
+                isOwner && !isRenaming ? h("button.adm-btn.sm", {
+                  type: "button",
+                  "data-action": "rename-board",
+                  title: "Rename board",
+                  onclick: e => { e.stopPropagation?.(); startRename(b); },
+                }, ICONS.edit(), "Rename") : null,
+                isOwner ? h("button.adm-btn.sm.danger", {
+                  type: "button",
+                  "data-action": "delete-board",
+                  title: "Delete board",
+                  onclick: e => { e.stopPropagation?.(); openDeleteConfirm(b); },
+                }, ICONS.trash(), "Delete") : null,
+                canShare ? h("button.adm-btn.sm", { type: "button", "data-action": "share-board", onclick: e => { e.stopPropagation?.(); openShare(b); } }, ICONS.share(), "Share") : null,
                 h("button.adm-btn.sm", { type: "button", "data-action": "open-board", onclick: () => onOpenBoard?.(b.id) }, "Open")))));
       })));
   }
@@ -1470,11 +1629,19 @@ export function mountBoardsHome({ root, admin, me = {}, onOpenBoard, onLogout = 
     if (!activeShare) renderNewBoardModal();
   }
 
+  const onKey = e => {
+    if (e.key !== "Escape") return;
+    if (state.deleteTarget && !state.deleting) { e.preventDefault?.(); closeDeleteConfirm(); }
+    else if (state.newOpen && !state.creating) { e.preventDefault?.(); state.newOpen = false; state.createError = null; render(); }
+  };
+  document.addEventListener?.("keydown", onKey);
+
   const ready = loadBoards();
   return {
     refresh: loadBoards,
     destroy() {
       destroyed = true;
+      document.removeEventListener?.("keydown", onKey);
       activeShare?.destroy();
       shell.remove();
       modalSlot.remove();

@@ -218,7 +218,7 @@ export function redactingLogger(log, urls) {
  * board on every redemption. The redeemer's other open sockets pick up the higher role on the next timed re-check.
  */
 export function announcingRegistry(registry, bus, log) {
-  // board → tenant and link → board never change (the port has no update for either): remembered, bounded, so a
+  // board → tenant and link → board don't move between tenants/boards (evicted on deleteBoard): remembered, bounded, so a
   // redemption wave costs no extra Registry reads (p5-load).
   const tenantOf = new Map(), boardOfLink = new Map();
   const remember = (m, k, v) => { if (m.size >= 10_000) m.delete(m.keys().next().value); m.set(k, v); };
@@ -239,6 +239,28 @@ export function announcingRegistry(registry, bus, log) {
   };
   return {
     ...registry,
+    async updateBoard(boardId, patch) {
+      const before = await registry.board(boardId).catch(() => null);
+      const out = await registry.updateBoard(boardId, patch);
+      if (out) {
+        remember(tenantOf, boardId, out.tenant);
+        if (!before || out.memberRole !== before.memberRole) await announce(boardId);
+      }
+      return out;
+    },
+    async deleteBoard(boardId) {
+      let tenant = tenantOf.get(boardId);
+      if (!tenant) {
+        const b = await registry.board(boardId).catch(() => null);
+        if (b) { tenant = b.tenant; remember(tenantOf, boardId, tenant); }
+      }
+      const deleted = await registry.deleteBoard(boardId);
+      if (deleted) {
+        await announce(boardId);
+        tenantOf.delete(boardId);
+      }
+      return deleted;
+    },
     setGrant: after("setGrant", board => board),
     createInvite: after("createInvite", o => o?.board),
     revokeInvite: after("revokeInvite", async id => (await registry.invite(id).catch(() => null))?.board),

@@ -16,6 +16,7 @@ import { cornerRadius, roundPolygon, fillLines, arrowheadCmds, fontClass, FONT_F
 import { parseLinkCardFromElement, linkCardOpenBadgeRect } from "./link-card.js";
 import { parseEmbedFromElement } from "./embed.js";
 import { effectsOf, clipPathCommands } from "./effects.js";
+import { metaOf, formatMetaBadgeText } from "./metadata.js";
 
 /** View-independent world-space geometry cache keyed by element object (auto-GC'd on doc edits). */
 const geoCache = new WeakMap();
@@ -422,6 +423,10 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     if (el.type === "frame") {
       out.push({ t: "path", id: el.id, cmds: pts.map((p, i) => [i ? "L" : "M", ...p]), stroke: theme.dim, width: 1, dash: null, opacity });
       out.push({ t: "text", id: el.id + ":name", x: pts[0][0], y: pts[0][1] - 18 * Math.min(1, s), text: el.name || "Frame", size: 12 * Math.min(1, s) + 2, color: theme.dim, align: "left", lineHeight: 1.2, opacity });
+      const frameMeta = metaOf(el);
+      if (frameMeta && progress >= 1) {
+        paintMetaBadge(el, frameMeta, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, allText: opts.allText });
+      }
       return;
     }
     if (glow > 0 && pts.length >= 2) {
@@ -437,6 +442,10 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
       }
     }
     if (stroke) { const cmds = []; sketch(cmds, trim(pts, progress), r, rough, progress >= 1); if (cmds.length) out.push({ t: "path", id: el.id, cmds, stroke, width, dash, opacity }); }
+    const shapeMeta = metaOf(el);
+    if (shapeMeta && progress >= 1) {
+      paintMetaBadge(el, shapeMeta, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, allText: opts.allText });
+    }
     return;
   }
 
@@ -608,6 +617,88 @@ function cardCirclePts(cx, cy, r, steps = 14) {
     pts.push([cx + Math.cos(t) * r, cy + Math.sin(t) * r]);
   }
   return pts;
+}
+
+/** Paint a compact, strictly clipped corner/footer metadata pill on a shape carrying `customData.meta`. */
+function paintMetaBadge(el, shapeMeta, Q, QNoRot, view, theme, out, { opacity, progress, aRot, aScale, allText }) {
+  const b = bbox(el);
+  if (b.w < 36 || b.h < 22) return;
+  const label = formatMetaBadgeText(shapeMeta);
+  if (!label) return;
+
+  const s = view.scale;
+  const padX = Math.min(6, b.w * 0.08);
+  const padY = Math.min(5, b.h * 0.12);
+  const pillH = Math.min(18, Math.max(12, b.h * 0.24), b.h - padY * 2);
+  if (pillH < 12) return;
+
+  let pillY = b.y + b.h - padY - pillH;
+  let maxPillW = b.w - padX * 2;
+  if (el.type === "ellipse" || el.type === "diamond") {
+    const cy = b.y + b.h / 2;
+    const rx = b.w / 2;
+    const ry = b.h / 2;
+    const targetFrac = el.type === "diamond" ? 0.66 : 0.76;
+    pillY = Math.max(b.y + padY, Math.min(b.y + b.h - padY - pillH, b.y + b.h * targetFrac - pillH / 2));
+    const dy = Math.max(Math.abs(pillY - cy), Math.abs(pillY + pillH - cy));
+    if (dy >= ry) return;
+    const halfSpan = el.type === "ellipse"
+      ? rx * Math.sqrt(Math.max(0, 1 - (dy / ry) ** 2))
+      : rx * Math.max(0, 1 - dy / ry);
+    maxPillW = Math.max(0, 2 * halfSpan - padX * 2);
+  }
+  if (maxPillW < 24) return;
+
+  const fontSize = Math.min(10, Math.max(7.5, pillH * 0.62));
+  const rawW = textWidth(label, fontSize, FONT_FAMILY.sans) + 10;
+  const pillW = Math.min(maxPillW, Math.max(24, rawW));
+  const pillX = (el.type === "rectangle" || el.type === "frame") ? b.x + padX : b.x + (b.w - pillW) / 2;
+  if (pillX < b.x || pillX + pillW > b.x + b.w || pillY < b.y || pillY + pillH > b.y + b.h) return;
+
+  const dark = isDarkTheme(theme);
+  const pillBg = dark ? "#27272FE6" : "#F4F4F5EB";
+  const pillBorder = dark ? "#3F3F46" : "#D4D4D8";
+  const pillFg = dark ? "#E4E4E7" : "#3F3F46";
+
+  const pillPts = cardRoundRectPts(pillX, pillY, pillW, pillH, Math.min(5, pillH / 2), 3);
+  out.push({ t: "path", id: el.id + ":meta:bg", cmds: cardPolyCmds(el, pillPts, Q), fill: pillBg, opacity });
+  out.push({ t: "path", id: el.id + ":meta:border", cmds: cardPolyCmds(el, pillPts, Q, true), stroke: pillBorder, width: Math.max(0.5, 0.75 * s), dash: null, opacity });
+
+  if (allText || fontSize * s * aScale >= TEXT_MIN) {
+    const innerW = Math.max(0, pillW - 8);
+    let fitted = fitCardText(label, innerW, fontSize, FONT_FAMILY.sans);
+    if (shapeMeta.runbookUrl && !fitted.endsWith("↗")) {
+      const suffix = " ↗";
+      const suffixW = textWidth(suffix, fontSize, FONT_FAMILY.sans);
+      if (innerW > suffixW + textWidth("…", fontSize, FONT_FAMILY.sans)) {
+        const base = label.slice(0, -suffix.length);
+        fitted = fitCardText(base, innerW - suffixW, fontSize, FONT_FAMILY.sans) + suffix;
+      } else if (innerW >= textWidth("↗", fontSize, FONT_FAMILY.sans)) {
+        fitted = "↗";
+      }
+    }
+    const [cx, cy] = QNoRot(b.x + b.w / 2, b.y + b.h / 2);
+    const [px0, py0] = QNoRot(pillX, pillY);
+    const [px1, py1] = QNoRot(pillX + pillW, pillY + pillH);
+    out.push({
+      t: "text",
+      id: el.id + ":meta:text",
+      font: "sans",
+      angle: angleOf(el) + aRot,
+      cx,
+      cy,
+      x: px0,
+      y: py0,
+      text: fitted,
+      size: fontSize * s * aScale,
+      color: pillFg,
+      align: "center",
+      box: { x: px0, y: py0, w: px1 - px0, h: py1 - py0 },
+      lineHeight: 1.15,
+      opacity,
+      reveal: progress,
+    });
+  }
 }
 
 /** Crisp vector provider emblem drawn strictly with pure 2D path primitives. */

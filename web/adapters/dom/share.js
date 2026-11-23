@@ -24,12 +24,44 @@ async function copyToClipboard(text) {
 }
 
 /**
- * @param {{ host: HTMLElement, model: ReturnType<typeof import("../../core/share.js").createShareModel>, opener?: { focus?: () => void }|null, accessHref?: string|null, copy?: (text: string) => Promise<boolean>, now?: () => number }} o
+ * @param {{ host: HTMLElement, model: ReturnType<typeof import("../../core/share.js").createShareModel>, opener?: { focus?: () => void }|null, accessHref?: string|null, copy?: (text: string) => Promise<boolean>, share?: ((data: { title?: string, url: string }) => Promise<void>)|null, now?: () => number }} o
  */
-export function openShare({ host, model, opener = null, accessHref = null, copy = copyToClipboard, now = Date.now }) {
+export function openShare({ host, model, opener = null, accessHref = null, copy = copyToClipboard, share = typeof globalThis.navigator?.share === "function" ? data => globalThis.navigator.share(data) : null, now = Date.now }) {
   const S = model.state, id = ++seq;
   // One announcement: the text is visible here and said once through the page's live region (announce); this line is not itself a live region, so it is not read twice.
   const status = h("p.share-status", { tabindex: "-1", "data-fk": "share-status" });
+  const quickCopyBtn = h("button.btn.primary.share-quick-copy", {
+    type: "button",
+    "data-fk": "share-quick-copy",
+    onclick: async () => {
+      const url = model.boardUrl();
+      const ok = await copy(url);
+      status.textContent = ok ? "Board link copied." : "Could not copy board link.";
+      announce(status.textContent);
+    },
+  }, "Copy board link");
+  const quickNativeBtn = share
+    ? h("button.btn.share-quick-native", {
+      type: "button",
+      "data-fk": "share-quick-native",
+      onclick: async () => {
+        const url = model.boardUrl();
+        const title = S.view?.board?.title || "Plenary board";
+        try {
+          await share({ title, url });
+          status.textContent = "Share sheet opened.";
+          announce(status.textContent);
+        } catch (err) {
+          if (err?.name !== "AbortError") {
+            const ok = await copy(url);
+            status.textContent = ok ? "Board link copied." : "Could not share board link.";
+            announce(status.textContent);
+          }
+        }
+      },
+    }, "Share…")
+    : null;
+  const quickBar = h("div.share-quick-bar", { "data-share-quick": "true" }, quickCopyBtn, quickNativeBtn);
   const email = h("input.field", { type: "email", "aria-label": "Email address", "aria-describedby": `share-guest-${id}`, autocomplete: "off", maxlength: "320", placeholder: "name@company.com", "data-fk": "share-email",
     oninput: e => model.set("email", e.target.value) });
   const guest = h("p.from", { id: `share-guest-${id}` });
@@ -49,7 +81,7 @@ export function openShare({ host, model, opener = null, accessHref = null, copy 
   const accessNote = h("p.from", {});
   const boardHead = h("h3", {}, "On this board"), inheritedHead = h("h3", {}, "Who else has access · inherited");
   const boardLine = h("p.muted", { "aria-label": "Board" });
-  const content = h("div.share-body", {}, boardLine,
+  const content = h("div.share-body", {}, boardLine, quickBar,
     h("div.l", {}, h("h3", {}, "Invite people"),
       h("div.row", {}, email, roleSel, daysSel, inviteBtn), guest, sent, invites),
     h("div.l", {}, h("h3", {}, "Link access"), h("p.from", {}, "Anyone with the link signs in with Google first, then gets this role on this board only."),
@@ -58,7 +90,7 @@ export function openShare({ host, model, opener = null, accessHref = null, copy 
   const note = h("p", {}, "Loading…");
   const slot = h("div", {});                       // the form joins the dialog only once the server has said this person may share (so Tab never meets an unreachable control)
   const done = h("button.btn.primary", { type: "button", onclick: () => d.close() }, "Done");
-  const d = openDialog({ host, title: "Share this board", opener, onSubmit: async () => { if (await model.invite()) status.focus?.(); else if (S.notice) email.focus?.(); },
+  const d = openDialog({ host, title: "Share this board", opener, sheet: true, onSubmit: async () => { if (await model.invite()) status.focus?.(); else if (S.notice) email.focus?.(); },
     body: [note, status, slot], footer: [done] });
   done.focus?.();                                  // while loading the Done button is the only control: focus is inside the dialog from the first moment
   let built = false;

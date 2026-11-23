@@ -12,13 +12,14 @@ import { announce, captureFocus, restoreFocus } from "./focus.js";
 import { openDialog } from "./dialogs.js";
 import { shell, showNotice, message } from "./spaces.js";
 import { act, setOff, speak } from "./access.js";
+import { isMobileCardViewport, renderOffboardCards } from "./mobile/admin-cards.js";
 import { itemLabel, planLine, removeLines } from "../../core/offboard.js";
 
 /**
- * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/offboard.js").createOffboardModel>, hrefs: { home: string }, signIn?: { href: string, text?: string } | null, start?: string|null }} o
+ * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/offboard.js").createOffboardModel>, hrefs: { home: string }, signIn?: { href: string, text?: string } | null, start?: string|null, mobileCards?: boolean | null }} o
  *   start: a person to open at once (`?offboard=<user id>`)
  */
-export function mountOffboardPage({ root, model, hrefs, signIn = null, start = null }) {
+export function mountOffboardPage({ root, model, hrefs, signIn = null, start = null, mobileCards = null }) {
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   let dlg = null, reviewBtn = null, removeBtn = null, h1 = null, focusTo = null;
@@ -40,8 +41,8 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
       onchange: e => { const p = people.find(x => x.id === e.target.value); if (p && may && !S.busy) { focusTo = fk; model.choose(i, p); } else e.target.value = to.id; } },
       people.map(p => h("option", { value: p.id, selected: p.id === to.id }, p.id === S.defaults.recipient.id ? `${p.name} (${S.defaults.reason === "manager" ? "their manager" : "you"})` : p.name)));
     return h("tr", {}, h("th", { scope: "row" }, itemLabel(i), " ", h("span.badge", {}, i.type === "group" ? "Area" : i.personal ? "Personal space" : "Space"), i.trashed ? h("span.badge", {}, " In Trash") : null),
-      h("td", {}, may ? sel : h("span.muted", {}, i.can.why ?? "You can't hand this on.")),
-      h("td", {}, res ? h("span", { role: res.ok ? null : "alert" }, res.ok ? "Done. " : "Not done. ", res.text) : i.can.reassign ? "Not yet" : i.can.handover ? "Goes with the removal" : "Skipped"));
+      h("td", { "data-label": "New owner" }, may ? sel : h("span.muted", {}, i.can.why ?? "You can't hand this on.")),
+      h("td", { "data-label": "Status" }, res ? h("span", { role: res.ok ? null : "alert" }, res.ok ? "Done. " : "Not done. ", res.text) : i.can.reassign ? "Not yet" : i.can.handover ? "Goes with the removal" : "Skipped"));
   }
 
   function draw() {
@@ -55,8 +56,20 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     const finder = searchBox("Find a person", q => model.search(q), S.found, p => model.open(p.id), "offboard-find", "found");
     if (!S.member) return replace(main, crumbs, h("div.sp-head", {}, h1), h("p.sub-h", {}, "Reassign what they solely own, then remove them. Nothing moves until you confirm."), finder);
     const m = S.member, d = S.defaults, n = S.items.length, can = model.actionable().length, qualifies = can > 0 || model.handedOver() !== null;
-    const table = h("table.matrix", {}, h("caption", {}, `What ${m.name} solely owns`),
-      h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Item"), h("th", { scope: "col" }, "New owner"), h("th", { scope: "col" }, "Status"))), h("tbody", {}, S.items.map(row)));
+    const itemsView = isMobileCardViewport(mobileCards)
+      ? renderOffboardCards({
+        memberName: m.name,
+        items: S.items,
+        model,
+        busy: S.busy,
+        defaults: d,
+        results: S.results,
+        itemLabel,
+        onChoose: (item, person, fk) => { focusTo = fk; model.choose(item, person); },
+      })
+      : h("div.matrix-scroll", { role: "region", "aria-label": `What ${m.name} solely owns`, tabindex: "0" },
+        h("table.matrix", {}, h("caption", {}, `What ${m.name} solely owns`),
+          h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Item"), h("th", { scope: "col" }, "New owner"), h("th", { scope: "col" }, "Status"))), h("tbody", {}, S.items.map(row))));
     reviewBtn = act({ "data-fk": "review" }, "Review and reassign…", () => { dlg = null; if (model.openConfirm("items")) openConfirm(openerOf("review")); }, () => S.busy || !can);
     removeBtn = act({ "data-fk": "remove" }, `Remove ${m.name}…`, () => { if (model.openConfirm("remove")) openConfirm(openerOf("remove")); }, () => S.busy || !S.canRemove);
     setOff(reviewBtn, S.busy || !can); setOff(removeBtn, S.busy || !S.canRemove);
@@ -64,7 +77,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
       h("p", {}, `${m.name}${m.email ? ` (${m.email})` : ""}.`, qualifies ? ` Each item goes to ${d.recipient.name} (${d.reason === "manager" ? "their manager" : "you, as no manager is known"}) unless you pick someone else in its row.` : " You can't hand on any of their items."),
       m.removed ? h("p", {}, `${m.name} has been removed from the organization.`) : null,
       S.blocked === "admin" ? h("p", { role: "status" }, `${m.name} is an organization admin and can't be removed here.`) : null,
-      n ? [h("h2", {}, "Items"), h("div.matrix-scroll", { role: "region", "aria-label": `What ${m.name} solely owns`, tabindex: "0" }, table), S.next ? h("button.btn", { type: "button", onclick: () => model.more() }, "Show more") : null,
+      n ? [h("h2", {}, "Items"), itemsView, S.next ? h("button.btn", { type: "button", onclick: () => model.more() }, "Show more") : null,
         h("h2", {}, "Another new owner"), h("p.muted", {}, "Search for a person to offer them in every row's list."), searchBox("Find a new owner", q => model.search(q, "foundOwner"), S.foundOwner, p => model.addKnown(p), "offboard-owner", "foundOwner")]
         : !m.removed && !S.blocked ? message(`${m.name} solely owns nothing.`, "They can be removed now.") : null,
       h("div.pick-row", {}, n ? reviewBtn : null, !m.removed && !S.blocked ? removeBtn : null));

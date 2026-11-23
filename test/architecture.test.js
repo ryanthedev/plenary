@@ -34,7 +34,7 @@ import { ROOT, listFiles, importsOf, checkBoundaries } from "./arch-scan.js";
 const SCAN = ["packages", "server", "scripts", "deploy"];   // every non-test code folder but web/ (client's)
 const CORE_DIRS = ["packages/protocol/", "packages/core/", "server/admin/"];
 const CORE_FILES = ["server/gateway.js", "server/room-host.js", "server/feed.js", "server/breather.js", "server/ids.js", "server/log.js", "server/blob-access.js", "server/instrument.js", "server/trash-sweep.js", "server/blob-reaper.js"];
-const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/", "server/metrics/"];
+const ADAPTER_DIRS = ["server/store/", "server/registry/", "server/bus/", "server/blobs/", "server/auth/", "server/compress/", "server/metrics/", "server/live-sources/"];
 const SUPPORT_DIRS = ["server/pg/", "server/sqlite/", "server/encode/"];
 /** Driving adapters, each with its group: server.js serves HTTP/WebSocket (Bun.serve) and mounts static.js. */
 const DRIVING = {
@@ -42,7 +42,9 @@ const DRIVING = {
   "server/static.js": "server/http",
   "server/blob-http.js": "server/http",
   "server/metrics-http.js": "server/http",
+  "server/embed-http.js": "server/http",
   "server/auth/http.js": "server/auth/http",
+  "server/live-sources/handler.js": "server/live-sources/handler",
 };
 const COMPOSITION_ROOTS = [
   "server/main.js",
@@ -77,6 +79,7 @@ const NOT_ADAPTERS = {
   "server/auth/versions.js": "core: board version history & named snapshots over the Registry port and tenancy (#19)",
   "server/auth/compliance.js": "core: per-board/tenant data export and GDPR user erasure over the Registry port (#34)",
   "server/auth/share-policy.js": "core: share link policy (scrypt passcodes, expiry, noDownload, brute-force backoff) (#37)",
+  "server/auth/embed-token.js": "core: pure WebCrypto HMAC-SHA256 read-only board embed tokens (#23)",
 };
 /** Non-port modules a driven adapter may import. */
 const SHARED = ["server/ids.js", "server/auth/util.js"];

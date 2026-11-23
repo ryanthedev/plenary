@@ -1,18 +1,25 @@
 // @ts-check
-// Click-to-activate DOM overlay manager for YouTube & direct media URL embeds (Issue #112).
+// Click-to-activate DOM overlay manager for content embeds: YouTube, Figma, docs, PDF pages, and direct media (Issues #112, #24).
 // Modeled on web/adapters/dom/video-overlay.js:
-// - Mounts ZERO iframes or remote media elements until the user explicitly clicks Play (or calls activate(id)),
-//   preventing viewer waves from hammering YouTube or external media hosts.
-// - Once activated, mounts a tightly sandboxed `https://www.youtube-nocookie.com/embed/...` <iframe>
-//   (or mobile-safe `<video controls playsinline>` / `<img>`), synced to camera pan/zoom, with a Close
-//   button to return immediately to the lightweight 60fps canvas poster card.
+// - Mounts ZERO iframes or remote media elements until the user explicitly clicks Play/Open (or calls activate(id)),
+//   preventing viewer waves from hammering external hosts.
+// - Enforces tenant embed allow-list policy at render and activation time, showing a clear blocked notice when disallowed.
+// - Once activated, mounts a tightly sandboxed <iframe> (or mobile-safe `<video controls playsinline>` / `<img>`),
+//   synced to camera pan/zoom, with a Close button to return immediately to the lightweight 60fps canvas poster card.
 //
 // Hexagonal boundary: DOM adapter only (lives under web/adapters/dom/). No imports from other adapters.
 
-import { parseEmbedFromElement, YOUTUBE_EMBED_ORIGIN } from "../../../packages/core/embed.js";
+import {
+  parseEmbedFromElement,
+  isEmbedAllowed,
+  YOUTUBE_EMBED_ORIGIN,
+  FIGMA_EMBED_ORIGIN,
+  EMBED_SANDBOX,
+} from "../../../packages/core/embed.js";
 
 const YOUTUBE_EMBED_PREFIX = `${YOUTUBE_EMBED_ORIGIN}/embed/`;
-const IFRAME_SANDBOX = "allow-scripts allow-same-origin allow-presentation";
+const FIGMA_EMBED_PREFIX = `${FIGMA_EMBED_ORIGIN}/embed?`;
+const IFRAME_SANDBOX = EMBED_SANDBOX.youtube;
 const IFRAME_ALLOW = "accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture; fullscreen";
 
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
@@ -78,15 +85,24 @@ export function isEmbedVisible(rect, viewport, margin = 64) {
 }
 
 /**
- * Mount the click-to-activate DOM overlay manager for media embed cards.
+ * Mount the click-to-activate DOM overlay manager for content embed cards.
  * Dependencies (`doc`, `win`) are injectable for headless unit tests.
- * @param {{ root?: HTMLElement, doc?: Document, win?: typeof globalThis, cullMargin?: number, onActivate?: (id: string) => void, onDeactivate?: (id: string) => void }} [opts]
+ * @param {{
+ *   root?: HTMLElement,
+ *   doc?: Document,
+ *   win?: typeof globalThis,
+ *   cullMargin?: number,
+ *   policy?: import("../../../packages/core/embed.js").EmbedPolicy | null,
+ *   onActivate?: ((id: string) => void) | null,
+ *   onDeactivate?: ((id: string) => void) | null,
+ * }} [opts]
  */
 export function createEmbedOverlay({
   root,
   doc = globalThis.document,
   win = globalThis.window ?? globalThis,
   cullMargin = 64,
+  policy = null,
   onActivate = null,
   onDeactivate = null,
 } = {}) {
@@ -97,6 +113,8 @@ export function createEmbedOverlay({
     if (node.parentNode && typeof node.parentNode.removeChild === "function") node.parentNode.removeChild(node);
     else node.remove?.();
   };
+
+  let activePolicy = policy;
 
   const layer = doc.createElement("div");
   layer.className = "embed-overlay-layer";
@@ -112,7 +130,7 @@ export function createEmbedOverlay({
 
   /** @type {Set<string>} */
   const active = new Set();
-  /** @type {Map<string, { wrap: HTMLElement, playBtn: HTMLButtonElement, mediaWrap: HTMLElement, media: HTMLElement | null, closeBtn: HTMLButtonElement, selFrame: HTMLElement, active: boolean, provider: string | null, embedUrl: string | null }>} */
+  /** @type {Map<string, { wrap: HTMLElement, playBtn: HTMLButtonElement, mediaWrap: HTMLElement, media: HTMLElement | null, blockedNotice: HTMLElement, closeBtn: HTMLButtonElement, selFrame: HTMLElement, active: boolean, blocked: boolean, provider: string | null, embedUrl: string | null }>} */
   const mounted = new Map();
   /** @type {Map<string, { el: any, embed: any }>} */
   const lastTargets = new Map();
@@ -154,7 +172,7 @@ export function createEmbedOverlay({
     entry.mediaWrap.style.display = "none";
     entry.mediaWrap.style.pointerEvents = "none";
     entry.closeBtn.style.display = "none";
-    entry.playBtn.style.display = "block";
+    if (!entry.blocked) entry.playBtn.style.display = "block";
   }
 
   function attachErrorFallback(entry, media, embed) {
@@ -218,6 +236,70 @@ export function createEmbedOverlay({
         border: "0",
         display: "block",
         background: "#000000",
+      });
+      return iframe;
+    }
+
+    if (embed.provider === "figma") {
+      if (typeof embed.embedUrl !== "string" || !embed.embedUrl.startsWith(FIGMA_EMBED_PREFIX)) return null;
+      const iframe = doc.createElement("iframe");
+      iframe.className = "embed-iframe embed-figma";
+      iframe.setAttribute("sandbox", EMBED_SANDBOX.figma);
+      iframe.setAttribute("allowfullscreen", "");
+      iframe.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
+      iframe.setAttribute("loading", "lazy");
+      iframe.setAttribute("title", embed.title || "Figma");
+      iframe.setAttribute("frameborder", "0");
+      iframe.src = embed.embedUrl;
+      Object.assign(iframe.style, {
+        width: "100%",
+        height: "100%",
+        border: "0",
+        display: "block",
+        background: "#1E1E1E",
+      });
+      return iframe;
+    }
+
+    if (embed.provider === "doc") {
+      if (typeof embed.embedUrl !== "string" || !embed.embedUrl.startsWith("https://")) return null;
+      const iframe = doc.createElement("iframe");
+      iframe.className = "embed-iframe embed-doc";
+      iframe.setAttribute("sandbox", EMBED_SANDBOX.doc);
+      iframe.setAttribute("referrerpolicy", "no-referrer");
+      iframe.setAttribute("loading", "lazy");
+      iframe.setAttribute("title", embed.title || "Document");
+      iframe.setAttribute("frameborder", "0");
+      iframe.src = embed.embedUrl;
+      Object.assign(iframe.style, {
+        width: "100%",
+        height: "100%",
+        border: "0",
+        display: "block",
+        background: "#FFFFFF",
+      });
+      return iframe;
+    }
+
+    if (embed.provider === "pdf") {
+      if (typeof embed.embedUrl !== "string" || (!embed.embedUrl.startsWith("https://") && !embed.embedUrl.startsWith("/blobs/"))) {
+        return null;
+      }
+      const iframe = doc.createElement("iframe");
+      iframe.className = "embed-iframe embed-pdf";
+      iframe.setAttribute("sandbox", EMBED_SANDBOX.pdf);
+      iframe.setAttribute("referrerpolicy", "no-referrer");
+      iframe.setAttribute("loading", "lazy");
+      iframe.setAttribute("title", embed.title || "PDF Document");
+      iframe.setAttribute("frameborder", "0");
+      if (embed.page) iframe.setAttribute("data-pdf-page", String(embed.page));
+      iframe.src = embed.embedUrl;
+      Object.assign(iframe.style, {
+        width: "100%",
+        height: "100%",
+        border: "0",
+        display: "block",
+        background: "#26262B",
       });
       return iframe;
     }
@@ -306,6 +388,25 @@ export function createEmbedOverlay({
       pointerEvents: "none",
     });
 
+    const blockedNotice = doc.createElement("div");
+    blockedNotice.className = "embed-blocked-notice";
+    blockedNotice.setAttribute("role", "status");
+    Object.assign(blockedNotice.style, {
+      position: "absolute",
+      inset: "0",
+      display: "none",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: "6px",
+      padding: "16px",
+      background: "rgba(18, 18, 22, 0.94)",
+      color: "#F4F4F5",
+      fontSize: "13px",
+      textAlign: "center",
+      pointerEvents: "none",
+    });
+
     const closeBtn = doc.createElement("button");
     closeBtn.type = "button";
     closeBtn.className = "embed-close-btn";
@@ -342,9 +443,11 @@ export function createEmbedOverlay({
       playBtn,
       mediaWrap,
       media: null,
+      blockedNotice,
       closeBtn,
       selFrame,
       active: false,
+      blocked: false,
       provider: null,
       embedUrl: null,
     };
@@ -365,6 +468,7 @@ export function createEmbedOverlay({
 
     appendNode(wrap, playBtn);
     appendNode(wrap, mediaWrap);
+    appendNode(wrap, blockedNotice);
     appendNode(wrap, closeBtn);
     appendNode(wrap, selFrame);
     appendNode(layer, wrap);
@@ -380,7 +484,23 @@ export function createEmbedOverlay({
     mounted.delete(id);
   }
 
+  function applyBlockedState(id, entry, embed, allowed) {
+    entry.blocked = !allowed;
+    entry.wrap.setAttribute("data-embed-blocked", allowed ? "false" : "true");
+    if (!allowed) {
+      if (active.has(id)) active.delete(id);
+      if (entry.active || entry.media) clearMedia(entry);
+      entry.playBtn.style.display = "none";
+      entry.playBtn.style.pointerEvents = "none";
+      entry.blockedNotice.textContent = `Embed blocked by tenant policy (${embed.host || embed.provider})`;
+      entry.blockedNotice.style.display = "flex";
+    } else {
+      entry.blockedNotice.style.display = "none";
+    }
+  }
+
   function applyActiveMedia(id, entry, embed, dragging) {
+    if (entry.blocked) return;
     if (!active.has(id)) {
       if (entry.active || entry.media) clearMedia(entry);
       return;
@@ -409,8 +529,13 @@ export function createEmbedOverlay({
     if (destroyed || typeof id !== "string" || !id) return false;
     const target = lastTargets.get(id);
     if (!target) return false;
-    const embed = parseEmbedFromElement(target.el);
+    const embed = parseEmbedFromElement(target.el, { policy: activePolicy });
     if (!embed) return false;
+    if (!isEmbedAllowed(embed.url, activePolicy, embed.provider)) {
+      const entry = mounted.get(id);
+      if (entry) applyBlockedState(id, entry, embed, false);
+      return false;
+    }
     active.add(id);
     const entry = mounted.get(id);
     if (entry) applyActiveMedia(id, entry, embed, !!lastSyncArgs?.dragging);
@@ -455,10 +580,11 @@ export function createEmbedOverlay({
     layer,
     /**
      * Synchronize embed overlay containers with visible embed elements and camera transform.
-     * No iframe/video/img is created for an element unless it has been activated.
+     * No iframe/video/img is created for an element unless it has been activated and is allowed by policy.
      */
-    sync({ elements = [], view = { x: 0, y: 0, scale: 1 }, viewport = { w: 0, h: 0 }, selectedIds = null, dragging = false } = {}) {
+    sync({ elements = [], view = { x: 0, y: 0, scale: 1 }, viewport = { w: 0, h: 0 }, selectedIds = null, dragging = false, policy: syncPolicy = undefined } = {}) {
       if (destroyed) return;
+      if (syncPolicy !== undefined) activePolicy = syncPolicy;
       lastSyncArgs = { elements, view, viewport, selectedIds, dragging };
       lastTargets.clear();
 
@@ -467,7 +593,7 @@ export function createEmbedOverlay({
 
       for (const el of elements) {
         if (!el || el.isDeleted) continue;
-        const embed = parseEmbedFromElement(el);
+        const embed = parseEmbedFromElement(el, { policy: activePolicy });
         if (!embed) continue;
         liveIds.add(el.id);
         lastTargets.set(el.id, { el, embed });
@@ -478,6 +604,9 @@ export function createEmbedOverlay({
 
         const entry = mounted.get(el.id) ?? mountEntry(el.id, embed);
         entry.wrap.setAttribute("data-embed-provider", embed.provider);
+        const pdfPage = /** @type {any} */ (embed).page;
+        if (pdfPage) entry.wrap.setAttribute("data-pdf-page", String(pdfPage));
+        else entry.wrap.removeAttribute?.("data-pdf-page");
         entry.wrap.style.transform = rect.transform;
         entry.wrap.style.width = `${rect.w}px`;
         entry.wrap.style.height = `${rect.h}px`;
@@ -488,11 +617,15 @@ export function createEmbedOverlay({
         entry.wrap.className = isSelected ? "embed-el selected" : "embed-el";
         entry.selFrame.style.display = isSelected ? "block" : "none";
 
-        const playVisible = rect.w >= 48 && rect.h >= 36 && !active.has(el.id);
-        entry.playBtn.style.display = playVisible ? "block" : "none";
-        entry.playBtn.style.pointerEvents = !dragging && playVisible ? "auto" : "none";
+        const allowed = isEmbedAllowed(embed.url, activePolicy, embed.provider);
+        applyBlockedState(el.id, entry, embed, allowed);
 
-        applyActiveMedia(el.id, entry, embed, dragging);
+        if (allowed) {
+          const playVisible = rect.w >= 48 && rect.h >= 36 && !active.has(el.id);
+          entry.playBtn.style.display = playVisible ? "block" : "none";
+          entry.playBtn.style.pointerEvents = !dragging && playVisible ? "auto" : "none";
+          applyActiveMedia(el.id, entry, embed, dragging);
+        }
       }
 
       // Cull off-screen or deleted embeds
@@ -503,6 +636,10 @@ export function createEmbedOverlay({
       for (const id of [...active]) {
         if (!liveIds.has(id)) active.delete(id);
       }
+    },
+    setPolicy(nextPolicy) {
+      activePolicy = nextPolicy ?? null;
+      if (lastSyncArgs) this.sync(lastSyncArgs);
     },
     activate,
     deactivate,

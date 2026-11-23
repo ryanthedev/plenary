@@ -12,6 +12,7 @@ import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
 import { shell, showNotice, gate, message } from "./spaces.js";
 import { act, setOff, speak, quiet } from "./access.js";
+import { isMobileCardViewport, renderRolePermissionCards } from "./mobile/admin-cards.js";
 import { SCOPE_LABEL, LADDER_LABEL, usedText, impactText, rangeText } from "../../core/role-admin.js";
 
 const KIND = { builtin: "Built-in, read-only", member: "Built-in, permissions editable", custom: "Custom" };
@@ -19,9 +20,9 @@ const CELL = { yes: ["✓", "applies"], no: ["", "not granted"], na: ["–", "no
 
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/role-admin.js").createRolesModel>, hrefs: { home: string },
- *   signIn?: { href: string, text?: string } | null }} o
+ *   signIn?: { href: string, text?: string } | null, mobileCards?: boolean | null }} o
  */
-export function mountRolesPage({ root, model, hrefs, signIn = null }) {
+export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards = null }) {
   const S = model.state;
   const { status, main } = shell(root, hrefs);
   const keys = keeper();
@@ -56,6 +57,18 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
   };
 
   function matrixView(rows, editable) {
+    if (isMobileCardViewport(mobileCards)) {
+      return renderRolePermissionCards({
+        rows,
+        scopeLabels: SCOPE_LABEL,
+        cellMeta: CELL,
+        editable,
+        busy: S.busy,
+        onToggle: id => model.toggle(id),
+        mark: keys.mark,
+        ctl,
+      });
+    }
     const head = h("tr", {}, h("th", { scope: "col" }, "Permission"), h("th", { scope: "col" }, "Granted"), S.page.matrix.scopes.map(s => h("th", { scope: "col" }, SCOPE_LABEL[s] ?? s)));
     let tierHead = false;
     const body = rows.flatMap(r => {
@@ -63,11 +76,11 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
         ? h("tr.tier-head", {}, h("th", { scope: "colgroup", colspan: String(2 + S.page.matrix.scopes.length) }, "Content tier", h("br"), h("small", {}, "Opening boards beyond your own access. Held at the organization only; only someone who holds a permission can give it.")))
         : null;
       const grant = r.group === "content"
-        ? h("td", {}, h("span", {}, r.ticked ? "Yes" : "No"), h("small", {}, " set by board access"))
-        : h("td", {}, keys.mark(ctl(h("input", { type: "checkbox", checked: r.ticked, "aria-label": `${r.label}, ${r.id}`, "aria-disabled": r.tickable ? "false" : "true", ...(r.reason ? { "aria-describedby": `reason-${r.id.replace(/\W/g, "-")}` } : {}),
+        ? h("td", { "data-label": "Granted" }, h("span", {}, r.ticked ? "Yes" : "No"), h("small", {}, " set by board access"))
+        : h("td", { "data-label": "Granted" }, keys.mark(ctl(h("input", { type: "checkbox", checked: r.ticked, "aria-label": `${r.label}, ${r.id}`, "aria-disabled": r.tickable ? "false" : "true", ...(r.reason ? { "aria-describedby": `reason-${r.id.replace(/\W/g, "-")}` } : {}),
           onclick: e => { if (!r.tickable || S.busy) { e.preventDefault?.(); return; } model.toggle(r.id); } })), `perm:${r.id}`));
       const row = h("tr", {}, h("th", { scope: "row" }, r.label, h("br"), h("code", {}, r.id), r.help ? h("br") : null, r.help ? h("small", {}, r.help) : null, r.reason ? h("br") : null, r.reason ? h("small", { id: `reason-${r.id.replace(/\W/g, "-")}`, class: "reason" }, r.reason) : null), grant,
-        r.cells.map(c => h("td", {}, h("span", { "aria-hidden": "true" }, CELL[c.state][0]), h("span.sr-only", {}, `${SCOPE_LABEL[c.scope]}: ${CELL[c.state][1]}`))));
+        r.cells.map(c => h("td", { "data-label": SCOPE_LABEL[c.scope] ?? c.scope }, h("span", { "aria-hidden": "true" }, CELL[c.state][0]), h("span.sr-only", {}, `${SCOPE_LABEL[c.scope]}: ${CELL[c.state][1]}`))));
       return heading ? [heading, row] : [row];
     });
     return h("div.matrix-scroll", { role: "region", "aria-label": "Permission matrix", tabindex: "0" },

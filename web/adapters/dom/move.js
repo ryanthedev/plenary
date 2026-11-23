@@ -29,7 +29,7 @@ export function openMove({ host, model, opener = null, onMoved }) {
   const cancel = h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel");
   const body = h("div.share-body", {}, h("p.from", {}, "Direct grants, invites and links travel with the board, and its address does not change."), where, diffBox);
   const slot = h("div", {});
-  const d = openDialog({ host, title: "Move board", opener: null, onClose: () => { if (!S.result) opener?.focus?.(); },
+  const d = openDialog({ host, title: "Move board", opener: null, sheet: true, onClose: () => { if (!S.result) opener?.focus?.(); },
     onSubmit: async () => { if (model.canMove() && await model.submit()) { d.close(); onMoved(S.result); } else if (S.notice) status.focus?.(); },
     body: [note, status, slot], footer: [cancel, move] });
   cancel.focus?.();

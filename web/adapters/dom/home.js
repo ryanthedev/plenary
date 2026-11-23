@@ -209,7 +209,9 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   let destroyed = false;
   /** @type {null|"members"|"audit"} */ let panel = null;
   let adminOpen = false;
+  let drawerOpen = false;
   let orgBusy = false;
+  /** @type {null | { close: () => void }} */ let activeCardSheet = null;
   const mem = { status: "idle", tenant: null, members: [], admins: [], busy: false, removing: null, seq: 0 };
   const audit = { status: "idle", tenant: null, events: [], nextBefore: null, loadingMore: false, seq: 0 };
 
@@ -217,17 +219,117 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const search = h("input.home-search", { type: "search", placeholder: "Search boards and Spaces", "aria-label": "Search boards and Spaces", autocomplete: "off", maxlength: "100", spellcheck: "false",
     oninput: e => { panel = null; model.setQuery(e.target.value); },
     onkeydown: e => { if (e.key === "Escape" && search.value) { search.value = ""; model.setQuery(""); e.preventDefault(); } } });
-  const side = h("nav.home-side", { "aria-label": "Home navigation" });
+  const drawerToggle = h("button.btn.ghost.home-drawer-toggle", {
+    type: "button",
+    "aria-label": "Open navigation",
+    "aria-expanded": "false",
+    "aria-controls": "home-side",
+    "data-mobile-drawer-toggle": "true",
+    onclick: () => setDrawer(!drawerOpen),
+  }, "☰");
+  const drawerBackdrop = h("div.home-drawer-backdrop", {
+    "aria-hidden": "true",
+    hidden: true,
+    onclick: () => setDrawer(false, true),
+  });
+  const side = h("nav.home-side", { id: "home-side", "aria-label": "Home navigation", "data-drawer-open": "false" });
+  const mobileTabs = h("nav.home-mobile-tabs", { role: "tablist", "aria-label": "Board views" });
   const main = h("main.home-main", { id: "home-main", tabindex: "-1" });
+  const fabHost = h("div.home-fab-host");
   const who = h("span.home-who");
   const orgBadge = h("span.home-org-badge");
   const top = h("header.home-top", {},
+    drawerToggle,
     h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, brandMark(), "Plenary"),
     orgBadge,
     h("div.home-searchbox", { role: "search" }, search, h("kbd", { "aria-hidden": "true" }, "/ or ⌘K")),
     h("span.spacer"), who);
-  const home = h("div.home.home-page", { id: "home" }, top, status, h("div.home-body", {}, side, main));
+  const home = h("div.home.home-page", { id: "home" }, top, status, mobileTabs, drawerBackdrop, h("div.home-body", {}, side, main), fabHost);
   root.replaceChildren(home);
+
+  function setDrawer(open, refocus = false) {
+    drawerOpen = Boolean(open);
+    side.setAttribute("data-drawer-open", drawerOpen ? "true" : "false");
+    drawerToggle.setAttribute("aria-expanded", drawerOpen ? "true" : "false");
+    drawerToggle.setAttribute("aria-label", drawerOpen ? "Close navigation" : "Open navigation");
+    drawerBackdrop.hidden = !drawerOpen;
+    if (S.data) renderSide();
+    if (!drawerOpen && refocus) drawerToggle.focus?.();
+  }
+
+  function closeCardSheet() {
+    if (!activeCardSheet) return;
+    const s = activeCardSheet;
+    activeCardSheet = null;
+    s.close();
+  }
+
+  function openCardActionsSheet(c, opener) {
+    closeCardSheet();
+    const label = c.title || "Untitled";
+    const href = boardHref(c.id);
+    const backdrop = h("div.mobile-board-actions-backdrop", { "aria-hidden": "true", onclick: () => close(true) });
+    const rows = [
+      h("a.sheet-action-row", { href, "data-card-sheet-action": "open" }, "Open board"),
+      !guest() ? h("button.sheet-action-row", {
+        type: "button",
+        "data-card-sheet-action": "star",
+        onclick: () => { close(true); model.toggleStar(c.id); },
+      }, c.starred ? "Unstar board" : "Star board") : null,
+      h("button.sheet-action-row", {
+        type: "button",
+        "data-card-sheet-action": "copy-link",
+        onclick: async () => {
+          close(true);
+          try {
+            const fullUrl = typeof globalThis.location?.origin === "string" && !/^https?:\/\//.test(href)
+              ? `${globalThis.location.origin}/${href.replace(/^\.?\//, "")}`
+              : href;
+            await globalThis.navigator?.clipboard?.writeText?.(fullUrl);
+            model.notify("Board link copied.");
+          } catch {
+            model.notify("Could not copy board link.");
+          }
+        },
+      }, "Copy board link"),
+      move && c.can?.move ? h("button.sheet-action-row", {
+        type: "button",
+        "data-card-sheet-action": "move",
+        onclick: () => {
+          close(false);
+          startMove({ host: root, move, board: c.id, opener, reload: () => model.load(), restoreFocus: () => main.focus?.() });
+        },
+      }, "Move to…") : null,
+      h("button.sheet-action-row", {
+        type: "button",
+        "data-card-sheet-action": "cancel",
+        onclick: () => close(true),
+      }, "Cancel"),
+    ].filter(Boolean);
+    const sheet = h("div.mobile-board-actions-sheet", {
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": `Actions for ${label}`,
+      "data-mobile-board-sheet": c.id,
+      tabindex: "-1",
+      onkeydown: e => { if (e.key === "Escape") { e.preventDefault?.(); close(true); } },
+    },
+    h("div.sheet-grabber", { "aria-hidden": "true" }),
+    h("div.mobile-sheet-header", {}, h("h3.mobile-sheet-title", {}, label)),
+    h("div.mobile-action-list", { role: "group", "aria-label": `Actions for ${label}` }, rows));
+    let closed = false;
+    function close(refocus = false) {
+      if (closed) return;
+      closed = true;
+      backdrop.remove();
+      sheet.remove();
+      if (activeCardSheet?.close === close) activeCardSheet = null;
+      if (refocus) opener?.focus?.();
+    }
+    activeCardSheet = { close };
+    root.append(backdrop, sheet);
+    sheet.focus?.();
+  }
 
   // Persistent inputs for self-serve Workspace creation and Members add-by-email (kept across redraws so typing never loses focus).
   const orgNameInput = h("input.field.home-org-input", { type: "text", maxlength: "80", autocomplete: "off", placeholder: "Workspace name (e.g. My Studio)", "aria-label": "Workspace name" });
@@ -368,7 +470,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const newSpace = () => mark(h("button.btn.home-side-add", { type: "button", title: "New space", "aria-label": "New space", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New space")), "new-space");
   const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn.home-side-add", { type: "button", title: "New area", "aria-label": "New area", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New area")), "new-group") : null);
   const navBtn = (view, label, count) => mark(h("button.nav", { type: "button", "aria-current": S.view === view && !panel && !S.query.trim() ? "page" : null,
-    onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); } }, label, count != null ? h("span.n", {}, String(count)) : null), `nav:${view}`);
+    onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); setDrawer(false); } }, label, count != null ? h("span.n", {}, String(count)) : null), `nav:${view}`);
 
   function openTemplate(tpl, opener) {
     if (guest() || typeof dialogs?.newBoard !== "function") return;
@@ -432,12 +534,20 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
         h("span.card-when", {}, when))
       : h("span.p", { title: fullMeta }, h("span.card-meta-prefix", {}, prefix));
     const roleKey = c.role ? String(c.role).toLowerCase().replace(/[^a-z0-9-]/g, "") : "";
+    const mobileActionsBtn = h("button.btn.ghost.card-mobile-actions", {
+      type: "button",
+      "aria-label": `Actions for ${label}`,
+      "aria-haspopup": "dialog",
+      "data-mobile-card-actions": c.id,
+      onclick: e => openCardActionsSheet(c, e.currentTarget),
+    }, "⋯");
     return h(`li.card${menu ? ".has-menu" : ""}`, {},
       mark(h("a.card-open", { href: boardHref(c.id) },
         h("div.card-preview", { "aria-hidden": "true", "data-preview-variant": String(previewVariant(c.id)) }, boardPreviewSvg(c.id)),
         h("div.card-body", {}, h("span.t", { title: label }, label), meta)), `card:${sec}:${c.id}`),
       c.role ? h("span", { class: `card-role${roleKey ? ` card-role-${roleKey}` : ""}`, "aria-hidden": "true" }, c.role) : null,
       menu ? h("span.card-menu.home-menu", {}, menu.el) : null,
+      mobileActionsBtn,
       guest() ? null : star(c, sec));
   }
   const cardList = (cards, label) => h("ul.cards", { "aria-label": label }, cards.map(c => card(c, label)));
@@ -487,11 +597,47 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       h("summary.home-admin-summary", {}, "Workspace Admin"),
       h("div.home-admin-list", {}, adminLinks))
       : null;
+    const drawerHead = drawerOpen
+      ? h("div.home-drawer-head", {},
+        h("strong", {}, d.unit?.name || "Navigation"),
+        h("button.btn.ghost.home-drawer-close", { type: "button", "aria-label": "Close navigation", onclick: () => setDrawer(false, true) }, "✕"))
+      : null;
     replace(side,
+      drawerHead,
       d.guest ? null : newBoard(),
       h("div.home-nav-group", {}, navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length), dailyLinks),
       spacesSec,
       adminSec);
+  }
+
+  function renderMobileChrome() {
+    const d = S.data;
+    if (!d) {
+      replace(mobileTabs);
+      replace(fabHost);
+      return;
+    }
+    const tab = (view, label, count) => h("button.home-mobile-tab", {
+      type: "button",
+      role: "tab",
+      "data-mobile-tab": view,
+      "aria-selected": S.view === view && !panel && !S.query.trim() ? "true" : "false",
+      onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); },
+    }, label, count != null ? h("span.n", {}, String(count)) : null);
+    replace(mobileTabs,
+      tab("home", "Recent", null),
+      d.guest ? null : tab("starred", "Starred", d.starred.length),
+      tab("shared", "Shared", d.shared.length));
+
+    const showFab = !d.guest && typeof dialogs?.newBoard === "function";
+    replace(fabHost, showFab
+      ? h("button.btn.primary.home-fab", {
+        type: "button",
+        "aria-label": "New board",
+        "data-mobile-fab": "new-board",
+        onclick: e => { setPendingTemplate(storage, null, clock.now()); dialogs.newBoard({ opener: e.currentTarget }); },
+      }, "＋ New board")
+      : null);
   }
 
   function renderMembersPanel() {
@@ -574,6 +720,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   function render() { keys.around(draw); }
   function draw() {
     renderSide();
+    renderMobileChrome();
     renderMain();
     who.textContent = S.data ? S.data.user.name : "";
     const orgName = S.data && !S.data.guest && S.data.unit ? (S.data.unit.name || "Your workspace") : "";
@@ -585,10 +732,11 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   }
   const unsub = model.subscribe(render);
   const onKey = e => {
+    if (e.key === "Escape" && drawerOpen) { e.preventDefault?.(); setDrawer(false, true); return; }
     const typing = /^(input|textarea|select)$/i.test(e.target?.tagName ?? "") || e.target?.isContentEditable;
     if ((e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) || ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey) && !e.altKey)) { e.preventDefault(); search.focus(); }
   };
   document.addEventListener("keydown", onKey);
   render();
-  return { destroy() { destroyed = true; unsub(); document.removeEventListener("keydown", onKey); root.replaceChildren(); } };
+  return { destroy() { destroyed = true; closeCardSheet(); unsub(); document.removeEventListener("keydown", onKey); root.replaceChildren(); } };
 }

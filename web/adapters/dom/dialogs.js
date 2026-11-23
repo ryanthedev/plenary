@@ -17,14 +17,16 @@ export function randomKey(c = globalThis.crypto) {
 
 /**
  * One modal. `body` and `footer` are built by the caller; returns `{ close, el }`.
- * @param {{ host: HTMLElement, title: string, body: Node[], footer: Node[], opener?: { focus?: () => void } | null, onClose?: () => void, form?: boolean, onSubmit?: () => void }} o
+ * @param {{ host: HTMLElement, title: string, body: Node[], footer: Node[], opener?: { focus?: () => void } | null, onClose?: () => void, form?: boolean, onSubmit?: () => void, sheet?: boolean }} o
  */
-export function openDialog({ host, title, body, footer, opener = null, onClose, onSubmit }) {
+export function openDialog({ host, title, body, footer, opener = null, onClose, onSubmit, sheet = false }) {
   const hid = `dlg-title-${++seq}`;
   const form = h("form", { onsubmit: e => { e.preventDefault?.(); onSubmit?.(); } }, h("div.dbody", {}, body), h("footer", {}, footer));
-  const dialog = h("div.dialog.sp-dialog", { role: "dialog", "aria-modal": "true", "aria-labelledby": hid, tabindex: "-1" }, h("h2", { id: hid }, title), form);
+  const dialog = h(`div.dialog.sp-dialog${sheet ? ".sp-sheet-dialog" : ""}`, { role: "dialog", "aria-modal": "true", "aria-labelledby": hid, tabindex: "-1", ...(sheet ? { "data-mobile-sheet": "true" } : {}) },
+    sheet ? h("div.sheet-grabber", { "aria-hidden": "true" }) : null,
+    h("h2", { id: hid }, title), form);
   let trap = null;
-  const veil = h("div.dialog-veil.sp-veil", {
+  const veil = h(`div.dialog-veil.sp-veil${sheet ? ".sp-sheet-veil" : ""}`, {
     onclick: e => { if (e.target === e.currentTarget) close(); },
     onkeydown: e => trap?.handleKeyDown(e),
   }, dialog);

@@ -132,6 +132,7 @@ const ROUTES = {
   "PUT /home/stars/:board": { path: `/home/stars/${B}` },
   "DELETE /home/stars/:board": { path: `/home/stars/${B}` },
   "GET /links/:id": { path: "/links/abc" },
+  "POST /links/:id": { path: "/links/abc", body: { passcode: "1234" } },
   "GET /teams": { path: "/teams" },
   "POST /teams": { path: "/teams", body: { name: "T" } },
   "GET /teams/:id": { path: "/teams/t1" },

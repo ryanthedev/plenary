@@ -101,8 +101,11 @@ import { trashService } from "./trash.js";
 import { offboardService } from "./offboard.js";
 import { versionService } from "./versions.js";
 import { ComplianceError, exportBoardData, exportTenantData, eraseUserData } from "./compliance.js";
-import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView, listBoardAudit, listTenantAudit } from "../admin/boards.js";
+import { createLinkRateLimiter } from "./share-policy.js";
+import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, verifyLinkAccess, setGrant, shareView, listBoardAudit, listTenantAudit } from "../admin/boards.js";
 import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../admin/tenants.js";
+
+const defaultLinkRateLimiter = createLinkRateLimiter();
 
 export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
@@ -164,10 +167,11 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   testHooks?: { pruned?(p: { visited: number, expired: number, live: number }): void, routes?(table: { pattern: string, methods: string[], names: string[] }[]): void } | null,
  *   snapshot?: { get(board: string, seq: number): Promise<any> } | null,
  *   snapshotTickets?: { verify(t: string): Promise<{ board: string, seq: number, exp: number }|null> } | null,
+ *   linkRateLimiter?: import("./share-policy.js").LinkRateLimiter | null,
  *   timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
  * }} deps
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), versions = versionService({ registry, tenancy, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), versions = versionService({ registry, tenancy, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, linkRateLimiter = defaultLinkRateLimiter, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
   const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
@@ -371,10 +375,19 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     try { x = await mintCode(identity); } catch { failed("mint_failed"); return withCookie(err(503, "unavailable"), clearLogin); }
     const frag = "#code=" + x.code;   // base64url: URL-safe as is
     if (expected.link) {
-      let r = null, outage = false;
-      try { r = await tenancy.redeemLink(identity, expected.link); } catch { outage = true; }
+      let r = null, outage = false, passcodeRequired = false;
+      try {
+        r = await tenancy.redeemLink(identity, expected.link);
+        if (!r) {
+          const l = await registry.link(expected.link);
+          if (l && !l.revoked && (l.expiresAt == null || now() < l.expiresAt) && l.hasPasscode) {
+            passcodeRequired = true;
+          }
+        }
+      } catch { outage = true; }
       if (r) return redirect(boardUrl(r.board) + frag, [clearLogin, x.cookie]);
-      return redirect(postLoginUrl + frag + (outage ? "&link=unavailable" : "&link=invalid"), [clearLogin, x.cookie]);
+      const linkParam = outage ? "unavailable" : passcodeRequired ? `passcode-required&linkId=${encodeURIComponent(expected.link)}` : "invalid";
+      return redirect(postLoginUrl + frag + "&link=" + linkParam, [clearLogin, x.cookie]);
     }
     return redirect(postLoginUrl + frag, [clearLogin, x.cookie]);
   }
@@ -491,6 +504,22 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
 
   // ---- routes ----
   const admin = { registry, tenancy, now };
+  async function redeemLinkHttp(who, linkId, passcode) {
+    const checked = await verifyLinkAccess({ link: linkId, passcode }, { registry, now, rateLimiter: linkRateLimiter });
+    if ("code" in checked) {
+      if (checked.code === "passcode-required") return err(401, "passcode-required");
+      if (checked.code === "bad-passcode") return err(403, "bad-passcode");
+      if (checked.code === "rate-limited") {
+        const retryAfterMs = checked.retryAfterMs ?? 0;
+        const retryAfter = Math.max(1, Math.ceil(retryAfterMs / 1000));
+        return err(429, "rate-limited", { retryAfterMs, retryAfter }, { "retry-after": String(retryAfter) });
+      }
+      return err(404, "not-found");
+    }
+    const r = await tenancy.redeemLink(who, linkId, { verified: true });
+    if (!r) return err(404, "not-found");
+    return json(200, { board: r.board, url: boardUrl(r.board), ...(checked.policy.noDownload ? { noDownload: true } : {}) });
+  }
   const firstAdminTenant = async who => {
     const list = typeof tenancy.tenantsFor === "function" ? await tenancy.tenantsFor(who) : [];
     const adm = list.find(t => isTenantAdminRecord(t, who));
@@ -875,10 +904,21 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       GET: async (req, p) => json(200, { links: await listLinks({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
         const who = await caller(req);
-        const b = await body(req, ["role", "expiresAt"]);
+        const b = await body(req, ["role", "expiresAt", "passcode", "noDownload"]);
+        // Never feed plaintext passcode into the fast SHA-256 idempotency fingerprint (would create an offline guess oracle in reg_idempotency).
+        const { passcode: _omitPasscode, ...fpRest } = b;
+        const fpBody = b.passcode !== undefined ? { ...fpRest, hasPasscode: b.passcode != null } : fpRest;
         const linkBody = link => ({ link, ...(publicUrl ? { url: `${publicUrl}/links/${encodeURIComponent(link.id)}` } : {}) });
-        return keyed(req, who, "POST /boards/:board/links", p, b,
-          async idem => linkBody(await createLink({ caller: who, board: p.board, role: b.role, expiresAt: b.expiresAt ?? null, idem }, admin)),
+        return keyed(req, who, "POST /boards/:board/links", p, fpBody,
+          async idem => linkBody(await createLink({
+            caller: who,
+            board: p.board,
+            role: b.role,
+            expiresAt: b.expiresAt ?? null,
+            ...(b.passcode !== undefined ? { passcode: b.passcode } : {}),
+            ...(b.noDownload !== undefined ? { noDownload: b.noDownload } : {}),
+            idem,
+          }, admin)),
           async id => linkBody(await readLink({ caller: who, board: p.board, link: id }, admin)));
       },
     }],
@@ -911,13 +951,22 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         DELETE: async (req, p) => { await home.star(await caller(req), p.board, false); return json(204); },
       }],
     ] : []),
-    ["/links/:id", { GET: async (req, p) => {
-      if (!req.headers.has("authorization")) return beginLogin(p.id.slice(0, 128));
-      const who = await caller(req);
-      const r = await tenancy.redeemLink(who, p.id);
-      if (!r) return err(404, "not-found");
-      return json(200, { board: r.board, url: boardUrl(r.board) });
-    } }],
+    ["/links/:id", {
+      GET: async (req, p) => {
+        if (!req.headers.has("authorization")) return beginLogin(p.id.slice(0, 128));
+        const who = await caller(req);
+        // Passcodes are never accepted in URL query strings (prevents browser history / access-log leakage).
+        const passcode = req.headers.get("x-link-passcode") ?? undefined;
+        return redeemLinkHttp(who, p.id, passcode);
+      },
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const hasCt = Boolean(req.headers.get("content-type"));
+        const b = hasCt ? await body(req, ["passcode"]) : {};
+        const passcode = b.passcode ?? req.headers.get("x-link-passcode") ?? undefined;
+        return redeemLinkHttp(who, p.id, passcode);
+      },
+    }],
   ].map(([pattern, methods]) => {
     const names = [];
     const pat = String(pattern);
@@ -982,6 +1031,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "moved") return err(409, "moved");
         if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged" || e.code === "would-escalate") return err(409, e.code);
         if (e.code === "unknown-person" || e.code === "bad-role" || e.code === "bad-recipient") return err(400, e.code);
+        if (/** @type {string} */ (e.code) === "bad-passcode" || /** @type {string} */ (e.code) === "invalid") return err(400, e.code, { message: String(e.message).slice(0, 200) });
         if (e.code === "still-owns" || e.code === "is-admin" || e.code === "personal") return err(409, e.code);
         if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }

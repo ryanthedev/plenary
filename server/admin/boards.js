@@ -390,6 +390,7 @@ export async function listLinks({ caller, board }, deps) {
  * Never returns plaintext passcodes or passcode hashes.
  * @param {{ link: string, passcode?: unknown }} req
  * @param {{ registry: Registry, now?: () => number, rateLimiter?: import("../auth/share-policy.js").LinkRateLimiter|null }} deps
+ * @returns {Promise<{ ok: true, board: string, role: import("../auth/registry-port.js").Role, policy: { noDownload: boolean, expiresAt: number|null, hasPasscode: boolean } } | { ok: false, code: "expired"|"passcode-required"|"bad-passcode"|"rate-limited", retryAfterMs?: number }>}
  */
 export async function verifyLinkAccess({ link, passcode = undefined }, { registry, now = Date.now, rateLimiter = null }) {
   if (typeof link !== "string" || !link) return { ok: false, code: /** @type {const} */ ("expired") };
@@ -397,7 +398,7 @@ export async function verifyLinkAccess({ link, passcode = undefined }, { registr
   if (!row) return { ok: false, code: /** @type {const} */ ("expired") };
   const passcodeHash = row.hasPasscode ? await registry.linkPasscodeHash(row.id) : null;
   const res = checkLinkPolicy(row, { passcode, passcodeHash, now: now(), rateLimiter });
-  if (!res.ok) return res;
+  if (!res.ok) return /** @type {{ ok: false, code: "expired"|"passcode-required"|"bad-passcode"|"rate-limited", retryAfterMs?: number }} */ (res);
   const { policy } = /** @type {{ ok: true, policy: { noDownload: boolean, expiresAt: number|null, hasPasscode: boolean } }} */ (res);
   return { ok: true, board: row.board, role: row.role, policy };
 }

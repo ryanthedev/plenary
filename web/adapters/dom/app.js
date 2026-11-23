@@ -1800,8 +1800,27 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     picker.click();
   }
 
+  const boardModeration = () => {
+    const raw = S.eds.board.doc.appState?.herdr?.moderation;
+    const locked = raw?.locked === true;
+    const mutedUsers = Array.isArray(raw?.mutedUsers)
+      ? [...new Set(raw.mutedUsers.filter(u => typeof u === "string" && u.length >= 1 && u.length <= 128))].slice(0, 200)
+      : [];
+    return { locked, mutedUsers };
+  };
+  const toggleAudienceLock = () => {
+    if (S.role !== "presenter" || !S.may()) return;
+    const { locked, mutedUsers } = boardModeration();
+    const next = !locked;
+    const ok = S.act("board", e => e.setAppState({ moderation: { locked: next, mutedUsers } }), { settings: true });
+    if (!ok) return;
+    chromeDirty = true;
+    toast(next ? "Audience edits locked" : "Audience edits unlocked", 2000);
+  };
+
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
+    const { locked: audienceLocked } = boardModeration();
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
     const toggleDrawer = type => { ui.drawer = ui.drawer === type ? null : type; chromeDirty = true; };
     const toggleNotes = () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; };
@@ -1865,6 +1884,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const collabSection = menuSection("Collaborate", [
       boardMenuItem("note", "Notes", "Notes", toggleNotes, { badge: String(notesCount()), on: ui.drawer === "notes" }),
       collab ? boardMenuItem("comments", "Comments", "Comments", () => toggleDrawer("comments"), { on: ui.drawer === "comments" }) : null,
+      role === "presenter" && may
+        ? boardMenuItem(
+          audienceLocked ? "unlock" : "lock",
+          audienceLocked ? "Unlock audience edits" : "Lock audience edits",
+          audienceLocked ? "Unlock audience edits" : "Lock audience edits",
+          toggleAudienceLock,
+          { badge: audienceLocked ? "On" : "", on: audienceLocked },
+        )
+        : null,
       share && S.canShare ? boardMenuItem("share", "Share", "Share board", () => openShareDialog()) : (admin ? boardMenuItem("share", "Share", "Share board", () => openAdminShare()) : null),
       canMove() ? boardMenuItem("moveToLayer", "Move to…", "Move to…", openMoveDialog) : null,
     ]);
@@ -1961,6 +1989,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           ? h("a.brand-mark", { href: brandHref, title: homeHref ? "Home" : "All boards", "aria-label": homeHref ? "Home" : "All boards", style: { textDecoration: "none" } }, icon("brand", { size: 15 }))
           : h("span.brand-mark", { "aria-hidden": "true" }, icon("brand", { size: 15 })),
         titleNode,
+        audienceLocked ? h("span.board-locked-badge", { role: "status", "data-audience-locked": "1", title: "Audience edits are locked by presenter" }, icon("lock", { size: 12 }), " Locked") : null,
         moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null,
         viewsPill),
       h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
@@ -2582,7 +2611,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -2635,7 +2664,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}`, build: buildTopbar },
+    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${boardModeration().locked ? "1" : "0"}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
     drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t]); }, build: timeline },

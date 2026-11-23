@@ -14,6 +14,8 @@ import {
 import { memoryRegistry } from "../../server/auth/registry.js";
 import { sqliteRegistry } from "../../server/registry/sqlite.js";
 import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
+import { httpRoutes } from "../../server/auth/http.js";
+import { sessions as makeSessions } from "../../server/auth/session.js";
 import { createLink, shareView, verifyLinkAccess } from "../../server/admin/boards.js";
 
 const T0 = Date.UTC(2026, 10, 22, 12, 0, 0);
@@ -277,4 +279,171 @@ describe("share-policy: registry & admin createLink persistence (memory & sqlite
       }
     });
   }
+});
+
+describe("share-policy: HTTP createLink & redemption wiring (#37)", () => {
+  const ORIGIN = "https://plenary.test";
+  const httpConfig = {
+    cookieKey: "k".repeat(32),
+    postLoginUrl: ORIGIN + "/",
+    boardUrl: ORIGIN + "/b/{board}",
+    publicUrl: ORIGIN,
+  };
+
+  async function makeRig({ rateLimiterOpts } = {}) {
+    let t = T0;
+    const now = () => t;
+    const registry = memoryRegistry({ now });
+    const sessions = await makeSessions({ key: "s".repeat(32), now });
+    const tenancy = makeTenancy({ registry, now });
+    const tenant = await registry.createTenant({ domain: "acme.com", admins: ["google:ada"] });
+    const space = await registry.createSpace({ tenant: tenant.id, name: "General", owner: "google:ada" });
+    const board = await registry.createBoard({ tenant: tenant.id, title: "All-Hands", space: space.id, owner: "google:ada" });
+    const ownerId = { user: "google:ada", email: "ada@acme.com", domain: "acme.com", name: "Ada" };
+    const guestId = { user: "google:gus", email: "gus@gmail.com", domain: null, name: "Gus" };
+    const ownerTok = await sessions.issue(ownerId);
+    const guestTok = await sessions.issue(guestId);
+    const linkRateLimiter = rateLimiterOpts ? createLinkRateLimiter(rateLimiterOpts) : undefined;
+    const routes = httpRoutes({
+      registry,
+      sessions,
+      tenancy,
+      now,
+      config: httpConfig,
+      ...(linkRateLimiter ? { linkRateLimiter } : {}),
+    });
+    const req = (path, { method = "GET", token = null, body = undefined, headers = {} } = {}) =>
+      routes(new Request(ORIGIN + path, {
+        method,
+        headers: {
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+          ...headers,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      }));
+    return {
+      registry,
+      tenancy,
+      board,
+      ownerId,
+      guestId,
+      ownerTok,
+      guestTok,
+      req,
+      advance: ms => { t += ms; },
+    };
+  }
+
+  test("POST /boards/:board/links accepts passcode & noDownload and rejects invalid policy with 400", async () => {
+    const { board, ownerTok, req } = await makeRig();
+
+    // Invalid passcode (< 4 chars) -> 400
+    const badPass = await req(`/boards/${board.id}/links`, {
+      method: "POST",
+      token: ownerTok,
+      body: { role: "viewer", passcode: "123" },
+    });
+    expect(badPass.status).toBe(400);
+
+    // Invalid noDownload type -> 400
+    const badDl = await req(`/boards/${board.id}/links`, {
+      method: "POST",
+      token: ownerTok,
+      body: { role: "viewer", noDownload: "yes" },
+    });
+    expect(badDl.status).toBe(400);
+
+    // Valid passcode + noDownload -> 201 without leaking plaintext or hash
+    const created = await req(`/boards/${board.id}/links`, {
+      method: "POST",
+      token: ownerTok,
+      body: { role: "annotator", passcode: "pin-2026", noDownload: true, expiresAt: T0 + 3_600_000 },
+    });
+    expect(created.status).toBe(201);
+    const body = await created.json();
+    expect(body.link).toMatchObject({
+      board: board.id,
+      role: "annotator",
+      hasPasscode: true,
+      noDownload: true,
+      expiresAt: T0 + 3_600_000,
+    });
+    expect(body.url).toBe(`${ORIGIN}/links/${body.link.id}`);
+    expect(JSON.stringify(body)).not.toContain("pin-2026");
+    expect(JSON.stringify(body)).not.toContain("scrypt$");
+  });
+
+  test("open links remain 100% backwards-compatible on GET and POST /links/:id", async () => {
+    const { board, ownerTok, guestTok, guestId, tenancy, req } = await makeRig();
+    const res = await req(`/boards/${board.id}/links`, {
+      method: "POST",
+      token: ownerTok,
+      body: { role: "viewer" },
+    });
+    expect(res.status).toBe(201);
+    const { link } = await res.json();
+
+    const redeemed = await req(`/links/${link.id}`, { token: guestTok });
+    expect(redeemed.status).toBe(200);
+    expect(await redeemed.json()).toEqual({ board: board.id, url: `${ORIGIN}/b/${board.id}` });
+    expect(await tenancy.role(guestId, board.id)).toBe("viewer");
+  });
+
+  test("passcode-protected link enforces 401 passcode-required, 403 bad-passcode, 429 rate-limited, and 200 on valid passcode", async () => {
+    const { board, ownerTok, guestTok, guestId, tenancy, req, advance } = await makeRig({
+      rateLimiterOpts: { maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 10_000, windowMs: 60_000 },
+    });
+    const created = await req(`/boards/${board.id}/links`, {
+      method: "POST",
+      token: ownerTok,
+      body: { role: "annotator", passcode: "secret-42", noDownload: true },
+    });
+    expect(created.status).toBe(201);
+    const { link } = await created.json();
+
+    // Direct tenancy.redeemLink without passcode cannot bypass protection (e.g. OAuth callback path)
+    expect(await tenancy.redeemLink(guestId, link.id)).toBeNull();
+    expect(await tenancy.role(guestId, board.id)).toBeNull();
+
+    // Missing passcode -> 401 passcode-required (both GET and POST)
+    const missingGet = await req(`/links/${link.id}`, { token: guestTok });
+    expect(missingGet.status).toBe(401);
+    expect(await missingGet.json()).toEqual({ error: "passcode-required" });
+
+    const missingPost = await req(`/links/${link.id}`, { method: "POST", token: guestTok, body: {} });
+    expect(missingPost.status).toBe(401);
+    expect(await missingPost.json()).toEqual({ error: "passcode-required" });
+
+    // 3 wrong passcodes -> 403 bad-passcode each time, then rate-limited
+    for (const wrong of ["wrong-1", "wrong-2", "wrong-3"]) {
+      const bad = await req(`/links/${link.id}`, { method: "POST", token: guestTok, body: { passcode: wrong } });
+      expect(bad.status).toBe(403);
+      expect(await bad.json()).toEqual({ error: "bad-passcode" });
+    }
+
+    // 4th attempt (even with valid passcode) during backoff -> 429 rate-limited
+    const limited = await req(`/links/${link.id}`, { method: "POST", token: guestTok, body: { passcode: "secret-42" } });
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("1");
+    expect(await limited.json()).toMatchObject({ error: "rate-limited", retryAfter: 1 });
+    expect(await tenancy.role(guestId, board.id)).toBeNull();
+
+    // Advance past backoff window -> valid passcode succeeds via POST JSON body
+    advance(1_000);
+    const okPost = await req(`/links/${link.id}`, { method: "POST", token: guestTok, body: { passcode: "secret-42" } });
+    expect(okPost.status).toBe(200);
+    expect(await okPost.json()).toEqual({
+      board: board.id,
+      url: `${ORIGIN}/b/${board.id}`,
+      noDownload: true,
+    });
+    expect(await tenancy.role(guestId, board.id)).toBe("annotator");
+
+    // Also works via x-link-passcode header, and refuses URL query-string passcodes
+    const badQuery = await req(`/links/${link.id}?passcode=secret-42`, { token: guestTok });
+    expect(badQuery.status).toBe(401);
+    const okHeader = await req(`/links/${link.id}`, { token: guestTok, headers: { "x-link-passcode": "secret-42" } });
+    expect(okHeader.status).toBe(200);
+  });
 });

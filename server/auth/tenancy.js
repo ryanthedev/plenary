@@ -21,6 +21,7 @@
 import { higher, capTo, normEmail, verifiedEmail, isTenantAdminRecord, INVITE_ROLES } from "./util.js";
 import { resolveAccess, teamIndex, movedContext, mayMove } from "./resolver.js";
 import { HOME } from "./registry-port.js";
+import { checkLinkPolicy } from "./share-policy.js";
 export { oidcTenantBinding } from "./idp-port.js";
 
 /** @typedef {import("./registry-port.js").Registry} Registry */
@@ -343,12 +344,20 @@ export function tenancy({ registry, now = Date.now, recordUntil = () => Infinity
 
     /**
      * A signed-in user opened a share link. Records the use and returns `{ board }`, or null for an unknown,
-     * expired or revoked link (all the same answer). The role itself is re-read from the link on every role().
+     * expired, revoked, or passcode-rejected link. The role itself is re-read from the link on every role().
+     * @param {Identity} identity
+     * @param {string} linkId
+     * @param {{ passcode?: unknown, rateLimiter?: import("./share-policy.js").LinkRateLimiter|null, verified?: boolean }} [opts]
      */
-    async redeemLink(identity, linkId) {
+    async redeemLink(identity, linkId, { passcode = undefined, rateLimiter = null, verified = false } = {}) {
       if (!identity || typeof identity.user !== "string" || typeof linkId !== "string") return null;
       const l = await registry.link(linkId);
       if (!live(l, now())) return null;
+      if (l.hasPasscode && !verified) {
+        const passcodeHash = typeof registry.linkPasscodeHash === "function" ? await registry.linkPasscodeHash(l.id) : null;
+        const checked = checkLinkPolicy(l, { passcode, passcodeHash, now: now(), rateLimiter });
+        if (!checked.ok) return null;
+      }
       // A board in Trash cannot be joined (PROTOCOL.md § Trash and restore): the Registry refuses the use in the same atomic step (code "in-trash"), answered like an unknown link, nothing recorded.
       try { await registry.addLinkUse(l.id, identity.user); } catch (e) { if (e?.code === "in-trash") return null; throw e; }
       return { board: l.board };

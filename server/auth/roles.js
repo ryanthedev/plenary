@@ -46,7 +46,7 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   // ---- what a role is ----
   const storedMap = list => new Map(list.map(r => [r.id, r]));
   /** The member role as stored, or what it is until an admin edits it. */
-  const memberOf = roles => roles.get(MEMBER_ROLE_ID) ?? { id: MEMBER_ROLE_ID, name: "Unit member", base: null, boardRole: null, permissions: [...DEFAULT_MEMBER_PERMS] };
+  const memberOf = roles => roles.get(MEMBER_ROLE_ID) ?? { id: MEMBER_ROLE_ID, name: "Organization member", base: null, boardRole: null, permissions: [...DEFAULT_MEMBER_PERMS] };
   /** The permissions `role` gives AT THE UNIT (ladder content plus management), the measure of "may the caller hold this". */
   const unitPerms = (role, roles) => roleDef(role, "unit", roles)?.permissions ?? new Set();
   /** The Unit-wide admin capability: editing the Unit member role changes what EVERY member may do, so it is held to it (the one place tiered admin levels, #88, map to). */
@@ -59,11 +59,11 @@ export function rolesService({ registry, tenancy, announce = () => {} }) {
   /** One role as the screen shows it. `used`: `{ places, capped }` (custom), `{ members, capped }` (member), or null (built-in). */
   function view(role, roles, used = null, st = null) {
     if (ROLES.includes(role)) return { id: role, name: LADDER_NAMES[role], kind: "builtin", editable: false, summary: LADDER_SUMMARY[role], ladder: role, permissions: allMgmt(role), scopes: scopesOf(role, roles), used: null };
-    if (role === "admin") return { id: "admin", name: "Unit admin", kind: "builtin", editable: false, summary: "Manages the Unit: every management permission, no board content", ladder: null, permissions: [...MGMT_PERMS], scopes: scopesOf("admin", roles), used: null };
-    if (isTierRole(role)) return { id: role, name: BUILTIN_UNIT_NAMES[role], kind: "builtin", editable: false, used, summary: TIER_ROLES[role].includes("content.personal") ? "Opens every board of the Unit, including other people's personal spaces" : "Opens every board in every shared Space (not personal spaces)", ladder: null, permissions: [...TIER_ROLES[role]], scopes: scopesOf(role, roles) };
+    if (role === "admin") return { id: "admin", name: "Organization admin", kind: "builtin", editable: false, summary: "Manages the organization: every management permission, no board content", ladder: null, permissions: [...MGMT_PERMS], scopes: scopesOf("admin", roles), used: null };
+    if (isTierRole(role)) return { id: role, name: BUILTIN_UNIT_NAMES[role], kind: "builtin", editable: false, used, summary: TIER_ROLES[role].includes("content.personal") ? "Opens every board in the organization, including other people's personal spaces" : "Opens every board in every shared Space (not personal spaces)", ladder: null, permissions: [...TIER_ROLES[role]], scopes: scopesOf(role, roles) };
     if (role === MEMBER_ROLE_ID) {
       const m = memberOf(roles);
-      return { id: MEMBER_ROLE_ID, name: "Unit member", kind: "member", editable: !!st && unitWide(st), summary: "What everyone in the Unit gets", ladder: null, permissions: m.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(MEMBER_ROLE_ID, roles), used };
+      return { id: MEMBER_ROLE_ID, name: "Organization member", kind: "member", editable: !!st && unitWide(st), summary: "What everyone in the organization gets", ladder: null, permissions: m.permissions.filter(p => MGMT_PERMS.includes(p)), scopes: scopesOf(MEMBER_ROLE_ID, roles), used };
     }
     const c = roles.get(role);
     const mgmt = c.permissions.filter(p => MGMT_PERMS.includes(p)).length, tier = c.permissions.filter(p => TIER_PERMS.includes(p)).length;

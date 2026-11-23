@@ -87,7 +87,7 @@ test("DW-52.3 the access rows are the access page's, read-only: this board's peo
   const { m } = setup(); await m.load();
   expect(m.accessRows()).toEqual([
     { group: "board", name: "Ada", role: "Owner", from: "Added directly" }, { group: "board", name: "Infra", role: "Editor", from: "Team" },
-    { group: "inherited", name: "Product owners", role: "Owner", from: "via Group Product" },
+    { group: "inherited", name: "Product owners", role: "Owner", from: "via Area Product" },
     { group: "inherited", name: "Everyone in the organization", role: "Viewer", from: "via Space Design" },
     { group: "inherited", name: "Priya", role: "Admin", from: "organization admins manage access, not content" }]);
 });

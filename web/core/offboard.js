@@ -5,10 +5,10 @@
 
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const MSG = {
-  forbidden: "You can't do that. Only a Unit admin, or an owner of the item, can hand it on.", notfound: "This person is not available.", invalid: "The server did not accept that.",
-  "bad-recipient": "The new owner must be another member of the Unit who has not been removed.",
+  forbidden: "You can't do that. Only an organization admin, or an owner of the item, can hand it on.", notfound: "This person is not available.", invalid: "The server did not accept that.",
+  "bad-recipient": "The new owner must be another member of the organization who has not been removed.",
   personal: "A personal space goes with the removal. It can't be reassigned on its own.",
-  "still-owns": "This person still solely owns something. Reassign it first.", "is-admin": "A Unit admin can't be removed here.",
+  "still-owns": "This person still solely owns something. Reassign it first.", "is-admin": "An organization admin can't be removed here.",
 };
 const MAYBE = " It may have worked. Trying again unchanged is safe.";
 /** The sentence for a refused or failed call. */
@@ -26,7 +26,7 @@ export function planLine(i, to) {
 }
 /** What the removal does, as the confirm step words it. */
 export const removeLines = name => [
-  `${name} loses everything the Unit gave them: general access, their Space, Group and Team access, and their own grants on boards.`,
+  `${name} loses everything the organization gave them: general access, their Space, Area and Team access, and their own grants on boards.`,
   "Boards, their addresses, and guests' access stay. Invites and share links they made stay until they expire.",
   "This can't be undone here.",
 ];
@@ -128,7 +128,7 @@ export function createOffboardModel({ api, newKey = null }) {
       S.busy = false; S.progress = null;
       if (r.error) { fail(r); S.confirm = null; emit(); if (r.code === "still-owns") await self.loadFor(S.member.id); return false; }
       keys.delete(k); S.confirm = null;
-      S.said = `${S.member.name} was removed from the Unit.`;
+      S.said = `${S.member.name} was removed from the organization.`;
       emit();
       await self.loadFor(S.member.id);
       return true;

@@ -12,7 +12,7 @@ import { CONTENT_LABEL } from "./explain.js";
 /** What each permission is called on the screen (its id is shown beside it as code). */
 export const PERM_LABEL = {
   "board.view": "View boards", "board.comment": "Comment", "board.annotate": "Annotate", "board.edit": "Edit",
-  "board.create": "Create boards", "space.create": "Create Spaces", "group.create": "Create Groups", "members.manage": "Manage who has access",
+  "board.create": "Create boards", "space.create": "Create Spaces", "group.create": "Create Areas", "members.manage": "Manage who has access",
   move: "Move boards out", delete: "Delete and restore", transfer: "Transfer ownership", "roles.manage": "Manage roles", "team.manage": "Manage teams",
 };
 /** The content tier (Unit level only): who may open boards beyond their own access. Said plainly, because it is the sensitive part of a role. */
@@ -22,7 +22,7 @@ export const PERM_HELP = {
   "content.personal": "Open, move out, trash, restore and hand over boards in other people's personal spaces. Needs a reason: it reads private work.",
 };
 export const permLabel = id => PERM_LABEL[id] ?? id;
-export const SCOPE_LABEL = { unit: "Organization", group: "Group", space: "Space", board: "Board" };
+export const SCOPE_LABEL = { unit: "Organization", group: "Area", space: "Space", board: "Board" };
 export const LADDER_LABEL = { viewer: "Viewer", commenter: "Commenter", annotator: "Annotator", editor: "Editor" };
 const MSG = {
   "too-large": limit => `This organization has the most custom roles it can (${limit}). Delete one first.`,
@@ -221,7 +221,7 @@ export function createRolesModel({ api, newKey = null }) {
         return {
           id: p.id, group: p.group, label: permLabel(p.id), ...(PERM_HELP[p.id] ? { help: PERM_HELP[p.id] } : {}), ticked,
           tickable: p.group !== "content" && editable && M.tickable.includes(p.id) && !(r?.kind === "member" && p.group === "content-tier"),
-          ...(p.group === "content-tier" && editable && !(M.tickable.includes(p.id) && r?.kind !== "member") ? { reason: r?.kind === "member" ? "The Unit member role never carries this." : "Only someone who holds this can grant it." } : {}),
+          ...(p.group === "content-tier" && editable && !(M.tickable.includes(p.id) && r?.kind !== "member") ? { reason: r?.kind === "member" ? "The organization member role never carries this." : "Only someone who holds this can grant it." } : {}),
           cells: M.scopes.map(s => ({ scope: s, state: !p.scopes.includes(s) ? "na" : ticked ? "yes" : "no" })),
         };
       });

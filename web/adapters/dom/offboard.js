@@ -39,7 +39,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     const sel = h("select.field", { "data-fk": fk, "aria-label": `New owner of ${i.name}`, "aria-disabled": may && !S.busy ? "false" : "true",
       onchange: e => { const p = people.find(x => x.id === e.target.value); if (p && may && !S.busy) { focusTo = fk; model.choose(i, p); } else e.target.value = to.id; } },
       people.map(p => h("option", { value: p.id, selected: p.id === to.id }, p.id === S.defaults.recipient.id ? `${p.name} (${S.defaults.reason === "manager" ? "their manager" : "you"})` : p.name)));
-    return h("tr", {}, h("th", { scope: "row" }, itemLabel(i), " ", h("span.badge", {}, i.type === "group" ? "Group" : i.personal ? "Personal space" : "Space"), i.trashed ? h("span.badge", {}, " In Trash") : null),
+    return h("tr", {}, h("th", { scope: "row" }, itemLabel(i), " ", h("span.badge", {}, i.type === "group" ? "Area" : i.personal ? "Personal space" : "Space"), i.trashed ? h("span.badge", {}, " In Trash") : null),
       h("td", {}, may ? sel : h("span.muted", {}, i.can.why ?? "You can't hand this on.")),
       h("td", {}, res ? h("span", { role: res.ok ? null : "alert" }, res.ok ? "Done. " : "Not done. ", res.text) : i.can.reassign ? "Not yet" : i.can.handover ? "Goes with the removal" : "Skipped"));
   }
@@ -48,7 +48,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     if (S.status === "loading") return replace(main, h("p.muted", {}, "Loading…"));
     if (S.status === "signed-out") return replace(main, message("You are signed out.", "Sign in again to continue."), signIn ? h("a.btn.primary", { href: signIn.href }, signIn.text ?? "Sign in") : null);
     if (S.status === "forbidden") return replace(main, message("This is not available.", "Only people who manage members can offboard someone."), h("a.btn", { href: hrefs.home }, "Back to Home"));
-    if (S.status === "notfound") return replace(main, message("This person is not available.", "They may never have signed in to this Unit."), h("a.btn", { href: hrefs.home }, "Back to Home"));
+    if (S.status === "notfound") return replace(main, message("This person is not available.", "They may never have signed in to this organization."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     if (S.status === "error") return replace(main, message("Could not load this page.", S.notice ?? "The server did not answer."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     h1 = h("h1", { id: "page-title", tabindex: "-1", "data-fk": "heading" }, "Offboard a member");
     const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /");
@@ -62,8 +62,8 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     setOff(reviewBtn, S.busy || !can); setOff(removeBtn, S.busy || !S.canRemove);
     replace(main, crumbs, h("div.sp-head", {}, h1, h("span.badge", {}, m.removed ? "Removed" : "Member")),
       h("p", {}, `${m.name}${m.email ? ` (${m.email})` : ""}.`, qualifies ? ` Each item goes to ${d.recipient.name} (${d.reason === "manager" ? "their manager" : "you, as no manager is known"}) unless you pick someone else in its row.` : " You can't hand on any of their items."),
-      m.removed ? h("p", {}, `${m.name} has been removed from the Unit.`) : null,
-      S.blocked === "admin" ? h("p", { role: "status" }, `${m.name} is a Unit admin and can't be removed here.`) : null,
+      m.removed ? h("p", {}, `${m.name} has been removed from the organization.`) : null,
+      S.blocked === "admin" ? h("p", { role: "status" }, `${m.name} is an organization admin and can't be removed here.`) : null,
       n ? [h("h2", {}, "Items"), h("div.matrix-scroll", { role: "region", "aria-label": `What ${m.name} solely owns`, tabindex: "0" }, table), S.next ? h("button.btn", { type: "button", onclick: () => model.more() }, "Show more") : null,
         h("h2", {}, "Another new owner"), h("p.muted", {}, "Search for a person to offer them in every row's list."), searchBox("Find a new owner", q => model.search(q, "foundOwner"), S.foundOwner, p => model.addKnown(p), "offboard-owner", "foundOwner")]
         : !m.removed && !S.blocked ? message(`${m.name} solely owns nothing.`, "They can be removed now.") : null,
@@ -81,7 +81,7 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     const cancel = h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel");
     const d = openDialog({ host: root, title: remove ? `Remove ${m.name}?` : `Reassign what ${m.name} solely owns?`, opener,
       body: [h("ul", { "aria-label": remove ? "What removing does" : "What moves where" }, lines.map(t => h("li", {}, t))),
-        skipped.length ? h("p", {}, `Not included, needs a Unit admin: ${skipped.map(i => i.name).join(", ")}.`) : null,
+        skipped.length ? h("p", {}, `Not included, needs an organization admin: ${skipped.map(i => i.name).join(", ")}.`) : null,
         remove ? null : h("p", {}, "Items are reassigned one at a time. Boards, their addresses and guests' access stay."), progress],
       footer: [cancel, go],
       onClose: () => { if (S.confirm) model.closeConfirm(); },

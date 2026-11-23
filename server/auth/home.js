@@ -167,7 +167,7 @@ export function homeService({ registry, tenancy, now = Date.now }) {
         unit: unit ? {
           id: unit.id,
           kind: unit.kind,
-          ...(unit.name ? { name: unit.name } : {}),
+          ...(unit.name || unit.domain || unit.domains?.[0] ? { name: unit.name || unit.domain || unit.domains?.[0] } : {}),
           ...(isPersonalUnit ? { personal: true } : {}),
           ...(isTenantAdminRecord(unit, identity) ? { isAdmin: true } : {}),
         } : null,

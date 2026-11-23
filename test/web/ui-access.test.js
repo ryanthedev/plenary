@@ -7,7 +7,7 @@ import { createTeamsModel, createTeamModel, createAccessModel, failText, sizeTex
 import { askView } from "../../web/adapters/dom/explain.js";
 import { announced } from "../../web/adapters/dom/focus.js";
 
-const hrefs = { home: "./", team: id => `?team=${id}`, teams: "?teams=1", space: id => `?space=${id}`, group: id => `?group=${id}`, board: id => `?board=${id}`, access: (t, id) => `?access=${t}:${id}` };
+const hrefs = { home: "./", team: id => `?team=${id}`, teams: "?teams=1", roles: "?roles=1", space: id => `?space=${id}`, group: id => `?group=${id}`, board: id => `?board=${id}`, access: (t, id) => `?access=${t}:${id}` };
 const ROLES = [{ id: "viewer", name: "Viewer", custom: false, summary: "Can view", ladder: "viewer", people: true }, { id: "editor", name: "Editor", custom: false, summary: "Can edit", ladder: "editor", people: true },
   { id: "owner", name: "Owner", custom: false, summary: "Everything", ladder: "owner", people: true }, { id: "r-fac", name: "Facilitator", custom: true, summary: "Custom", ladder: "annotator", people: false }];
 const U = (id, name, role, roleName, can = { change: true, remove: true }) => ({ subject: { type: "user", id, name, email: `${name}@acme.com` }, role, roleName, via: "direct", can });
@@ -178,7 +178,7 @@ test("the access page: general access, rows named 'who, role, from where', inher
   expect(byLabel("SELECT", "Role of ada")).toBeUndefined();
   expect(byLabel("SELECT", "Role of max")).toBeTruthy();
   expect(btn("Remove ada")).toBeUndefined();
-  expect(items("Access inherited from Group Product")[0].getAttribute("aria-label")).toBe("Infra, Viewer, via Group Product");
+  expect(items("Access inherited from Area Product")[0].getAttribute("aria-label")).toBe("Infra, Viewer, via Area Product");
   expect(all(e => e.tagName === "A" && e.getAttribute("href") === "?access=group:g-1")).toHaveLength(1);
   const keys = all(e => e.getAttribute("data-fk")).map(e => e.getAttribute("data-fk"));
   for (const k of ["who:user:google:ada", "who:user:google:max", "who:team:tm-1", "role:user:google:max", "remove:user:google:max", "role:team:tm-1"]) expect(keys).toContain(k);
@@ -236,10 +236,29 @@ test("a viewer sees who has access and nothing to change; the unit page says whe
   await accessPage();
   expect([btn("Add"), btn("Remove max"), byLabel("SELECT", "Role of max"), byLabel("INPUT", "Search people or teams")]).toEqual([undefined, undefined, undefined, undefined]);
   expect(rowsAll()).toHaveLength(3);
-  state.access = AP({ scope: { type: "unit", id: "t-1" }, roles: [], general: [], rows: [] }); root.replaceChildren();
+  state.access = AP({
+    scope: { type: "unit", id: "t-1", name: "Acme Corp" },
+    roles: [],
+    general: [],
+    rows: [],
+    admins: [{ user: "google:root", name: "Root", email: "root@acme.com" }],
+    why: { mine: { role: null, sources: [{ kind: "unit", scope: { type: "unit", id: "t-1" }, role: "admin", roleName: "Admin", ladder: null, strongest: false }] }, needs: {}, owners: [], ask: { can: false, roles: [], pending: null, retryAfterMs: null }, guest: false },
+  });
+  root.replaceChildren();
   await accessPage("unit");
-  expect(textOf(root.find(e => e.hasClass("home-empty") && textOf(e).includes("nothing to add")))).toContain("make one first");
-  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Access: organization");
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Access: Acme Corp");
+  expect(textOf(root.find(e => e.hasClass("badge")))).toBe("Organization");
+  expect(textOf(root)).toContain("You are an organization admin for Acme Corp. You can manage members, roles, and organization-wide access.");
+  expect(textOf(root)).not.toContain("You have no board access of your own");
+  expect(textOf(root)).not.toContain("Only the people set elsewhere have access.");
+  const actionCard = root.find(e => e.hasClass("sp-action-card"));
+  expect(textOf(actionCard)).toContain("Organization-wide access uses custom roles.");
+  expect(actionCard.findAll(e => e.tagName === "A").map(a => [a.getAttribute("href"), textOf(a)])).toEqual([["?roles=1", "Create a role →"], ["?teams=1", "Manage members →"]]);
+  // Fallback when unit scope has no name: shows "Your workspace"
+  state.access = AP({ scope: { type: "unit", id: "t-1" }, roles: [], general: [], rows: [] });
+  root.replaceChildren();
+  await accessPage("unit");
+  expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Access: Your workspace");
 });
 
 test("a personal space, an unknown scope and a signed-out person: their pages", async () => {
@@ -258,7 +277,7 @@ test("core copy: failText, sizeText, viaText", () => {
   expect(failText({ error: "conflict", code: "too-large" })).toContain("too many places");
   expect(failText({ error: "network" })).toContain("No answer");
   expect([sizeText(0), sizeText(1), sizeText(7), sizeText(1001)]).toEqual(["0 members", "1 member", "7 members", "1000+ members"]);
-  expect([viaText({ via: "direct" }), viaText({ via: "team" }), viaText({ via: "inherited", scope: { type: "group", name: "Product" } })]).toEqual(["Added directly", "Team", "via Group Product"]);
+  expect([viaText({ via: "direct" }), viaText({ via: "team" }), viaText({ via: "inherited", scope: { type: "group", name: "Product" } })]).toEqual(["Added directly", "Team", "via Area Product"]);
 });
 
 test("pressing a match in the picker keeps focus on it (the list is rebuilt around it), on the Access page and the Team page", async () => {
@@ -330,12 +349,12 @@ test("Your access lists every source and marks the strongest; Who has access is 
     general: [{ scope: { type: "unit", id: "t-1" }, role: "viewer" }], organization: { admins: [{ user: "google:root", name: "root" }], more: false, memberRole: "viewer" } });
   await accessPage();
   const mine = items("Where your access comes from");
-  expect(mine.map(li => li.getAttribute("aria-label"))).toEqual(["Viewer · via the Infra team", "Commenter · via everyone in the organization on Group Product, grants the most"]);
+  expect(mine.map(li => li.getAttribute("aria-label"))).toEqual(["Viewer · via the Infra team", "Commenter · via everyone in the organization on Area Product, grants the most"]);
   expect(textOf(mine[1])).toContain("Grants the most");
   expect(textOf(mine[0])).not.toContain("Grants the most");
   expect(items("People added directly to this Space").map(li => li.getAttribute("aria-label"))).toEqual(["ada, Owner, Added directly"]);
   expect(items("Teams with access to this Space").map(li => li.getAttribute("aria-label"))).toEqual(["Infra, Viewer, Team"]);
-  expect(items("Access inherited from Group Product").map(li => li.getAttribute("aria-label"))).toEqual(["Design, Viewer, via Group Product"]);
+  expect(items("Access inherited from Area Product").map(li => li.getAttribute("aria-label"))).toEqual(["Design, Viewer, via Area Product"]);
   expect(items("Access inherited from your organization").map(li => li.getAttribute("aria-label"))).toEqual(["eve, Reader, via organization"]);
   expect(items("General access").map(li => li.getAttribute("aria-label"))).toEqual(["Everyone in the organization: viewer (organization)"]);
   expect(items("Organization admins").map(li => li.getAttribute("aria-label"))).toEqual(["root"]);

@@ -45,7 +45,7 @@ export function normalizeExplain(b) {
 export const normalizeRequest = r => (r && typeof r === "object" && r.user && typeof r.user.id === "string" && r.user.id.length <= 200 && typeof r.role === "string" && Number.isFinite(r.at)
   ? { user: { id: r.user.id, name: str(r.user.name), email: typeof r.user.email === "string" ? str(r.user.email, 320) : null }, role: str(r.role, 64), roleName: str(r.roleName, 64), at: r.at } : null);
 
-const NOUN = { unit: "organization", group: "Group", space: "Space", board: "board" };
+const NOUN = { unit: "organization", group: "Area", space: "Space", board: "board" };
 /** Where a source is set, in a sentence: "Space Platform", "Group Engineering", "this board", "your organization". */
 export function scopeText(scope, here = null) {
   if (here && scope.type === here.type && scope.id === here.id) return `this ${NOUN[scope.type]}`;
@@ -154,7 +154,7 @@ export function createAskModel({ api, type, id, why, newKey = null, onChange = (
       }
       key = null;
       state.status = "sent"; state.pending = { role: r.request.role, roleName: r.request.roleName, at: r.request.at };
-      state.said = `Request sent. The owners will see it on this Space's Access page.`.replace("this Space's", type === "board" ? "this board's" : type === "group" ? "this Group's" : "this Space's");
+      state.said = `Request sent. The owners will see it on this Space's Access page.`.replace("this Space's", type === "board" ? "this board's" : type === "group" ? "this Area's" : "this Space's");
       done();
       return true;
     },

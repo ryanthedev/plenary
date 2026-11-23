@@ -37,7 +37,7 @@ export function spaceEmpty(page) {
     : "You can't add boards here; ask an owner to add you as an editor.";
   return { title: "No boards yet.", detail };
 }
-export const groupEmpty = (page, name) => ({ title: `No Spaces in ${name} yet.`, detail: page.can.createSpace ? "" : "Group editors can add Spaces here." });
+export const groupEmpty = (page, name) => ({ title: `No Spaces in ${name} yet.`, detail: page.can.createSpace ? "" : "Area editors can add Spaces here." });
 
 /**
  * A Space or Group page. `kind` "space" | "group".
@@ -181,7 +181,7 @@ export function createNewGroupModel({ api, newKey = null }) {
     async submit() {
       if (state.busy) return false;
       const name = state.name.trim();
-      if (!name) { state.error = "Give the Group a name."; emit(); return false; }
+      if (!name) { state.error = "Give the Area a name."; emit(); return false; }
       if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
       const k = keyFor(); if (k === undefined) return false;
       state.busy = true; state.error = null; emit();
@@ -227,7 +227,7 @@ export function createNewSpaceModel({ api, group = null, newKey = null }) {
       const name = state.name.trim();
       if (!name) { state.error = "Give the Space a name."; emit(); return false; }
       if (name.length > NAME_MAX) { state.error = `Names are at most ${NAME_MAX} characters.`; emit(); return false; }
-      if (state.group === null && !state.root) { state.error = "Pick a Group: you can't add Spaces outside one."; emit(); return false; }
+      if (state.group === null && !state.root) { state.error = "Pick an Area: you can't add Spaces outside one."; emit(); return false; }
       const k = keyFor(); if (k === undefined) return false;
       state.busy = true; state.error = null; emit();
       let r;

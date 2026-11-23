@@ -88,13 +88,13 @@ export function createDialogs({ host, api, hrefs, go, newKey = randomKey }) {
       const model = createNewSpaceModel(/** @type {any} */ ({ api, group, newKey }));
       const S = model.state;
       const name = h("input.field", { type: "text", maxlength: "200", autocomplete: "off", "aria-label": "Name", oninput: e => model.setName(e.target.value) });
-      const groupSel = h("select.field", { "aria-label": "Group", onchange: e => model.setGroup(e.target.value) });
+      const groupSel = h("select.field", { "aria-label": "Area", onchange: e => model.setGroup(e.target.value) });
       const viewRadio = h("input", { type: "radio", name: "ga", value: "view", checked: true, onchange: () => model.setGeneral("viewer") });
       const noneRadio = h("input", { type: "radio", name: "ga", value: "none", onchange: () => model.setGeneral(null) });
       const err = errorLine();
       const create = h("button.btn.primary", { type: "submit" }, "Create space");
       const d = openDialog({ host, title: "New space", opener, onSubmit: () => model.submit(),
-        body: [field("Name", null, name), field("Group", "You can add Spaces to Groups where you're an editor, or leave it outside any Group.", groupSel),
+        body: [field("Name", null, name), field("Area", "You can add Spaces to Areas where you're an editor, or leave it outside any Area.", groupSel),
           h("div.l", { role: "radiogroup", "aria-label": "General access" }, "General access",
             h("label.opt", {}, viewRadio, h("span", {}, "Everyone in your organization can view", h("small", {}, "Members can find and watch its boards. You choose who edits."))),
             h("label.opt", {}, noneRadio, h("span", {}, "Only people added", h("small", {}, "Hidden from search for everyone else.")))),
@@ -104,7 +104,7 @@ export function createDialogs({ host, api, hrefs, go, newKey = randomKey }) {
       const render = () => {
         if (S.status === "ready" && !built) {
           built = true;
-          replace(groupSel, S.root ? h("option", { value: "" }, "No group (directly in your organization)") : null, S.groups.map(g => h("option", { value: g.id }, g.name)));
+          replace(groupSel, S.root ? h("option", { value: "" }, "No area (directly in your organization)") : null, S.groups.map(g => h("option", { value: g.id }, g.name)));
           groupSel.value = S.group ?? "";
           if (!model.canCreate()) { S.error = "You can't create Spaces here."; }
           name.focus?.();
@@ -127,8 +127,8 @@ export function createDialogs({ host, api, hrefs, go, newKey = randomKey }) {
       const sel = h("select.field", { "aria-label": "General access", onchange: e => model.setGeneral(e.target.value) },
         GENERAL_CHOICES.map(([v, label]) => h("option", { value: v ?? "none", selected: v === null }, label)));
       const err = errorLine();
-      const create = h("button.btn.primary", { type: "submit" }, "Create group");
-      const d = openDialog({ host, title: "New group", opener, onSubmit: () => model.submit(),
+      const create = h("button.btn.primary", { type: "submit" }, "Create area");
+      const d = openDialog({ host, title: "New area", opener, onSubmit: () => model.submit(),
         body: [field("Name", null, name), field("General access", "Applies to the Spaces inside it. People added by name keep their own access.", sel), h("p.from", {}, "You'll be its owner."), err],
         footer: [h("button.btn", { type: "button", onclick: () => d.close() }, "Cancel"), create] });
       name.focus?.();

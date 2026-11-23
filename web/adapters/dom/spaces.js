@@ -242,16 +242,16 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
     const p = S.page, g = p.group;
     groupId = g.id;
     const newSpace = p.can.createSpace ? keys.mark(keys.keep("new-space", () => h("button.btn.primary", { type: "button", onclick: e => dialogs.newSpace({ opener: e.currentTarget, group: groupId }) }, "＋ New space")), "new-space") : null;
-    const menuCfg = { label: "Group options", items: [
+    const menuCfg = { label: "Area options", items: [
       { text: "Rename", hidden: !p.can.rename, onSelect: () => { editing = true; render(); } },
       { text: "General access…", hidden: !p.can.general, onSelect: b => dialogs.general({ opener: b, current: g.general, onSave: r => model.setGeneral(r) }) },
     ] };
     const menu = p.can.rename || p.can.general ? keys.keep("group-options", () => overflowMenu(menuCfg)) : null;
     if (menu) { menu.update(menuCfg); keys.mark(menu.button, "group-options"); }
-    const input = inlineEditor({ editing, session: title, text: g.name, label: "Group name",
+    const input = inlineEditor({ editing, session: title, text: g.name, label: "Area name",
       onSave: (v, moved) => model.rename(v).then(ok => { if (ok) end(moved); else render(); }), onCancel: end });
     h1 = keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, input ?? g.name), "heading");
-    const head = h("div.sp-head", {}, h1, h("span.badge", {}, "Group"), h("span.spacer"),
+    const head = h("div.sp-head", {}, h1, h("span.badge", {}, "Area"), h("span.spacer"),
       hrefs.access ? keys.mark(h("a.btn", { href: hrefs.access("group", g.id) }, "Members"), "members") : null, newSpace, menu?.el);
     const empty = groupEmpty(p, g.name);
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"), head, h("p.sub-h", {}, generalText(g.general)),

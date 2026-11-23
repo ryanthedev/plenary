@@ -55,6 +55,27 @@
   fill: none;
 }
 
+.home-page .home-org-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+.home-page .home-org-badge:empty {
+  display: none;
+}
+
 .home-page .home-searchbox {
   position: relative;
   flex: 1 1 auto;
@@ -678,6 +699,12 @@
   .home-page .home-who,
   .home-page .home-searchbox kbd {
     display: none;
+  }
+
+  .home-page .home-org-badge {
+    max-width: 120px;
+    font-size: 11.5px;
+    padding: 2px 8px;
   }
 
   .home-page .home-search {

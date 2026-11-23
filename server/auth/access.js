@@ -404,9 +404,9 @@ export function accessService({ registry, tenancy, now = Date.now, explainer = e
         const def = grantable(access, r, type, roles, exempt);
         if (def) pick.push({ id: r, name: roleLabel(r, roles), custom: !LADDER_NAMES[r], summary: summaryOf(r, def, roles), ladder: def.ladder, people: !(type === "board" && !LADDER_NAMES[r]) });
       }
-      const name = type === "board" ? row.title : type === "unit" ? undefined : row.name;
+      const name = type === "board" ? row.title : type === "unit" ? (row.name || row.domain || row.domains?.[0] || undefined) : row.name;
       return {
-        scope: { type, id: row.id, ...(canSee && name !== undefined ? { name } : {}), ...(isPersonal(sc) ? { personal: true } : {}) },
+        scope: { type, id: row.id, ...((canSee || type === "unit") && name !== undefined ? { name } : {}), ...(isPersonal(sc) ? { personal: true } : {}) },
         can: { manage },
         ...(hiddenAbove ? { hiddenAbove: true } : {}),
         general,

@@ -220,8 +220,10 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const side = h("nav.home-side", { "aria-label": "Home navigation" });
   const main = h("main.home-main", { id: "home-main", tabindex: "-1" });
   const who = h("span.home-who");
+  const orgBadge = h("span.home-org-badge");
   const top = h("header.home-top", {},
     h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, brandMark(), "Plenary"),
+    orgBadge,
     h("div.home-searchbox", { role: "search" }, search, h("kbd", { "aria-hidden": "true" }, "/ or ⌘K")),
     h("span.spacer"), who);
   const home = h("div.home.home-page", { id: "home" }, top, status, h("div.home-body", {}, side, main));
@@ -364,7 +366,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   // Every control that can hold focus is marked with a stable key, so a redraw (a star toggled, a view picked, a load, a notice) puts focus back.
   const newBoard = () => mark(h("button.btn.primary.home-new-board", { type: "button", onclick: e => { setPendingTemplate(storage, null, clock.now()); dialogs.newBoard({ opener: e.currentTarget }); } }, "＋ New board"), "new-board");
   const newSpace = () => mark(h("button.btn.home-side-add", { type: "button", title: "New space", "aria-label": "New space", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New space")), "new-space");
-  const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn.home-side-add", { type: "button", title: "New group", "aria-label": "New group", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New group")), "new-group") : null);
+  const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn.home-side-add", { type: "button", title: "New area", "aria-label": "New area", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New area")), "new-group") : null);
   const navBtn = (view, label, count) => mark(h("button.nav", { type: "button", "aria-current": S.view === view && !panel && !S.query.trim() ? "page" : null,
     onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); } }, label, count != null ? h("span.n", {}, String(count)) : null), `nav:${view}`);
 
@@ -474,9 +476,9 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
         h("div.home-side-head", {},
           h("span.home-side-label", {}, "Spaces"),
           spaceActions.length ? h("div.home-side-acts", {}, spaceActions) : null),
-        t && h("div.tree", { role: "group", "aria-label": "Groups and Spaces" },
+        t && h("div.tree", { role: "group", "aria-label": "Areas and Spaces" },
           t.groups.map(g => h("div.grp", {}, h("h4", {}, mark(h("a", { href: groupHref(g.id) }, g.name), `group:${g.id}`)), g.spaces.map(node))),
-          t.spaces.length ? h("div.grp", {}, h("h4", {}, "Not in a group"), t.spaces.map(node)) : null,
+          t.spaces.length ? h("div.grp", {}, t.groups.length ? h("h4", {}, "Other spaces") : null, t.spaces.map(node)) : null,
           t.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null))
       : null;
     const adminSec = adminLinks.length
@@ -574,6 +576,9 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     renderSide();
     renderMain();
     who.textContent = S.data ? S.data.user.name : "";
+    const orgName = S.data && !S.data.guest && S.data.unit ? (S.data.unit.name || "Your workspace") : "";
+    orgBadge.textContent = orgName;
+    orgBadge.title = orgName ? `Workspace: ${orgName}` : "";
     status.textContent = S.notice ?? "";
     status.hidden = !S.notice;
     if (S.notice) status.append(" ", mark(h("button.btn.ghost", { type: "button", onclick: () => model.dismissNotice() }, "Dismiss"), "dismiss"));

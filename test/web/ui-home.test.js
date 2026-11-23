@@ -38,18 +38,26 @@ test("Home: Recent then Starred cards link to the board, with path, role and age
   expect(first.getAttribute("href")).toBe("?board=a");
   expect(textOf(first)).toBe("AProduct / Design · editor · 10 min ago");
   const side = root.find(e => e.hasClass("home-side"));
-  expect(side.findAll(e => e.tagName === "H4").map(textOf)).toEqual(["Product", "Not in a group"]);
+  expect(side.findAll(e => e.tagName === "H4").map(textOf)).toEqual(["Product", "Other spaces"]);
   expect(side.findAll(e => e.tagName === "BUTTON").map(textOf)).toEqual(["＋ New board", "Home", "Starred1", "Shared with me1", "＋ New space"]);
-  // Spaces and Groups are links to their own pages (?space= / ?group=), not search buttons
+  // Spaces and Areas are links to their own pages (?space= / ?group=), not search buttons
   expect(side.findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)])).toEqual([["?group=g", "Product"], ["?space=s1", "▢ Design"], ["?space=s2", "◐ ada's space"]]);
   expect(side.find(e => e.getAttribute("aria-current") === "page").textContent).toBe("Home");
+  // When no Areas exist, ungrouped spaces show cleanly under Spaces with no redundant sub-label
+  await mount({ ...DATA, unit: { id: "t-1", kind: "org", name: "Acme Studio" }, tree: { groups: [], spaces: DATA.tree.spaces, more: false } });
+  const sideNoAreas = root.find(e => e.hasClass("home-side"));
+  expect(sideNoAreas.findAll(e => e.tagName === "H4").map(textOf)).toEqual([]);
+  expect(textOf(root.find(e => e.hasClass("home-org-badge")))).toBe("Acme Studio");
+  // Fallback when unit has no name: shows "Your workspace"
+  await mount({ ...DATA, unit: { id: "t-1", kind: "org" } });
+  expect(textOf(root.find(e => e.hasClass("home-org-badge")))).toBe("Your workspace");
 });
 
-test("New group is offered only when the server says can.createGroup, and opens its dialog from the clicked button", async () => {
+test("New area is offered only when the server says can.createGroup, and opens its dialog from the clicked button", async () => {
   await mount();
-  expect(buttons().find(b => textOf(b) === "＋ New group")).toBeUndefined();
+  expect(buttons().find(b => textOf(b) === "＋ New area")).toBeUndefined();
   await mount({ ...DATA, can: { createGroup: true } });
-  const ng = buttons().find(b => textOf(b) === "＋ New group");
+  const ng = buttons().find(b => textOf(b) === "＋ New area");
   ng.click();
   expect(dialogCalls).toEqual([["group", ng]]);
 });

@@ -173,6 +173,7 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
 export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {}, newKey = null }) {
   const S = model.state;
   const { status, main } = shell(root, hrefs);
+  main.setAttribute?.("class", "home-main sp-main access-main");
   const keys = keeper();
   let view = null, after = null, controls = [], ask = null, askSig = null;
   function render() {
@@ -200,6 +201,7 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
   function draw() {
     controls = [];
     const p = S.page, sc = p.scope, noun = SCOPE_NOUN[sc.type] ?? sc.type, here = { type: sc.type, id: sc.id };
+    const orgLabel = sc.name || "Your workspace";
     view ??= pickerView({ api, teams: true, rolesFor: t => model.rolesFor(t), onAdd: (subject, role) => model.set(subject, role), label: "Add people or teams", ...picker });
     view.refresh();
     const back = sc.type === "space" ? hrefs.space(sc.id) : sc.type === "group" ? hrefs.group(sc.id) : sc.type === "board" ? hrefs.board(sc.id) : hrefs.home;
@@ -208,11 +210,17 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
     const w = p.why;
     const askKey = w ? JSON.stringify([sc.id, w.ask]) : null;
     if (askKey !== askSig) { askSig = askKey; ask = w && api?.ask && (w.ask.can || w.ask.pending) ? askView({ api, type: sc.type, id: sc.id, why: w, newKey }) : null; }
-    const mineSection = w ? h("section", { "aria-label": "Your access" }, h("h2", {}, "Your access"),
-      h("p", {}, w.mine.role ? `You have ${w.mine.role.name} access to this ${noun}. You get everything any of these gives you; the one that gives the most is marked.` : `You have no board access of your own to this ${noun}.`),
+    const isOrgAdmin = sc.type === "unit" && !w?.mine?.role && !!w?.mine?.sources?.some(s => s.kind === "unit" && s.role === "admin");
+    const mineCopy = w?.mine?.role
+      ? `You have ${w.mine.role.name} access to this ${noun}. You get everything any of these gives you; the one that gives the most is marked.`
+      : isOrgAdmin
+        ? `You are an organization admin for ${orgLabel}. You can manage members, roles, and organization-wide access.`
+        : `You have no board access of your own to this ${noun}.`;
+    const mineSection = w ? h("section.sp-card", { "aria-label": "Your access" }, h("h2", {}, "Your access"),
+      h("p", {}, mineCopy),
       w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", { "aria-label": x.text + (x.strongest ? ", grants the most" : "") }, h("span.who", {}, x.text), x.strongest ? h("span.badge", {}, "Grants the most") : null); })) : null,
       w.ask.can || w.ask.pending ? h("p", {}, ownersText(w.owners, w.guest)) : null, ask?.el) : null;
-    const requests = p.requests?.length ? h("section", { "aria-label": "Access requests" }, h("h2", {}, "Access requests"),
+    const requests = p.requests?.length ? h("section.sp-card", { "aria-label": "Access requests" }, h("h2", {}, "Access requests"),
       h("p.muted", {}, "These people asked for more access. Add them below to grant it, or dismiss the request."),
       h("ul.rows", { "aria-label": "Access requests" }, p.requests.map(r => h("li.row", { "aria-label": `${r.user.name} asked for ${r.roleName}` },
         who({ type: "user", id: r.user.id, name: r.user.name }, keys, `asked for ${r.roleName}`),
@@ -224,12 +232,24 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
       r.scope && r.scope.type !== "unit" ? h("a", { href: hrefs.access(r.scope.type, r.scope.id) }, viaText(r)) : h("span.p", {}, viaText(r)));
     const general = [...p.general.map(g => h("li.row", { "aria-label": generalLine(g) }, h("span.who", {}, generalLine(g))))];
     const orgAdmins = p.organization?.admins ?? [];
-    const nothing = !rows.length && !p.inherited.length && !p.general.length && !orgAdmins.length;
+    const nothing = !rows.length && !p.inherited.length && !p.general.length && !orgAdmins.length && !(p.admins?.length);
+    const headingText = sc.type === "unit" ? `Access: ${orgLabel}` : `Access${sc.name ? ": " + sc.name : ""}`;
+    const badgeText = sc.personal ? "Personal · only you" : sc.type === "unit" ? "Organization" : noun;
+    const noAddCard = p.can.manage
+      ? sc.type === "unit"
+        ? h("div.home-empty.sp-action-card", {},
+          h("h2", {}, "No custom roles yet"),
+          h("p", {}, "Organization-wide access uses custom roles."),
+          (hrefs.roles || hrefs.teams || hrefs.home) ? h("div.sp-action-links", {},
+            hrefs.roles ? h("a.btn.primary", { href: hrefs.roles }, "Create a role →") : null,
+            (hrefs.teams || hrefs.home) ? h("a.btn", { href: hrefs.teams ?? hrefs.home }, "Manage members →") : null) : null)
+        : message("There is nothing to add here yet.", "")
+      : null;
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ", sc.type === "unit" ? null : [h("a", { href: back }, sc.name ?? noun), " /"]),
-      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, `Access${sc.name ? ": " + sc.name : sc.type === "unit" ? ": organization" : ""}`), "heading"), h("span.badge", {}, sc.personal ? "Personal · only you" : noun)),
+      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, headingText), "heading"), h("span.badge", {}, badgeText)),
       mineSection, requests,
       h("h2", {}, "Who has access"),
-      nothing ? message("Only the people set elsewhere have access.", p.can.manage ? "Add people or teams below." : "") : null,
+      nothing ? message(sc.type === "unit" ? "No organization-wide role grants yet." : "Only the people set elsewhere have access.", addable ? "Add people or teams below." : "") : null,
       group("Added directly", `People added directly to this ${noun}`, direct.map(rowView)),
       group("Through teams", `Teams with access to this ${noun}`, teams.map(rowView)),
       [...inheritedBy].map(([k, list]) => { const s = list[0].scope; const from = s?.type === "unit" ? "your organization" : `${SCOPE_NOUN[s?.type] ?? "container"} ${s?.name ?? ""}`.trim();
@@ -239,8 +259,7 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
       group("Organization admins", "Organization admins", orgAdmins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name))), p.organization?.more ? "They manage access in every Space. The list shows the first few." : "They manage access in every Space; they see boards only where they are added."),
       p.next ? keys.mark(act({}, "Show more", () => model.loadMore()), "show-more") : null,
       p.admins?.length ? [h("h2", {}, "Admins"), h("ul.rows", { "aria-label": "Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null))))] : null,
-      addable ? h("section", { "aria-label": "Add people or teams" }, h("h2", {}, "Add people or teams"), view.el)
-        : p.can.manage ? message("There is nothing to add here yet.", sc.type === "unit" ? "Unit roles are custom roles: make one first." : "") : null);
+      addable ? h("section.sp-card", { "aria-label": "Add people or teams" }, h("h2", {}, "Add people or teams"), view.el) : noAddCard);
   }
   model.subscribe(render);
   render();

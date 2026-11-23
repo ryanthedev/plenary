@@ -215,16 +215,16 @@ test("Group page: Spaces as links, New space opens the dialog preset to this Gro
   expect(closes).toEqual(["?space=s-new"]);
   btn("Show more Spaces").click(); await settle();
   expect(calls.some(c => c[0] === "group" && c[2] === "s-2")).toBe(true);
-  btn("Group options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
-  expect(root.find(e => e.getAttribute("aria-label") === "Group name").value).toBe("Product");
+  btn("Area options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
+  expect(root.find(e => e.getAttribute("aria-label") === "Area name").value).toBe("Product");
 });
 
-test("New group dialog: name and general access, creates and goes to the Group page; refusal shown, dialog stays", async () => {
+test("New area dialog: name and general access, creates and goes to the Area page; refusal shown, dialog stays", async () => {
   const d = dialogsFor().newGroup({ opener: null });
   const dlg = root.find(e => e.getAttribute("role") === "dialog");
-  expect(textOf(dlg.find(e => e.tagName === "H2"))).toBe("New group");
+  expect(textOf(dlg.find(e => e.tagName === "H2"))).toBe("New area");
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
-  expect(textOf(dlg.find(e => e.getAttribute("role") === "alert"))).toBe("Give the Group a name.");
+  expect(textOf(dlg.find(e => e.getAttribute("role") === "alert"))).toBe("Give the Area a name.");
   dlg.find(e => e.getAttribute("aria-label") === "Name").dispatch("input", { target: { value: "Org" } });
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
   expect(calls.find(c => c[0] === "createGroup")).toEqual(["createGroup", { name: "Org", general: null, key: "key-fixed-0001" }]);
@@ -237,7 +237,7 @@ test("a Group with no Spaces: the JOURNEY copy; no New space for someone who can
   api.pages.group = GP({ spaces: [], can: { createSpace: false, rename: false, general: false } });
   const model = createPageModel({ api, kind: "group", id: "g-1" });
   mountGroupPage({ root, model, dialogs: dialogsFor(), hrefs }); await model.load();
-  expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("No Spaces in Product yet.Group editors can add Spaces here.");
+  expect(textOf(root.find(e => e.hasClass("home-empty")))).toBe("No Spaces in Product yet.Area editors can add Spaces here.");
   expect(btn("＋ New space")).toBeUndefined();
 });
 
@@ -292,7 +292,7 @@ test("New space dialog: general access radios; Only people added is sent as null
   const d = dialogsFor();
   d.newSpace({}); await settle();
   const dlg = root.find(e => e.getAttribute("role") === "dialog");
-  expect(dlg.find(e => e.tagName === "SELECT").findAll(e => e.tagName === "OPTION").map(textOf)).toEqual(["No group (directly in your organization)", "Product"]);
+  expect(dlg.find(e => e.tagName === "SELECT").findAll(e => e.tagName === "OPTION").map(textOf)).toEqual(["No area (directly in your organization)", "Product"]);
   dlg.find(e => e.getAttribute("aria-label") === "Name").dispatch("input", { target: { value: "Hidden" } });
   dlg.findAll(e => e.getAttribute("type") === "radio")[1].dispatch("change");
   dlg.find(e => e.tagName === "FORM").dispatch("submit"); await settle();
@@ -476,8 +476,8 @@ test("the busy re-render keeps the typed text in the card editor (no flash of th
 test("Group page: a saved rename puts focus on the title", async () => {
   const model = createPageModel({ api, kind: "group", id: "g-1" });
   mountGroupPage({ root, model, dialogs: dialogsFor(), hrefs }); await model.load();
-  btn("Group options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
-  const i = root.find(e => e.getAttribute("aria-label") === "Group name"); i.value = "Product 2"; key(i, "Enter"); await settle();
+  btn("Area options").click(); root.findAll(e => e.getAttribute("role") === "menuitem")[0].click();
+  const i = root.find(e => e.getAttribute("aria-label") === "Area name"); i.value = "Product 2"; key(i, "Enter"); await settle();
   expect(calls.at(-1)).toEqual(["updateGroup", "g-1", { name: "Product 2" }]);
   expect(focused.at(-1)).toBe(root.find(e => e.tagName === "H1"));
 });

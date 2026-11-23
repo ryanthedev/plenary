@@ -84,14 +84,14 @@ test("the matrix: a scrollable named region, a table with column and row headers
   const region = all(e => e.getAttribute("aria-label") === "Permission matrix")[0];
   expect([region.getAttribute("role"), region.getAttribute("tabindex")]).toEqual(["region", "0"]);
   const heads = all(e => e.tagName === "TH" && e.getAttribute("scope") === "col").map(textOf);
-  expect(heads).toEqual(["Permission", "Granted", "Organization", "Group", "Space", "Board"]);
+  expect(heads).toEqual(["Permission", "Granted", "Organization", "Area", "Space", "Board"]);
   const box = byKey("perm:board.create");
   expect([box.getAttribute("type"), box.getAttribute("aria-label"), on(box), box.getAttribute("aria-disabled")]).toEqual(["checkbox", "Create boards, board.create", true, "false"]);
   const row = box.parentNode.parentNode;
-  expect(row.findAll(e => e.hasClass("sr-only")).map(textOf)).toEqual(["Organization: applies", "Group: applies", "Space: applies", "Board: not at this scope"]);
+  expect(row.findAll(e => e.hasClass("sr-only")).map(textOf)).toEqual(["Organization: applies", "Area: applies", "Space: applies", "Board: not at this scope"]);
   const roles = byKey("perm:roles.manage");
   expect(roles.getAttribute("aria-disabled")).toBe("true");                // not in tickable: shown, not offered
-  expect(roles.parentNode.parentNode.findAll(e => e.hasClass("sr-only")).map(textOf)).toEqual(["Organization: not granted", "Group: not at this scope", "Space: not at this scope", "Board: not at this scope"]);
+  expect(roles.parentNode.parentNode.findAll(e => e.hasClass("sr-only")).map(textOf)).toEqual(["Organization: not granted", "Area: not at this scope", "Space: not at this scope", "Board: not at this scope"]);
   expect(all(e => e.tagName === "TH" && e.getAttribute("scope") === "row").length).toBe(7);
   expect(all(e => e.disabled === true)).toEqual([]);                        // aria-disabled, never disabled
 });
@@ -303,6 +303,6 @@ test("a role the caller may not edit shows no checkboxes to tick or Save, and sa
   expect(all(e => e.tagName === "INPUT" && e.getAttribute("type") === "checkbox").every(b => b.getAttribute("aria-disabled") === "true")).toBe(true);
   btn("Unit member").click(); await settle();
   expect(btn("Save role")).toBeUndefined();
-  expect(textOf(root)).toContain("Only a Unit admin can change what every member gets.");
+  expect(textOf(root)).toContain("Only an organization admin can change what every member gets.");
   expect(btn("Duplicate")).toBeTruthy();
 });

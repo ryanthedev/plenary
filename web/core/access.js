@@ -21,7 +21,7 @@ export const sizeText = n => (n > 1000 ? "1000+ members" : n === 1 ? "1 member" 
 /** What a scope is called in sentences. */
 /** The one line shown when access also comes from a Space or Group the person cannot open (the server says only that, no name and no count). */
 export const HIDDEN_ABOVE = "Some access comes from places you can't open.";
-export const SCOPE_NOUN = { unit: "organization", group: "Group", space: "Space", board: "board" };
+export const SCOPE_NOUN = { unit: "organization", group: "Area", space: "Space", board: "board" };
 /** A grant row's "from where" line (JOURNEY J10: name · role · from where). */
 export const viaText = row => (row.via === "team" ? "Team" : row.via === "inherited" ? `via ${SCOPE_NOUN[row.scope?.type] ?? "container"} ${row.scope?.name ?? ""}`.trim() : "Added directly");
 /** The general-access lines of an access page, e.g. "Everyone in the organization can view (Space Design)". */

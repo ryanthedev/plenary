@@ -368,7 +368,8 @@ describe("access page: who has access, through what, and the picker", () => {
     expect(await svc.setGrant(lee, "space", platform.id, "user", max.user, fac.id)).toMatchObject({ role: fac.id, roleName: "Facilitator" });
     // a role that has no meaning at the Space (roles.manage is Unit-only) is simply clipped, still listed; the Unit page lists custom roles only
     const unit = await svc.accessPage(root, "unit", acme.id);
-    expect(unit.roles.map(x => x.name)).toEqual(["Unit content admin", "Facilitator", "Wide"]);   // root holds content.shared, so the built-in is theirs to give
+    expect(unit.roles.map(x => x.name)).toEqual(["Organization content admin", "Facilitator", "Wide"]);   // root holds content.shared, so the built-in is theirs to give
+    expect(unit.scope.name).toBe("acme.com");
     expect(unit.admins).toEqual([{ user: "google:root", name: "root", email: "root@acme.com" }]);
   });
   test("a board lists its people and Team grants, its Space's general access and inherited rows; custom roles are for Teams only", async () => {

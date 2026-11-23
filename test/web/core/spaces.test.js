@@ -24,7 +24,7 @@ test("copy: general access, empty states (JOURNEY §5), errors", () => {
   expect(spaceEmpty(page({ can: { createBoard: false }, why: named })).detail).toBe("You're an Editor here through the Content editor role, which does not allow creating boards. Owners can add you as an Editor.");
   expect(spaceEmpty(page({ space: { personal: true }, can: { createBoard: true } })).title).toBe("Only you can see what's here until you share it.");
   expect(groupEmpty({ can: { createSpace: true } }, "Product").title).toBe("No Spaces in Product yet.");
-  expect(groupEmpty({ can: { createSpace: false } }, "Product").detail).toMatch(/Group editors/);
+  expect(groupEmpty({ can: { createSpace: false } }, "Product").detail).toMatch(/Area editors/);
   expect(errorText("forbidden")).toMatch(/can't/);
   expect(errorText("???")).toBe(errorText("unavailable"));
 });
@@ -114,7 +114,7 @@ test("New board: a failed load shows an error and cannot submit; a refusal shows
 test("New group: name validation, general access, one submit at a time, server refusal text", async () => {
   const { api, calls } = mk({ createGroup: () => ({ group: { id: "g-new", name: "Org" } }) });
   const m = createNewGroupModel({ api });
-  expect(await m.submit()).toBe(false); expect(m.state.error).toBe("Give the Group a name.");
+  expect(await m.submit()).toBe(false); expect(m.state.error).toBe("Give the Area a name.");
   m.setName("x".repeat(201)); expect(await m.submit()).toBe(false); expect(m.state.error).toMatch(/at most/); expect(calls.length).toBe(0);
   m.setName("  Org "); m.setGeneral("viewer");
   const [a, b] = await Promise.all([m.submit(), m.submit()]);
@@ -141,7 +141,7 @@ test("New space: Group choices, root vs Group-only people, general access, name 
   const only = createNewSpaceModel({ api: mk({ spaceGroups: () => ({ root: false, groups: [{ id: "g-1", name: "P" }], more: false }) }).api }); await only.load();
   expect(only.state.group).toBe("g-1");
   only.setGroup(""); only.setName("x");
-  expect(await only.submit()).toBe(false); expect(only.state.error).toMatch(/Pick a Group/);
+  expect(await only.submit()).toBe(false); expect(only.state.error).toMatch(/Pick an Area/);
   const none = createNewSpaceModel({ api: mk({ spaceGroups: () => ({ root: false, groups: [], more: false }) }).api }); await none.load();
   expect(none.canCreate()).toBe(false);
 });

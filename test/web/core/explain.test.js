@@ -23,8 +23,8 @@ test("normalizeExplain keeps a good answer, drops bad sources and owners, caps l
 
 test("the sentences: a source set on the page's own scope needs no 'on ...', one above it names where", () => {
   expect(sourceText(SRC(), here)).toBe("via the Infra team");
-  expect(sourceText(SRC({ scope: { type: "group", id: "g-1", name: "Eng" } }), here)).toBe("via the Infra team on Group Eng");
-  expect(sourceText(SRC({ kind: "general", scope: { type: "group", id: "g-1", name: "Eng" } }), here)).toBe("via everyone in the organization on Group Eng");
+  expect(sourceText(SRC({ scope: { type: "group", id: "g-1", name: "Eng" } }), here)).toBe("via the Infra team on Area Eng");
+  expect(sourceText(SRC({ kind: "general", scope: { type: "group", id: "g-1", name: "Eng" } }), here)).toBe("via everyone in the organization on Area Eng");
   expect(sourceText(SRC({ kind: "general", scope: { type: "unit", id: "t-1" } }), here)).toBe("via everyone in the organization");
   expect(sourceText(SRC({ kind: "direct" }), here)).toBe("added directly");
   expect(sourceText(SRC({ kind: "direct", scope: { type: "unit", id: "t-1" } }), here)).toBe("added directly on your organization");

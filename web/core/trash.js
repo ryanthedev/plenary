@@ -37,7 +37,7 @@ export const restoredText = (name, to = null) => `Restored ${name || "Untitled"}
 export function fromText(from) {
   if (!from) return "";
   const sp = from.space;
-  if (!sp) return from.group ? `${from.group.name ?? "A Group"} / a Space you can't open` : "a Space you can't open";
+  if (!sp) return from.group ? `${from.group.name ?? "An Area"} / a Space you can't open` : "a Space you can't open";
   const name = sp.personal ? "Personal space" : sp.name;
   return from.group?.name ? `${from.group.name} / ${name}` : name;
 }

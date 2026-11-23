@@ -43,10 +43,16 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
   }
 
   const listItem = r => {
-    const used = usedText(r), range = rangeText(r);
-    return h("li.row", { "aria-label": [r.name, KIND[r.kind], r.summary, range, used].filter(Boolean).join(", ") },
-      keys.mark(h("button.btn.ghost.who", { type: "button", "aria-current": r.id === S.selected && !S.draft?.isNew ? "true" : "false", onclick: () => { deleting = false; after = () => "heading-detail"; model.select(r.id); } }, r.name), `rolepick:${r.id}`),
-      h("span.p", {}, KIND[r.kind]), r.summary ? h("small", {}, r.summary) : null, range ? h("small", {}, range) : null, used ? h("small", {}, used) : null);
+    const used = usedText(r), range = rangeText(r), selected = r.id === S.selected && !S.draft?.isNew;
+    return h("li.row.role-row", { "aria-label": [r.name, KIND[r.kind], r.summary, range, used].filter(Boolean).join(", "), ...(selected ? { "data-selected": "true" } : {}) },
+      h("div.role-row-main", {},
+        h("div.role-row-head", {},
+          keys.mark(h("button.btn.ghost.who.role-pick", { type: "button", "aria-current": selected ? "true" : "false", onclick: () => { deleting = false; after = () => "heading-detail"; model.select(r.id); } }, r.name), `rolepick:${r.id}`),
+          h("span.badge.role-kind", {}, KIND[r.kind])),
+        r.summary ? h("p.role-summary", {}, r.summary) : null),
+      (range || used) ? h("div.role-row-meta", {},
+        range ? h("span.badge.role-scope", {}, range) : null,
+        used ? h("small.role-used", {}, used) : null) : null);
   };
 
   function matrixView(rows, editable) {
@@ -92,7 +98,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
         d?.isNew ? h("span.badge", {}, `Copy of ${S.page.roles.find(x => x.id === d.base)?.name ?? "a role"}`) : null,
         !d?.isNew && r?.kind === "custom" && r.base ? h("span.badge", {}, `Like ${S.page.roles.find(x => x.id === r.base)?.name ?? "another role"}`) : null),
       used ? h("p", {}, used) : null,
-      !editable ? h("p.muted", {}, r?.kind === "member" ? "Only a Unit admin can change what every member gets." : r?.kind === "custom" ? "This role gives more than you hold yourself, so you can't change it. Duplicate it to make your own." : "Built-in roles are read-only. Duplicate one to make your own.") : member ? h("p.muted", {}, "Everyone in the organization has this role. You can change its permissions, not its name or board access.") : null,
+      !editable ? h("p.muted", {}, r?.kind === "member" ? "Only an organization admin can change what every member gets." : r?.kind === "custom" ? "This role gives more than you hold yourself, so you can't change it. Duplicate it to make your own." : "Built-in roles are read-only. Duplicate one to make your own.") : member ? h("p.muted", {}, "Everyone in the organization has this role. You can change its permissions, not its name or board access.") : null,
       h("div.pick-row", {}, h("label.l", {}, "Name", nameIn), h("label.l", {}, "Board access", ladderSel)),
       matrixView(model.rows(), editable),
       S.confirm ? h("div.banner", { role: "alert" }, h("p", {}, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."),
@@ -110,7 +116,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null }) {
     const p = S.page;
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"),
       h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Roles"), "heading"), h("span.badge", {}, "Organization")),
-      h("p.muted", {}, "A role is a board access step plus management permissions, and for the whole organization optionally the content tier (opening shared or personal boards). The server checks permissions, never role names."),
+      h("p.muted", {}, "Choose what people can view, edit, and manage across your organization, areas, spaces, and boards."),
       h("ul.rows", { "aria-label": "Roles" }, p.roles.map(listItem)),
       p.roles.every(r => r.kind !== "custom") ? message("No custom roles yet.", "Built-in roles cover most needs. Duplicate one to make your own.") : null,
       detail());

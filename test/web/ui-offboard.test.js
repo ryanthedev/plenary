@@ -58,7 +58,7 @@ test("Review lists exactly what moves where in a dialog; Cancel changes nothing;
   expect(d.getAttribute("aria-modal")).toBe("true");
   expect(textOf(d)).not.toContain("Sam's space");                                  // a personal space is never reassigned on its own: it goes with the removal
   expect(textOf(d)).toContain("Field <i>notes</i> (1 board) will be owned by Root.");
-  expect(textOf(d)).toContain("Not included, needs a Unit admin: Research");
+  expect(textOf(d)).toContain("Not included, needs an organization admin: Research");
   all(e => e.tagName === "BUTTON" && textOf(e) === "Cancel", d)[0].click(); await settle();
   expect(all(e => e.getAttribute("role") === "dialog")).toEqual([]);
   expect(calls.filter(c => c[0] === "reassign")).toEqual([]);
@@ -101,7 +101,7 @@ test("removal stays locked while items remain; once the list is empty its dialog
   expect(textOf(d)).toContain("Boards, their addresses, and guests' access stay.");
   all(e => e.tagName === "FORM", all(e => e.getAttribute("role") === "dialog")[0])[0].dispatch("submit"); await settle();
   expect(calls.filter(c => c[0] === "remove")).toEqual([["remove", "google:sam", null, "k1"]]);
-  expect(announced()).toContain("Sam was removed from the Unit.");
+  expect(announced()).toContain("Sam was removed from the organization.");
   expect(model.state.status).toBe("ready");
 });
 test("a still-owns refusal on removal is said and the list is reloaded", async () => {
@@ -122,7 +122,7 @@ test("a person the Unit never saw, a caller who may not, and a signed-out page e
 });
 test("an admin leaver is shown as not removable and offers no Remove", async () => {
   await mount({ items: [], page: { blocked: "admin", canRemove: false } });
-  expect(textOf(root)).toContain("is a Unit admin and can't be removed here.");
+  expect(textOf(root)).toContain("is an organization admin and can't be removed here.");
   expect(btn("Remove Sam…")).toBeUndefined();
 });
 

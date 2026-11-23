@@ -232,7 +232,8 @@ body:has(#timeline:not([hidden])) .tool-rail { bottom: calc(102px + env(safe-are
 .list-row { width: 100%; text-align: left; }
 .list-row button { min-width: 24px; }
 input.rename { font: inherit; width: 110px; border: 1px solid var(--accent); border-radius: 6px; background: var(--surface); color: var(--fg); padding: 2px 6px; }
-textarea.field, input.field { color: var(--fg); font: 12.5px var(--font); resize: vertical; }
+textarea.field, input.field { color: var(--fg); font: 12.5px var(--font); }
+textarea.field { resize: vertical; }
 .code { width: 100%; min-height: 180px; resize: vertical; }
 .lib .item b { font-size: 18px; color: var(--fg-muted); }
 .preview canvas { max-width: 100%; max-height: 220px; }
@@ -824,8 +825,24 @@ body.stale .watching { opacity: .45; }
 .sp-main h2 { margin: 26px 0 10px; font-size: 15px; font-weight: 650; letter-spacing: -0.01em; color: var(--fg); }
 .sp-main h3 { margin: 18px 0 8px; font-size: 11.5px; font-weight: 600; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.06em; }
 .sp-page .field { min-height: 36px; padding: 6px 11px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--fg); font: 400 13.5px/1.2 var(--font); transition: border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease; }
-.sp-page .field:hover:not([disabled]):not([aria-disabled="true"]) { border-color: var(--border-strong); }
-.sp-page .field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
+.sp-page input.field,
+.sp-page select.field { height: 36px; min-height: 36px; }
+.sp-page .field:hover:not([disabled]):not([aria-disabled="true"]):not([readonly]):not([aria-readonly="true"]) { border-color: var(--border-strong); }
+.sp-page .field:focus:not([readonly]):not([aria-readonly="true"]):not([aria-disabled="true"]) { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
+.sp-page .field[readonly],
+.sp-page .field[aria-readonly="true"],
+.sp-page .field[aria-disabled="true"],
+.sp-page .field:disabled { background: var(--surface-subtle); color: var(--fg-muted); border-color: var(--border); cursor: default; }
+.sp-page input.field[readonly],
+.sp-page input.field[aria-readonly="true"] { caret-color: transparent; }
+.sp-page .field[aria-disabled="true"],
+.sp-page .field:disabled { opacity: 0.72; cursor: not-allowed; }
+.sp-page .field[readonly]:focus,
+.sp-page .field[aria-readonly="true"]:focus,
+.sp-page .field[aria-disabled="true"]:focus { outline: none; border-color: var(--border-strong); box-shadow: none; }
+.sp-page .field[readonly]:focus-visible,
+.sp-page .field[aria-readonly="true"]:focus-visible,
+.sp-page .field[aria-disabled="true"]:focus-visible { outline: 2px solid var(--border-strong); outline-offset: 2px; }
 .sp-page .btn { min-height: 36px; padding: 0 14px; border-radius: 9px; font-size: 13px; }
 .sp-page .btn.primary { box-shadow: var(--shadow-sm); }
 .sp-page .btn.ghost { min-height: 32px; padding: 0 10px; }
@@ -880,7 +897,12 @@ body.stale .watching { opacity: .45; }
   .sp-head h1 { font-size: 21px; }
   .sp-head .spacer { flex-basis: 100%; height: 0; }
   .sp-page .field { min-height: 44px; font-size: 16px; }
+  .sp-page input.field, .sp-page select.field { height: 44px; }
   .sp-page .btn { min-height: 44px; }
+}
+@media (pointer: coarse) {
+  .sp-page .field { min-height: 44px; font-size: 16px; }
+  .sp-page input.field, .sp-page select.field { height: 44px; }
 }
 
 /* ── Teams, Access, Roles, and Offboard lists ── */
@@ -899,8 +921,10 @@ body.stale .watching { opacity: .45; }
 .sp-page .rows > .row:hover { background: var(--surface-hover); }
 .sp-card .rows { box-shadow: none; margin: 10px 0 4px; }
 .pick-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; }
-.pick-row .field { flex: 1 1 200px; min-width: 0; }
+.pick-row > .field { flex: 1 1 200px; min-width: 0; }
 .picker { display: grid; gap: 10px; max-width: 540px; }
+.picker label.l { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 600; color: var(--fg-muted); }
+.picker label.l > .field { flex: 0 0 auto; width: 100%; }
 .picker .matches { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 240px; overflow: auto; }
 .picker .matches .btn { width: 100%; justify-content: flex-start; text-align: left; padding: 8px 12px; border: 1px solid transparent; border-radius: 8px; }
 .picker .matches .btn small { color: var(--fg-muted); font-weight: 400; }
@@ -924,7 +948,7 @@ body.stale .watching { opacity: .45; }
 .role-detail h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.01em; overflow-wrap: anywhere; }
 .role-detail h2:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .role-detail label.l { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 600; color: var(--fg-muted); flex: 1 1 200px; min-width: 0; }
-.role-detail .field { color: var(--fg); font-size: 13.5px; min-height: 36px; }
+.role-detail label.l > .field { flex: 0 0 auto; width: 100%; }
 .role-actions { margin-top: 14px; }
 .matrix-scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: 11px; margin: 14px 0; background: var(--surface); }
 .matrix-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

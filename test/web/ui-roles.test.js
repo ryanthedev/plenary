@@ -2,6 +2,7 @@
 // their names, keys and focus (exact key only, a neutral name when it is gone), aria-disabled while pending, announcements, the many-people confirmation, delete,
 // duplicate, and text safety.
 import { test, expect, beforeEach, afterEach } from "bun:test";
+import { readFileSync } from "node:fs";
 import { FakeElement, installDom, textOf } from "./collab/fake-dom.js";
 import { mountRolesPage } from "../../web/adapters/dom/roles.js";
 import { createRolesModel } from "../../web/core/role-admin.js";
@@ -305,4 +306,24 @@ test("a role the caller may not edit shows no checkboxes to tick or Save, and sa
   expect(btn("Save role")).toBeUndefined();
   expect(textOf(root)).toContain("Only an organization admin can change what every member gets.");
   expect(btn("Duplicate")).toBeTruthy();
+});
+
+test("CSS regression: single-line inputs/selects in Roles & Admin column-stacked fields never stretch vertically and style read-only cleanly", () => {
+  const css = readFileSync(new URL("../../web/style.css", import.meta.url), "utf8");
+  // .pick-row must only apply horizontal flex-basis to direct child .field, never descendants inside column-stacked label.l
+  expect(css).toMatch(/\.pick-row\s*>\s*\.field\s*\{[^}]*flex:\s*1 1 200px/s);
+  expect(css).not.toMatch(/\.pick-row\s+\.field\s*\{[^}]*flex:\s*1 1 200px/s);
+  // Column-stacked fields in .role-detail and .picker must lock flex: 0 0 auto so they stay single-line
+  expect(css).toMatch(/\.role-detail label\.l\s*>\s*\.field\s*\{[^}]*flex:\s*0 0 auto/s);
+  expect(css).toMatch(/\.picker label\.l\s*>\s*\.field\s*\{[^}]*flex:\s*0 0 auto/s);
+  expect(css).toMatch(/\.sp-page input\.field,\s*\.sp-page select\.field\s*\{[^}]*height:\s*36px/s);
+  // Read-only and aria-disabled fields have explicit muted styling and hidden caret
+  expect(css).toMatch(/\.sp-page \.field\[readonly\][\s\S]*?background:\s*var\(--surface-subtle\)/);
+  expect(css).toMatch(/\.sp-page input\.field\[readonly\][\s\S]*?caret-color:\s*transparent/);
+
+  const adminJs = readFileSync(new URL("../../web/adapters/dom/admin.js", import.meta.url), "utf8");
+  expect(adminJs).toMatch(/\.adm-field \.adm-input,\s*\.adm-field \.adm-select\s*\{[^}]*flex:\s*0 0 auto/s);
+
+  const mobileCss = readFileSync(new URL("../../web/styles/mobile-phase3-4.css", import.meta.url), "utf8");
+  expect(mobileCss).toMatch(/\.sp-page \.rows \.row select\.field[\s\S]*?flex:\s*0 0 auto/);
 });

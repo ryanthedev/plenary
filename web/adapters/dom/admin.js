@@ -365,6 +365,7 @@ const ADMIN_CSS = `
   font: inherit;
 }
 .adm-input { flex: 1 1 160px; min-width: 0; }
+.adm-field .adm-input, .adm-field .adm-select { flex: 0 0 auto; width: 100%; }
 .adm-input:focus, .adm-select:focus { outline: 2px solid var(--accent, #3B48E8); outline-offset: 1px; background: var(--surface, #FFFFFF); }
 .adm-section-label {
   font-size: 11px;

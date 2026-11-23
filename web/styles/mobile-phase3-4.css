@@ -388,6 +388,7 @@
   .sp-page .rows .row .btn,
   .sp-page .rows .row select.field,
   .sp-page .cards .trash-row .btn {
+    flex: 0 0 auto;
     min-height: 44px;
     font-size: 16px;
   }

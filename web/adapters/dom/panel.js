@@ -653,15 +653,19 @@ export function renderPanel(root, ctx) {
   const secs = panelSections(st, availableFor(S, ctx.workspaceMode ?? null));
   const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${listNamedFrames(B.doc).length}`, library: `· ${(ctx.library ?? []).length}` };
   const out = [];
-  if (tabs) out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" }, secs.map(s => h("button" + (s.active ? ".on" : ""), {
-    type: "button",
-    role: "tab",
-    "aria-selected": String(Boolean(s.active)),
-    "aria-label": s.title,
-    "data-fk": `panel-tab:${s.id}`,
-    style: touchBtnStyle,
-    onclick: () => ctx.setState({ type: "tab", id: s.id }),
-  }, s.title))));
+  const activeTabId = tabs ? secs.find(s => s.active)?.id : (state.tab || secs[0]?.id);
+  out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" }, secs.map(s => {
+    const isSel = tabs ? Boolean(s.active) : s.id === activeTabId;
+    return h("button" + (isSel ? ".on" : ""), {
+      type: "button",
+      role: "tab",
+      "aria-selected": String(isSel),
+      "aria-label": s.title,
+      "data-fk": `panel-tab:${s.id}`,
+      style: touchBtnStyle,
+      onclick: () => ctx.setState({ type: "tab", id: s.id }),
+    }, s.title);
+  })));
   for (const s of secs) {
     if (!s.active) continue;
     out.push(h("div.sec" + (s.folded ? ".folded" : ""), { "data-sec": s.id },

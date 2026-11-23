@@ -89,7 +89,7 @@ export function formatDocumentTitle(displayTitle) {
  *           prefs: import("../../ports/storage.js").Storage, theme?: string | null, notice?: string | null,
  *           collab?: ((S: any, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => any) | null,
  *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
- *           relogin?: { href: string, go(): void } | null, admin?: any, homeHref?: string | null,
+ *           relogin?: { href: string, go(): void } | null, onLogout?: (() => void) | null, admin?: any, homeHref?: string | null,
  *           access?: any, newKey?: (() => string) | null, share?: any, move?: any,
  *           versions?: import("../../ports/versions.js").VersionsPort | null, trashShown?: () => boolean,
  *           boardTitle?: string | null, getBoardTitle?: (() => Promise<any>) | null,
@@ -106,7 +106,7 @@ export function formatDocumentTitle(displayTitle) {
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: any, ui: any, net: any, collab: any, port: any, setTheme(t: string): void, openDialog(d: string): void, openShare(): any, setPanel(op: any): void, startComment(p: { x: number, y: number }): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, versions = null, trashShown = () => false, boardTitle = null, getBoardTitle = null, renameBoard = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, onLogout = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, versions = null, trashShown = () => false, boardTitle = null, getBoardTitle = null, renameBoard = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -2014,6 +2014,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       share && S.canShare ? boardMenuItem("share", "Share", "Share board", () => openShareDialog()) : (admin ? boardMenuItem("share", "Share", "Share board", () => openAdminShare()) : null),
       canMove() ? boardMenuItem("moveToLayer", "Move to…", "Move to…", openMoveDialog) : null,
     ]);
+    const accountSection = onLogout
+      ? menuSection("Account", [
+        boardMenuItem("logout", "Sign out", "Sign out", () => onLogout()),
+      ])
+      : null;
     menu = h("div.header-more-menu.board-menu", { role: "menu", "aria-label": "Board menu", hidden: !moreOpen, onkeydown: e => {
       if (e.key === "Escape") { e.preventDefault(); setMore(false, true); }
       else if (e.key === "Tab") setMore(false);
@@ -2026,7 +2031,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         else if (e.key === "End") next = items.at(-1);
         if (next) { e.preventDefault(); next.focus?.(); }
       }
-    } }, [boardSection, viewSection, collabSection]);
+    } }, [boardSection, viewSection, collabSection, accountSection]);
     const actions = h("div.island.top-right.header-actions", {},
       role === "presenter" ? [
         h("button.btn.ghost.desk-only.header-extra", { title: "Insert a Mermaid flowchart", "aria-label": "Insert Mermaid flowchart", disabled: !may, onclick: () => openDialog("mermaid") }, icon("mermaid", { size: 16 })),
@@ -2569,7 +2574,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Settings & keybindings", onclick: () => { setSheet(null, { restore: false }); openSettingsDialog(); } }, h("span.ic", {}, icon("settings", { size: 20 })), "Settings"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
-        h("button.tb", { "aria-label": "Toggle color theme", title: "Light / dark", "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
+        h("button.tb", { "aria-label": "Toggle color theme", title: "Light / dark", "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark"),
+        onLogout ? h("button.tb", { "aria-label": "Sign out", title: "Sign out", "data-action": "logout", onclick: () => { setSheet(null, { restore: false }); onLogout(); } }, h("span.ic", {}, icon("logout", { size: 20 })), "Sign out") : null));
     } else if (ui.sheet === "actions") {
       const { stream: targetStream, selected, hitEl } = resolveActionSheetSelection();
       const canWrite = canWriteSelection(targetStream, selected);

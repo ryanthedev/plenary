@@ -45,7 +45,7 @@ import { createRolesModel } from "./core/role-admin.js";
 import { mountTeamsPage, mountTeamPage, mountAccessPage } from "./adapters/dom/access.js";
 import { createTeamsModel, createTeamModel, createAccessModel } from "./core/access.js";
 import { createPageModel } from "./core/spaces.js";
-import { takeSignIn, signInNotice, asParam, menuSignIn, devLinks } from "./core/signin.js";
+import { takeSignIn, signInNotice, asParam, menuSignIn, devLinks, signOut } from "./core/signin.js";
 import { createSession } from "./core/session.js";
 import { rememberBoard, takeReturnBoard } from "./core/roles.js";
 
@@ -109,6 +109,10 @@ if (!signIn.token) {
 } else {
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });
   const orgApi = httpAdmin({ fetch: fetchNow, token: signIn.token });
+  const onLogout = () => {
+    signOut(tabStore);
+    location.assign("/auth/logout");
+  };
   if (!board) {
   // Signed in with no board in the link: Home (PROTOCOL.md § Home). Its sign-in expiry shows as "signed out" with a link back in.
   document.querySelector(".app")?.remove();
@@ -147,7 +151,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      org: orgApi,
+      org: orgApi, onLogout,
       boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
@@ -204,6 +208,7 @@ if (!signIn.token) {
     // exp: seconds (the sign-in contract); the page warns before it on the clock's ms scale.
     expAt: Number.isFinite(signIn.exp) ? signIn.exp * 1000 : null,
     relogin: { href: signInLink.href, go: () => { rememberBoard(tabStore, board); location.assign(signInLink.href); } },
+    onLogout,
     homeHref: `${location.pathname}${theme0 ? `?theme=${encodeURIComponent(theme0)}` : ""}`,
   });
   hideGate();

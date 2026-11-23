@@ -264,3 +264,37 @@ function describe_move() {
     expect(loads).toBe(2);
   });
 }
+
+test("Home header renders Sign out next to the user pill (in a workspace and in the no-workspace guest state) when onLogout is provided", async () => {
+  await mount();
+  expect(root.find(e => e.getAttribute("data-action") === "logout")).toBeUndefined();
+
+  let logouts = 0;
+  await mount(DATA, { onLogout: () => { logouts++; } });
+  const top = root.find(e => e.hasClass("home-top"));
+  const who = top.find(e => e.hasClass("home-who"));
+  const btn = top.find(e => e.getAttribute("data-action") === "logout");
+  expect(who).toBeTruthy();
+  expect(btn).toBeTruthy();
+  expect(textOf(btn)).toBe("Sign out");
+  expect(btn.getAttribute("aria-label")).toBe("Sign out");
+  expect(btn.hidden).toBe(false);
+  expect(top.childNodes.indexOf(btn)).toBe(top.childNodes.indexOf(who) + 1);
+  btn.click();
+  expect(logouts).toBe(1);
+
+  // Hides Sign out once already signed out
+  model.state.status = "signed-out"; model.notify(null);
+  expect(btn.hidden).toBe(true);
+
+  // Guest with no workspace yet ("Create your own Workspace" screen) still gets Sign out
+  logouts = 0;
+  const orgStub = { createTenant: async () => ({}), listTenantMembers: async () => ({}), addTenantMember: async () => ({}), removeTenantMember: async () => ({}), adminAudit: async () => ({}) };
+  await mount({ ...DATA, guest: true, unit: null, recent: [], starred: [], owned: [], shared: [], tree: null }, { org: orgStub, onLogout: () => { logouts++; } });
+  expect(textOf(root)).toContain("Create your own Workspace");
+  const guestBtn = root.find(e => e.getAttribute("data-action") === "logout");
+  expect(guestBtn).toBeTruthy();
+  expect(guestBtn.hidden).toBe(false);
+  guestBtn.click();
+  expect(logouts).toBe(1);
+});

@@ -21,7 +21,7 @@ const USERS = { "t-ada": { user: "ada", role: "owner" }, "t-bo": { user: "bo", r
   "t-di": { user: "di", role: "annotator" }, "t-vi": { user: "vi", role: "viewer" } };
 
 /** ada's page over a room with bo (a second presenter, headless) on the same virtual clock. */
-function setup({ expAt = null, relogin = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null, move = null, trashShown = undefined } = {}) {
+function setup({ expAt = null, relogin = null, onLogout = null, collab = false, role = null, token = "t-ada", prefs = memoryStore(), wrap = null, appNet = null, access = null, share = null, move = null, trashShown = undefined } = {}) {
   installPage();
   const net = localRoom({ users: USERS, clock: true });
   const joins = [], hooks = {};
@@ -30,7 +30,7 @@ function setup({ expAt = null, relogin = null, collab = false, role = null, toke
   const app = mountApp({
     startSession: ({ mine, onChange }) => { hooks.onChange = onChange; return createSession({ join: () => { const t = net.join(); joins.push(t); return wrap ? wrap(t) : t; }, token, board: "b1", client: USERS[token].user, user: USERS[token].user, mine, onChange, clock: net.clock }); },
     net: appNet ?? { kind: "local", put() {}, onFile() {} }, board: "b1", me: { user: USERS[token].user, name: "Ada", role }, prefs, theme: "light",
-    clock: net.clock, expAt, relogin, access, share, ...(trashShown ? { trashShown } : {}), move: move && { clock: net.clock, ...move }, newKey: () => "key-pill-0001",
+    clock: net.clock, expAt, relogin, onLogout, access, share, ...(trashShown ? { trashShown } : {}), move: move && { clock: net.clock, ...move }, newKey: () => "key-pill-0001",
     collab: collab ? (S, o) => { hooks.jumpTo = o.jumpTo; return syncCollabPort(S, { name: "Ada", frame: fn => net.clock.set(fn, 16), ...o }); } : null,
   });
   /** n animation frames, 16 ms of virtual time each, the room settled in between. */
@@ -739,7 +739,7 @@ test("K3 main.js: the token goes only into createSession and the HTTP ports; sig
   expect(code).toMatch(/httpHome\(\{[^}]*token: signIn\.token,/);
   expect(code).toMatch(/if \(!signIn\.token\)/);
   expect(code).toMatch(/createSession\(\{[^}]*token: signIn\.token,/);
-  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(["location.assign(href)", "location.assign(signInLink.href)"]);   // the first: after a create, to our own relative ?board= / ?space= link (hrefTo)
+  expect(code.match(/location\.assign\(([^)]*)\)/g)).toEqual(['location.assign("/auth/logout")', "location.assign(href)", "location.assign(signInLink.href)"]);   // fixed logout path, relative ?board= / ?space= link (hrefTo), and fixed sign-in href
   expect(code).not.toMatch(/console\.|localStorage|sessionStorage|tabStore\.(set|get)/);
   expect(code).not.toMatch(/RETURN_KEY|plenary\.return/);                       // read only through takeReturnBoard
   expect(code).toMatch(/const back = takeReturnBoard\(tabStore, \{ outcome: signIn\.outcome, board: asked \}\);/);
@@ -1538,4 +1538,40 @@ test("#91 mountApp validates the move wiring: a bare port (the shape main.js onc
   const sites = code.match(/\bmove: \{?[^\n]*/g);
   expect(sites.length).toBe(3);
   for (const l of sites) expect(l).toMatch(/^move: \{ port: httpMove\(\{[^}]*\}\), clock, newKey: \(\) => randomKey\(\) \}/);
+});
+
+test("Board menu and mobile tools sheet expose Sign out only when onLogout is provided, and main.js wires signOut + /auth/logout", async () => {
+  rig = setup();
+  const menuNoAuth = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  expect(menuNoAuth.all().find(e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Sign out")).toBeUndefined();
+
+  let logouts = 0;
+  rig = setup({ onLogout: () => { logouts++; } });
+  const more = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More");
+  more.click();
+  const menu = find(page.byId.topbar, e => e.attrs.role === "menu" && e.classList.contains("header-more-menu"));
+  const signOutItem = menu.all().find(e => e.attrs.role === "menuitem" && e.attrs["aria-label"] === "Sign out");
+  expect(signOutItem).toBeTruthy();
+  expect(text(signOutItem)).toContain("Sign out");
+  signOutItem.click();
+  expect(logouts).toBe(1);
+  expect(more.attrs["aria-expanded"]).toBe("false");
+
+  // Mobile tools sheet also includes Sign out
+  const phoneMq = page.media.get("(max-width: 1023px)");
+  if (phoneMq) phoneMq.matches = true;
+  const overflowBtn = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs["aria-label"] === "More options");
+  overflowBtn.click();
+  rig.step(2);
+  const mobileSignOut = find(page.byId.sheet, e => e.tagName === "BUTTON" && e.attrs["data-action"] === "logout");
+  expect(mobileSignOut).toBeTruthy();
+  mobileSignOut.click();
+  expect(logouts).toBe(2);
+
+  // Composition root (web/main.js) clears stored session via signOut(tabStore) and navigates to /auth/logout
+  const mainSrc = await Bun.file(new URL("../../web/main.js", import.meta.url)).text();
+  expect(mainSrc).toContain("signOut(tabStore)");
+  expect(mainSrc).toContain('location.assign("/auth/logout")');
+  expect(mainSrc).toMatch(/mountHome\(\{[\s\S]*?\bonLogout\b/);
+  expect(mainSrc).toMatch(/mountApp\(\{[\s\S]*?\bonLogout\b/);
 });

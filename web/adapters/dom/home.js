@@ -201,10 +201,11 @@ function prefillNewBoardTitle(dlg, boardTitle) {
  *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
  *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"|"listTenantMembers"|"addTenantMember"|"removeTenantMember"|"adminAudit"> | null,
  *   storage?: import("../../ports/storage.js").Storage | null,
+ *   onLogout?: (() => void) | null,
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string, links?: Array<{ href: string, text?: string }> } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null, onLogout = null }) {
   const S = model.state, keys = keeper(), mark = keys.mark;
   let destroyed = false;
   /** @type {null|"members"|"audit"} */ let panel = null;
@@ -237,13 +238,16 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const main = h("main.home-main", { id: "home-main", tabindex: "-1" });
   const fabHost = h("div.home-fab-host");
   const who = h("span.home-who");
+  const logoutBtn = onLogout
+    ? mark(h("button.btn.ghost.home-logout", { type: "button", "data-action": "logout", "aria-label": "Sign out", onclick: () => onLogout() }, "Sign out"), "logout")
+    : null;
   const orgBadge = h("span.home-org-badge");
   const top = h("header.home-top", {},
     drawerToggle,
     h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, brandMark(), "Plenary"),
     orgBadge,
     h("div.home-searchbox", { role: "search" }, search, h("kbd", { "aria-hidden": "true" }, "/ or ⌘K")),
-    h("span.spacer"), who);
+    h("span.spacer"), who, logoutBtn);
   const home = h("div.home.home-page", { id: "home" }, top, status, mobileTabs, drawerBackdrop, h("div.home-body", {}, side, main), fabHost);
   root.replaceChildren(home);
 
@@ -729,6 +733,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     renderMobileChrome();
     renderMain();
     who.textContent = S.data ? S.data.user.name : "";
+    if (logoutBtn) logoutBtn.hidden = S.status === "signed-out";
     const orgName = S.data && !S.data.guest && S.data.unit ? (S.data.unit.name || "Your workspace") : "";
     orgBadge.textContent = orgName;
     orgBadge.title = orgName ? `Workspace: ${orgName}` : "";

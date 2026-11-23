@@ -9,6 +9,58 @@ import { keeper } from "./focus.js";
 import { overflowMenu } from "./spaces.js";
 import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
+import { TEMPLATES } from "../../../packages/core/templates.js";
+
+/** SessionStorage key holding a selected template seed while navigating to a newly created board. */
+export const PENDING_TEMPLATE_KEY = "plenary:pending-template";
+const PENDING_TEMPLATE_TTL_MS = 60_000;
+
+function resolveStorage(storage) {
+  if (storage) return storage;
+  try { return globalThis.sessionStorage ?? null; } catch { return null; }
+}
+
+function setPendingTemplate(storage, templateId, now) {
+  try {
+    const store = resolveStorage(storage);
+    if (!store) return;
+    if (templateId && templateId !== "blank") {
+      const payload = JSON.stringify({ templateId, createdAt: Number.isFinite(now) ? now : 0 });
+      if (typeof store.set === "function") store.set(PENDING_TEMPLATE_KEY, payload);
+      else if (typeof store.setItem === "function") store.setItem(PENDING_TEMPLATE_KEY, payload);
+    } else {
+      if (typeof store.remove === "function") store.remove(PENDING_TEMPLATE_KEY);
+      else if (typeof store.removeItem === "function") store.removeItem(PENDING_TEMPLATE_KEY);
+    }
+  } catch {
+    // Ignore storage errors (private browsing / restricted iframes / test stubs).
+  }
+}
+
+/**
+ * Read and immediately clear a pending template handoff (returns null if missing, malformed, or expired).
+ * Supports both Plenary's Storage port (`get`/`remove`) and Web Storage (`getItem`/`removeItem`).
+ * @param {any} storage
+ * @param {number} [now]
+ * @param {number} [maxAgeMs]
+ * @returns {string | null}
+ */
+export function consumePendingTemplate(storage, now = Date.now(), maxAgeMs = PENDING_TEMPLATE_TTL_MS) {
+  try {
+    const store = resolveStorage(storage);
+    if (!store) return null;
+    const raw = typeof store.get === "function" ? store.get(PENDING_TEMPLATE_KEY) : store.getItem?.(PENDING_TEMPLATE_KEY);
+    if (typeof store.remove === "function") store.remove(PENDING_TEMPLATE_KEY);
+    else store.removeItem?.(PENDING_TEMPLATE_KEY);
+    if (!raw || typeof raw !== "string") return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.templateId !== "string" || !parsed.templateId) return null;
+    if (Number.isFinite(parsed.createdAt) && Number.isFinite(now) && now - parsed.createdAt > maxAgeMs) return null;
+    return parsed.templateId;
+  } catch {
+    return null;
+  }
+}
 
 /** Build a CSP-safe inline SVG node, falling back to an empty decorative span on minimal stub DOMs. */
 function svgEl(tag, attrs = {}, kids = []) {
@@ -32,15 +84,25 @@ function brandMark() {
     ]));
 }
 
+/** Featured template ids exposed in the Home starter strip (paired with Blank Board). */
+const HOME_TEMPLATE_IDS = ["plenary-tour", "architecture", "presentation", "retro"];
+
 /** Starter presets shown in the Home template strip (non-guest users with board creation). */
-const HOME_TEMPLATES = Object.freeze([
-  { id: "blank", title: "Blank Board", boardTitle: "", desc: "Start an open canvas" },
-  { id: "architecture", title: "Architecture Diagram", boardTitle: "Architecture Diagram", desc: "Pre-titled for system flows" },
-  { id: "deck", title: "Presentation Deck", boardTitle: "Presentation Deck", desc: "Pre-titled for framed slides" },
-  { id: "retro", title: "Retro / Sticky Notes", boardTitle: "Retro / Sticky Notes", desc: "Pre-titled for team retros" },
+export const HOME_TEMPLATES = Object.freeze([
+  Object.freeze({ id: "blank", title: "Blank Board", boardTitle: "", desc: "Start an open canvas" }),
+  ...HOME_TEMPLATE_IDS.map(id => TEMPLATES.find(t => t.id === id)).filter(Boolean),
 ]);
 
 function templatePreviewSvg(id) {
+  if (id === "plenary-tour") {
+    return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
+      svgEl("rect", { x: "12", y: "10", width: "62", height: "21", rx: "4", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--accent-soft)" }),
+      svgEl("rect", { x: "86", y: "10", width: "62", height: "21", rx: "4", stroke: "var(--border-strong)", "stroke-width": "1.4", fill: "var(--surface)" }),
+      svgEl("rect", { x: "12", y: "37", width: "62", height: "21", rx: "4", stroke: "var(--border-strong)", "stroke-width": "1.4", fill: "var(--surface)" }),
+      svgEl("rect", { x: "86", y: "37", width: "62", height: "21", rx: "4", stroke: "var(--ok)", "stroke-width": "1.4", fill: "var(--ok-bg)" }),
+      svgEl("path", { d: "M74 20h12M117 31v6", stroke: "var(--fg-dim)", "stroke-width": "1.4", "stroke-linecap": "round" }),
+    ]);
+  }
   if (id === "architecture") {
     return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
       svgEl("rect", { x: "10", y: "18", width: "42", height: "28", rx: "6", stroke: "var(--border-strong)", "stroke-width": "1.5", fill: "var(--surface)" }),
@@ -50,7 +112,7 @@ function templatePreviewSvg(id) {
       svgEl("path", { d: "M102 20 C 107 20, 108 38, 112 38", stroke: "var(--fg-dim)", "stroke-width": "1.4", "stroke-linecap": "round" }),
     ]);
   }
-  if (id === "deck") {
+  if (id === "presentation" || id === "deck") {
     return svgEl("svg", { viewBox: "0 0 160 66", class: "home-tpl-svg", "aria-hidden": "true", fill: "none" }, [
       svgEl("rect", { x: "12", y: "12", width: "62", height: "42", rx: "6", stroke: "var(--accent)", "stroke-width": "1.5", fill: "var(--surface)" }),
       svgEl("path", { d: "M22 24h28M22 33h40M22 40h24", stroke: "var(--fg-dim)", "stroke-width": "1.6", "stroke-linecap": "round" }),
@@ -138,10 +200,11 @@ function prefillNewBoardTitle(dlg, boardTitle) {
  *   teamsHref?: string | null, trashHref?: string | null, rolesHref?: string | null, offboardHref?: string | null, unitAccessHref?: ((id: string) => string) | null,
  *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
  *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"|"listTenantMembers"|"addTenantMember"|"removeTenantMember"|"adminAudit"> | null,
+ *   storage?: import("../../ports/storage.js").Storage | null,
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null }) {
   const S = model.state, keys = keeper(), mark = keys.mark;
   let destroyed = false;
   /** @type {null|"members"|"audit"} */ let panel = null;
@@ -299,7 +362,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
 
   const guest = () => !!S.data?.guest;
   // Every control that can hold focus is marked with a stable key, so a redraw (a star toggled, a view picked, a load, a notice) puts focus back.
-  const newBoard = () => mark(h("button.btn.primary.home-new-board", { type: "button", onclick: e => dialogs.newBoard({ opener: e.currentTarget }) }, "＋ New board"), "new-board");
+  const newBoard = () => mark(h("button.btn.primary.home-new-board", { type: "button", onclick: e => { setPendingTemplate(storage, null, clock.now()); dialogs.newBoard({ opener: e.currentTarget }); } }, "＋ New board"), "new-board");
   const newSpace = () => mark(h("button.btn.home-side-add", { type: "button", title: "New space", "aria-label": "New space", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New space")), "new-space");
   const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn.home-side-add", { type: "button", title: "New group", "aria-label": "New group", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New group")), "new-group") : null);
   const navBtn = (view, label, count) => mark(h("button.nav", { type: "button", "aria-current": S.view === view && !panel && !S.query.trim() ? "page" : null,
@@ -307,8 +370,29 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
 
   function openTemplate(tpl, opener) {
     if (guest() || typeof dialogs?.newBoard !== "function") return;
-    const dlg = dialogs.newBoard({ opener });
+    const templateId = tpl.id && tpl.id !== "blank" ? tpl.id : null;
+    setPendingTemplate(storage, templateId, clock.now());
+    const dlg = dialogs.newBoard(/** @type {any} */ ({ opener, ...(templateId ? { templateId } : {}) }));
     prefillNewBoardTitle(dlg, tpl.boardTitle);
+    // If the user cancels/closes the dialog without submitting, clear the pending template seed immediately.
+    if (templateId && dlg && typeof dlg.close === "function") {
+      let submitted = false;
+      const host = dlg.dialog ?? dlg.el;
+      const form = typeof host?.querySelector === "function"
+        ? host.querySelector("form")
+        : (typeof host?.find === "function" ? host.find(e => e.tagName === "FORM") : null);
+      if (form && typeof form.addEventListener === "function") {
+        form.addEventListener("submit", () => { submitted = true; }, true);
+      } else if (form && typeof form.onsubmit === "function") {
+        const prevSubmit = form.onsubmit;
+        form.onsubmit = e => { submitted = true; return prevSubmit.call(form, e); };
+      }
+      const origClose = dlg.close;
+      dlg.close = () => {
+        if (!submitted) setPendingTemplate(storage, null, clock.now());
+        return origClose();
+      };
+    }
   }
 
   function renderTemplates() {

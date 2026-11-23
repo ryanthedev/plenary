@@ -298,11 +298,12 @@ export async function listTenants({ caller }, { tenancy }) {
 }
 
 const liveTenantAdmin = async (registry, t, caller) => Boolean(t && isTenantAdminRecord(t, caller) && !(await registry.memberState?.(t.id, caller.user))?.removed);
+const plainUserName = id => String(id).replace(/^[a-z]+:/, "");
 
 /**
  * GET /tenants/:tenant/members — org admins only; 404 for unknown tenant, 403 for non-admin.
- * Returns human-friendly admin identifiers (stripped `email:` addresses and non-`google:` ids) without leaking raw
- * internal `google:<sub>` ids.
+ * Returns human-friendly admin identifiers (stripped `email:` addresses and non-`google:`/`microsoft:` ids) and
+ * signed-in organization directory members without leaking raw internal `google:<sub>` / `microsoft:<oid>` ids.
  * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string }} req
  * @param {{ registry: Registry }} deps
  */
@@ -315,7 +316,15 @@ export async function listTenantMembers({ caller, tenant }, { registry }) {
   const emailAdmins = t.admins.filter(a => a.startsWith("email:")).map(a => a.slice(6));
   const otherAdmins = t.admins.filter(a => !a.startsWith("email:") && !a.startsWith("google:") && !a.startsWith("microsoft:"));
   const admins = [...new Set([...emailAdmins, ...otherAdmins])];
-  return { members, admins };
+  const rawDirectory = typeof registry.findMembers === "function"
+    ? await registry.findMembers(t.id, { limit: 50 })
+    : [];
+  const directory = rawDirectory.map(m => ({
+    name: m.name || m.email || plainUserName(m.user),
+    email: m.email ?? null,
+    isAdmin: isTenantAdminRecord(t, { user: m.user, email: m.email, domain: t.domain }),
+  }));
+  return { members, admins, directory };
 }
 
 /**

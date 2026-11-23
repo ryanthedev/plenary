@@ -6,6 +6,7 @@
 /**
  * @typedef {{ status: number, code: string, message: string }} AdminHttpErrorShape
  * @typedef {{ id: string, name: string, domain: string | null, isAdmin: boolean }} AdminTenant
+ * @typedef {{ name: string, email: string | null, isAdmin: boolean }} AdminDirectoryMember
  * @typedef {{ id: string, tenant: string, title: string, memberRole: string | null, createdAt: number, role?: string }} AdminBoard
  * @typedef {{ id: string, board: string, role: string, expiresAt: number | null, revoked: boolean, by: string, createdAt: number }} AdminLink
  * @typedef {{ id: string, board: string, email: string, role: string, expiresAt: number | null, revoked: boolean, by: string, createdAt: number }} AdminInvite
@@ -15,7 +16,7 @@
  * @typedef {object} AdminPort
  * @property {() => Promise<{ tenants: AdminTenant[] }>} listTenants
  * @property {(o: { name: string }) => Promise<{ tenant: AdminTenant }>} createTenant
- * @property {(tenant: string) => Promise<{ members: string[], admins: string[] }>} listTenantMembers
+ * @property {(tenant: string) => Promise<{ members: string[], admins: string[], directory?: AdminDirectoryMember[] }>} listTenantMembers
  * @property {(tenant: string, email: string) => Promise<{ email: string }>} addTenantMember
  * @property {(tenant: string, email: string) => Promise<void>} removeTenantMember
  * @property {() => Promise<{ boards: AdminBoard[], isAdmin: boolean }>} listBoards

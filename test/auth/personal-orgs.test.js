@@ -219,9 +219,21 @@ for (const [name, makeRegistry] of ADAPTERS) {
       expect((await api("POST", `/tenants/${org1.id}/members`, bobTok, { email: "carol@gmail.com" })).status).toBe(403);
       expect((await api("DELETE", `/tenants/${org1.id}/members/bob%40gmail.com`, bobTok)).status).toBe(403);
 
-      // Domain-backed Workspace tenants reject adding external email org members (M4)
-      const ws = await registry.createTenant({ domain: "acme.com", admins: ["google:alice"] });
+      // Domain-backed Workspace tenants reject adding external email org members (M4),
+      // while GET /tenants/:id/members returns signed-in directory members with isAdmin flags (no raw provider ids).
+      const ws = await registry.createTenant({ domain: "acme.com", admins: ["google:alice", "email:alice@acme.com"] });
+      await registry.touchMember(ws.id, { user: "google:alice", name: "Alice", email: "alice@acme.com" });
+      await registry.touchMember(ws.id, { user: "google:dave", name: "Dave", email: "dave@acme.com" });
       expect((await api("POST", `/tenants/${ws.id}/members`, aliceTok, { email: "bob@gmail.com" })).status).toBe(400);
+      const wsMemRes = await api("GET", `/tenants/${ws.id}/members`, aliceTok);
+      expect(wsMemRes.status).toBe(200);
+      const wsMem = await wsMemRes.json();
+      expect(wsMem.members).toEqual([]);
+      expect(wsMem.admins).toEqual(["alice@acme.com"]);
+      expect(wsMem.directory).toEqual([
+        { name: "Alice", email: "alice@acme.com", isAdmin: true },
+        { name: "Dave", email: "dave@acme.com", isAdmin: false },
+      ]);
 
       // Unknown tenant returns 404 on members endpoints
       expect((await api("GET", "/tenants/t-nope00000000/members", aliceTok)).status).toBe(404);

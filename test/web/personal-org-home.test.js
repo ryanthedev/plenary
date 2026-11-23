@@ -171,6 +171,95 @@ describe("Personal org Home E2E (papaender@gmail.com -> create workspace -> add 
     expect(textOf(f2.root)).not.toContain("Studio Roadmap");
     f2.view.destroy();
   });
+
+  test("domain org admin sees Members under Workspace Admin listing all signed-in org users with Admin badge; non-admin member does not", async () => {
+    let t = Date.UTC(2026, 10, 23, 18, 0, 0);
+    const now = () => t;
+
+    const registry = memoryRegistry({ now });
+    const ten = tenancy({ registry, now });
+    const home = homeService({ registry, tenancy: ten, now });
+    const sessions = await createSessions({ key: KEY, now });
+    const handle = httpRoutes({ registry, sessions, tenancy: ten, home, now, config: CONFIG });
+    const fetchApi = (url, init) => handle(new Request(new URL(url, "https://p5y.omni.ooo"), init));
+
+    const alice = { user: "microsoft:alice-oid", name: "Alice Chen", email: "alice@alaskaair.com", domain: "alaskaair.com" };
+    const bob = { user: "microsoft:bob-oid", name: "Bob Ortiz", email: "bob@alaskaair.com", domain: "alaskaair.com" };
+    await registry.createTenant({
+      name: "alaskaair.com",
+      domain: "alaskaair.com",
+      admins: [alice.user, "email:alice@alaskaair.com"],
+    });
+    const aliceTok = await sessions.issue(alice);
+    const bobTok = await sessions.issue(bob);
+
+    const mountFor = async token => {
+      const dom = installDom();
+      globalThis.document.addEventListener = () => {};
+      globalThis.document.removeEventListener = () => {};
+      globalThis.Node = Object.getPrototypeOf(FakeElement);
+      const clock = virtualClock({ t0: now() });
+      const model = createHomeModel({ api: httpHome({ fetch: fetchApi, token, timers: clock }), clock });
+      const org = httpAdmin({ fetch: fetchApi, token });
+      const dialogs = { newBoard() {}, newSpace() {}, newGroup() {} };
+      const view = mountHome({
+        root: dom.root, model, clock, dialogs, org,
+        boardHref: id => `?board=${id}`, spaceHref: id => `?space=${id}`, groupHref: id => `?group=${id}`,
+      });
+      await model.load();
+      await settle();
+      return { root: dom.root, model, view, org };
+    };
+
+    // Bob visits Home first (recorded in reg_members directory) and does not see Workspace Admin / Members
+    const bView = await mountFor(bobTok);
+    expect(bView.model.state.data.guest).toBe(false);
+    expect(bView.model.state.data.unit).toMatchObject({ name: "alaskaair.com", kind: "company" });
+    expect(bView.model.state.data.unit.personal).toBeFalsy();
+    expect(bView.model.state.data.unit.isAdmin).toBeUndefined();
+    const bobSide = bView.root.find(e => e.hasClass("home-side"));
+    expect(bobSide.find(e => e.getAttribute("data-home-admin") === "true")).toBeUndefined();
+    expect(bobSide.findAll(e => e.tagName === "BUTTON").map(textOf)).not.toContain("Members");
+    bView.view.destroy();
+
+    // Alice (domain org admin) visits Home and sees Members under Workspace Admin
+    const aView = await mountFor(aliceTok);
+    expect(aView.model.state.data.guest).toBe(false);
+    expect(aView.model.state.data.unit).toMatchObject({ name: "alaskaair.com", kind: "company", isAdmin: true });
+    expect(aView.model.state.data.unit.personal).toBeFalsy();
+    const admDetails = aView.root.find(e => e.getAttribute("data-home-admin") === "true");
+    expect(admDetails).toBeTruthy();
+    const membersBtn = admDetails.find(e => e.getAttribute("data-fk") === "nav:members");
+    expect(membersBtn).toBeTruthy();
+    expect(textOf(membersBtn)).toBe("Members");
+
+    // Clicking Members loads and renders all signed-in org users with name, email, and Admin badge
+    membersBtn.click();
+    await settle(6);
+    const main = aView.root.find(e => e.hasClass("home-main"));
+    const mainText = textOf(main);
+    expect(mainText).toContain("Workspace members");
+    expect(mainText).toContain("Members (2)");
+    expect(mainText).toContain("Alice Chen");
+    expect(mainText).toContain("alice@alaskaair.com");
+    expect(mainText).toContain("Bob Ortiz");
+    expect(mainText).toContain("bob@alaskaair.com");
+    expect(mainText).not.toContain("microsoft:alice-oid");
+    expect(mainText).not.toContain("microsoft:bob-oid");
+    // Domain orgs do not render the personal-only "Add by email" form
+    expect(main.find(e => e.getAttribute("aria-label") === "Collaborator email")).toBeUndefined();
+
+    // Exactly one Admin badge, on Alice's row (not Bob's)
+    const rows = main.findAll(e => e.hasClass("row"));
+    expect(rows.length).toBe(2);
+    const aliceRow = rows.find(r => textOf(r).includes("alice@alaskaair.com"));
+    const bobRow = rows.find(r => textOf(r).includes("bob@alaskaair.com"));
+    expect(aliceRow).toBeTruthy();
+    expect(bobRow).toBeTruthy();
+    expect(aliceRow.findAll(e => e.hasClass("badge")).map(textOf)).toEqual(["Admin"]);
+    expect(bobRow.findAll(e => e.hasClass("badge"))).toEqual([]);
+    aView.view.destroy();
+  });
 });
 
 describe("Canvas Share dialog wiring regression (web/adapters/dom/app.js)", () => {

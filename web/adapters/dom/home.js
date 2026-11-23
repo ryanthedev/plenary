@@ -213,7 +213,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   let drawerOpen = false;
   let orgBusy = false;
   /** @type {null | { close: () => void }} */ let activeCardSheet = null;
-  const mem = { status: "idle", tenant: null, members: [], admins: [], busy: false, removing: null, seq: 0 };
+  const mem = { status: "idle", tenant: null, members: [], admins: [], directory: [], busy: false, removing: null, seq: 0 };
   const audit = { status: "idle", tenant: null, events: [], nextBefore: null, loadingMore: false, seq: 0 };
 
   const status = h("div.home-status", { role: "status", "aria-live": "polite" });
@@ -382,6 +382,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       if (destroyed || seq !== mem.seq) return;
       mem.members = Array.isArray(r?.members) ? r.members : [];
       mem.admins = Array.isArray(r?.admins) ? r.admins : [];
+      mem.directory = Array.isArray(r?.directory) ? r.directory : [];
       mem.status = "ready";
     } catch {
       if (destroyed || seq !== mem.seq) return;
@@ -563,9 +564,9 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     // A Space opens its own page (?space=<id>), a Group its (?group=<id>).
     const node = s => mark(h("a.nav.sub", { href: spaceHref(s.id), title: `Open ${s.name}`, "aria-label": `Open ${s.name}` }, s.personal ? "◐ " : "▢ ", s.name), `space:${s.id}`);
     const t = d.tree;
-    const isPersonalAdmin = !d.guest && !!org && d.unit?.personal === true && d.unit?.isAdmin === true;
+    const canMembers = !d.guest && !!org && d.unit?.isAdmin === true;
     const canAudit = !d.guest && !!org && typeof org.adminAudit === "function" && d.unit?.isAdmin === true;
-    const membersBtn = isPersonalAdmin
+    const membersBtn = canMembers
       ? mark(h("button.nav", { type: "button", "aria-current": panel === "members" && !S.query.trim() ? "page" : null,
         onclick: () => { search.value = ""; model.setQuery(""); openMembers(); } }, "Members"), "nav:members")
       : null;
@@ -645,30 +646,57 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   }
 
   function renderMembersPanel() {
-    const d = S.data, unitName = d?.unit?.name || "Personal Workspace";
-    const body = mem.status === "loading" && !mem.members.length && !mem.admins.length
-      ? h("p.muted", {}, "Loading members…")
-      : mem.status === "error"
-        ? [empty({ title: "Could not load members.", detail: "Check your connection and try again." }),
-          mark(h("button.btn.home-org-btn", { type: "button", onclick: () => loadMembers(d.unit.id) }, "Try again"), "members-retry")]
-        : [
-          mem.admins.length ? h("section", { "aria-label": "Admins" },
-            h("h2.sec", {}, "Admins"),
-            h("ul.rows", {}, mem.admins.map(a => h("li.row", {}, h("span.who", {}, a), h("span.badge", {}, "Admin"))))) : null,
-          h("section", { "aria-label": "Collaborators" },
-            h("h2.sec", {}, `Collaborators (${mem.members.length})`),
-            mem.members.length
-              ? h("ul.rows", {}, mem.members.map(email => h("li.row", {},
-                h("span.who", {}, email),
-                mark(h("button.btn.home-org-btn", { type: "button", disabled: mem.removing === email,
-                  "aria-label": `Remove ${email}`, onclick: () => removeMember(email) },
-                mem.removing === email ? "Removing…" : "Remove"), `member-rm:${email}`))))
-              : h("p.muted", {}, "No collaborators added yet.")),
-        ];
+    const d = S.data, isPersonal = d?.unit?.personal === true;
+    const unitName = d?.unit?.name || (isPersonal ? "Personal Workspace" : "Your workspace");
+    const hasLoaded = mem.members.length || mem.admins.length || mem.directory.length;
+    const collaboratorsSec = (alwaysShow) => (alwaysShow || mem.members.length
+      ? h("section", { "aria-label": "Collaborators" },
+        h("h2.sec", {}, `Collaborators (${mem.members.length})`),
+        mem.members.length
+          ? h("ul.rows", {}, mem.members.map(email => h("li.row", {},
+            h("span.who", {}, email),
+            mark(h("button.btn.home-org-btn", { type: "button", disabled: mem.removing === email,
+              "aria-label": `Remove ${email}`, onclick: () => removeMember(email) },
+            mem.removing === email ? "Removing…" : "Remove"), `member-rm:${email}`))))
+          : h("p.muted", {}, "No collaborators added yet."))
+      : null);
+    let body;
+    if (mem.status === "loading" && !hasLoaded) {
+      body = h("p.muted", {}, "Loading members…");
+    } else if (mem.status === "error") {
+      body = [empty({ title: "Could not load members.", detail: "Check your connection and try again." }),
+        mark(h("button.btn.home-org-btn", { type: "button", onclick: () => loadMembers(d.unit.id) }, "Try again"), "members-retry")];
+    } else if (isPersonal) {
+      body = [
+        mem.admins.length ? h("section", { "aria-label": "Admins" },
+          h("h2.sec", {}, "Admins"),
+          h("ul.rows", {}, mem.admins.map(a => h("li.row", {}, h("span.who", {}, a), h("span.badge", {}, "Admin"))))) : null,
+        collaboratorsSec(true),
+      ];
+    } else {
+      const dirEmails = new Set(mem.directory.map(p => (p.email ? String(p.email).toLowerCase() : null)).filter(Boolean));
+      const pendingAdmins = mem.admins.filter(a => !dirEmails.has(String(a).toLowerCase()));
+      body = [
+        h("section", { "aria-label": "Organization members" },
+          h("h2.sec", {}, `Members (${mem.directory.length})`),
+          mem.directory.length
+            ? h("ul.rows", {}, mem.directory.map(p => h("li.row", {},
+              h("span.who", {}, p.name, p.email && p.email !== p.name ? [" ", h("span.muted", {}, p.email)] : null),
+              p.isAdmin ? h("span.badge", {}, "Admin") : null)))
+            : (!pendingAdmins.length ? h("p.muted", {}, "No members have signed in yet.") : null)),
+        pendingAdmins.length ? h("section", { "aria-label": "Admins" },
+          h("h2.sec", {}, "Admins"),
+          h("ul.rows", {}, pendingAdmins.map(a => h("li.row", {}, h("span.who", {}, a), h("span.badge", {}, "Admin"))))) : null,
+        collaboratorsSec(false),
+      ];
+    }
+    const sub = isPersonal
+      ? `${unitName} — add collaborators by email so they can open shared Spaces and boards.`
+      : `${unitName} — organization members who have signed in with your workspace domain.`;
     return replace(main,
       mark(h("h1", { tabindex: "-1" }, "Workspace members"), "heading"),
-      h("p.home-panel-sub", {}, `${unitName} — add collaborators by email so they can open shared Spaces and boards.`),
-      memAddForm, memErr, body);
+      h("p.home-panel-sub", {}, sub),
+      isPersonal ? memAddForm : null, memErr, body);
   }
 
   function renderAuditPanel() {
@@ -708,7 +736,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
         : null;
       return replace(main, empty({ title: "You are signed out.", detail: "Sign in again to see your boards." }), signInButtons);
     }
-    if (!S.query.trim() && panel === "members" && S.data && !S.data.guest && S.data.unit?.personal && S.data.unit?.isAdmin && org) return renderMembersPanel();
+    if (!S.query.trim() && panel === "members" && S.data && !S.data.guest && S.data.unit?.isAdmin && org) return renderMembersPanel();
     if (!S.query.trim() && panel === "audit" && S.data && !S.data.guest && S.data.unit?.isAdmin && org && typeof org.adminAudit === "function") return renderAuditPanel();
     const m = model.main();
     if (!m) return replace(main);

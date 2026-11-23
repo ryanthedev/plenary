@@ -15,6 +15,7 @@ import { labelLines, textWidth } from "./text.js";
 import { cornerRadius, roundPolygon, fillLines, arrowheadCmds, fontClass, FONT_FAMILY } from "./style.js";
 import { parseLinkCardFromElement, linkCardOpenBadgeRect } from "./link-card.js";
 import { parseEmbedFromElement } from "./embed.js";
+import { effectsOf, clipPathCommands } from "./effects.js";
 
 /** View-independent world-space geometry cache keyed by element object (auto-GC'd on doc edits). */
 const geoCache = new WeakMap();
@@ -271,6 +272,50 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     }
   }
   const glow = a?.glow ?? 0;
+  const effects = effectsOf(el);
+  const itemBlendMode = effects.blendMode !== "normal" ? effects.blendMode : null;
+  let itemClipShape = null;
+  if (effects.clipShape !== "none") {
+    const shapeTarget = isLabel(el) ? (doc.get(el.containerId) ?? el) : el;
+    const shapeBox = isLinear(shapeTarget) ? bounds(shapeTarget, doc) : bbox(shapeTarget);
+    const [mx0, my0] = QNoRot(shapeBox.x, shapeBox.y);
+    const [mx1, my1] = QNoRot(shapeBox.x + shapeBox.w, shapeBox.y + shapeBox.h);
+    const mw = Math.abs(mx1 - mx0), mh = Math.abs(my1 - my0);
+    if (!(mw > 0 && mh > 0)) return;
+    const elAngle = isLinear(shapeTarget) ? 0 : angleOf(shapeTarget);
+    if (isShape(shapeTarget) && elAngle && sx !== sy) {
+      // Nonuniform animation scaling on a rotated shape scales after element rotation (`toWorld` -> `Q`).
+      // Transform the local clip path in the exact same order (affine invariance preserves Q curves).
+      const localCmds = clipPathCommands(effects.clipShape, shapeBox.x, shapeBox.y, shapeBox.w, shapeBox.h, effects.clipRadius);
+      if (!localCmds.length) return;
+      const mapPt = (px, py) => {
+        const w = toWorld(shapeTarget, { x: px, y: py });
+        return Q(w.x, w.y);
+      };
+      const cmds = localCmds.map(c => {
+        if (c[0] === "Q") {
+          const [ex, ey] = mapPt(c[1], c[2]);
+          const [qcx, qcy] = mapPt(c[3], c[4]);
+          return ["Q", ex, ey, qcx, qcy];
+        }
+        const [ex, ey] = mapPt(c[1], c[2]);
+        return [c[0], ex, ey];
+      });
+      itemClipShape = { shape: effects.clipShape, x: Math.min(mx0, mx1), y: Math.min(my0, my1), w: mw, h: mh, cmds };
+    } else {
+      const [mcx, mcy] = QNoRot(shapeBox.x + shapeBox.w / 2, shapeBox.y + shapeBox.h / 2);
+      const maskAngle = elAngle + aRot;
+      itemClipShape = {
+        shape: effects.clipShape,
+        x: Math.min(mx0, mx1),
+        y: Math.min(my0, my1),
+        w: mw,
+        h: mh,
+        ...(effects.clipRadius != null ? { radius: effects.clipRadius * view.scale * aScale } : {}),
+        ...(maskAngle ? { angle: maskAngle, cx: mcx, cy: mcy } : {}),
+      };
+    }
+  }
   let clipRect = null;
   if (a?.clip && !(a.clip.x <= 0 && a.clip.y <= 0 && a.clip.w >= 1 && a.clip.h >= 1)) {
     const clipTarget = isLabel(el) ? (doc.get(el.containerId) ?? el) : el;
@@ -432,8 +477,12 @@ export function paintElement(doc, el, P, view, theme, out, opts = {}) {
     }
   }
   } finally {
-    if (clipRect) {
-      for (let i = startIdx; i < out.length; i++) out[i].clip = clipRect;
+    if (clipRect || itemBlendMode || itemClipShape) {
+      for (let i = startIdx; i < out.length; i++) {
+        if (clipRect) out[i].clip = clipRect;
+        if (itemBlendMode) out[i].blendMode = itemBlendMode;
+        if (itemClipShape) out[i].clipShape = itemClipShape;
+      }
     }
   }
 }
@@ -458,6 +507,16 @@ export function paintScene(doc, view, theme, opts = {}) {
 // nothing drawn after that group overlaps it, so what shows on top never changes. `keyOf(it)`
 // names a style; `bboxOf(it)` its screen box. Text and images end no group (text draws above
 // every path anyway; an image is its own layer). Returns { layers: [{ key, items, img? }], texts }.
+function isIsolatedPath(it) {
+  if (it.blendMode && it.blendMode !== "normal") return true;
+  if (it.clip) return true;
+  if (it.clipShape) {
+    if (typeof it.clipShape === "string") return it.clipShape !== "none";
+    if (typeof it.clipShape === "object" && it.clipShape.shape && it.clipShape.shape !== "none") return true;
+  }
+  return false;
+}
+
 export function planBatches(items, keyOf, { lookback = 48 } = {}) {
   const layers = [], texts = [];
   for (const it of items) {
@@ -465,10 +524,14 @@ export function planBatches(items, keyOf, { lookback = 48 } = {}) {
     if (it.t === "image" || it.t === "video") { const b = imgBox(it); layers.push({ img: it, items: [], box: b, boxes: [b] }); continue; }
     if (it.t !== "path") continue;
     const key = keyOf(it), box = cmdsBox(it.cmds, (it.width ?? 0) / 2 + 1);
+    if (isIsolatedPath(it)) {
+      layers.push({ key, items: [it], box, boxes: [box], isolated: true });
+      continue;
+    }
     let into = null;
     for (let i = layers.length - 1, n = 0; i >= 0 && n < lookback; i--, n++) {
       const l = layers[i];
-      if (!l.img && l.key === key) { into = l; break; }
+      if (!l.img && !l.isolated && l.key === key) { into = l; break; }
       // Something above the candidates covers this spot: its union box first (cheap), then its pieces.
       if (overlaps(l.box, box) && l.boxes.some(b => overlaps(b, box))) break;
     }

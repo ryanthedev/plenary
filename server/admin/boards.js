@@ -14,6 +14,7 @@
 import { ROLES, LINK_ROLES, INVITE_ROLES, normEmail, verifiedEmail, isTenantAdminRecord } from "../auth/util.js";
 import { isUnitAdmin, ladderExempt, ownLadder } from "../auth/resolver.js";
 import { withinLadder } from "../auth/permissions.js";
+import { hashPasscode, validateSharePolicy, checkLinkPolicy } from "../auth/share-policy.js";
 
 /** @typedef {import("../auth/registry-port.js").Registry} Registry */
 /** @typedef {import("../auth/idp-port.js").Identity} Identity */
@@ -336,21 +337,39 @@ export async function revokeInvite({ caller, board, invite }, deps) {
   });
 }
 
-/** Make a share link: an unguessable id, a role (editor, annotator or viewer), optional expiry. */
-export async function createLink({ caller, board, role, expiresAt = null, idem }, deps) {
+/** Make a share link: an unguessable id, a role (editor, annotator or viewer), optional expiry, passcode and noDownload policy. */
+export async function createLink({ caller, board, role, expiresAt = null, passcode = null, noDownload = false, idem }, deps) {
   const { registry, now = Date.now } = deps;
   const s = await sharer(deps, caller, board), b = s.b;
   if (!LINK_ROLES.includes(role)) throw bad("links carry only editor, annotator or viewer");
   mayGive(s, role);
-  const link = await registry.createLink({ board: b.id, role, expiresAt: expiry(expiresAt, now()), by: caller.user, idem });
+  const t = now();
+  const checked = validateSharePolicy({ passcode, noDownload, expiresAt }, t);
+  if (!checked.ok) throw bad("error" in checked ? checked.error : "bad share policy");
+  const { policy } = /** @type {{ ok: true, policy: { passcode: string|null, noDownload: boolean, expiresAt: number|null } }} */ (checked);
+  const passcodeHash = policy.passcode != null ? hashPasscode(policy.passcode) : null;
+  const link = await registry.createLink({
+    board: b.id,
+    role,
+    expiresAt: policy.expiresAt,
+    passcodeHash,
+    noDownload: policy.noDownload,
+    by: caller.user,
+    idem,
+  });
   await recordAudit(registry, {
     tenant: b.tenant,
     board: b.id,
     actor: caller.user,
     action: "link.create",
     target: link.id,
-    detail: { role: link.role, expiresAt: link.expiresAt },
-    at: now(),
+    detail: {
+      role: link.role,
+      expiresAt: link.expiresAt,
+      ...(link.hasPasscode ? { hasPasscode: true } : {}),
+      ...(link.noDownload ? { noDownload: true } : {}),
+    },
+    at: t,
   });
   return link;
 }
@@ -366,6 +385,23 @@ export async function listLinks({ caller, board }, deps) {
   const s = await sharer(deps, caller, board), b = s.b;
   return deps.registry.links(b.id);
 }
+/**
+ * Evaluate a share link's policy (expiry, passcode, brute-force rate limit, noDownload) against persisted registry state.
+ * Never returns plaintext passcodes or passcode hashes.
+ * @param {{ link: string, passcode?: unknown }} req
+ * @param {{ registry: Registry, now?: () => number, rateLimiter?: import("../auth/share-policy.js").LinkRateLimiter|null }} deps
+ */
+export async function verifyLinkAccess({ link, passcode = undefined }, { registry, now = Date.now, rateLimiter = null }) {
+  if (typeof link !== "string" || !link) return { ok: false, code: /** @type {const} */ ("expired") };
+  const row = await registry.link(link);
+  if (!row) return { ok: false, code: /** @type {const} */ ("expired") };
+  const passcodeHash = row.hasPasscode ? await registry.linkPasscodeHash(row.id) : null;
+  const res = checkLinkPolicy(row, { passcode, passcodeHash, now: now(), rateLimiter });
+  if (!res.ok) return res;
+  const { policy } = /** @type {{ ok: true, policy: { noDownload: boolean, expiresAt: number|null, hasPasscode: boolean } }} */ (res);
+  return { ok: true, board: row.board, role: row.role, policy };
+}
+
 /** Idempotent like revokeInvite. */
 export async function revokeLink({ caller, board, link }, deps) {
   const { registry, now = Date.now } = deps;
@@ -419,7 +455,7 @@ export async function shareView({ caller, board }, deps) {
     unit: inside ? { domains: unit?.domains ?? [] } : null,
     limits: { inviteRoles: INVITE_ROLES.filter(may), linkRoles: LINK_ROLES.filter(may), inviteTtlMs: INVITE_TTL_MS },
     invites: inv.slice(0, SHARE_LIST_MAX).map(i => ({ id: i.id, email: i.email, role: i.role, expiresAt: i.expiresAt, createdAt: i.createdAt, guest: isGuestEmail(i.email, unit) })),
-    links: lnk.slice(0, SHARE_LIST_MAX).map(l => ({ id: l.id, role: l.role, expiresAt: l.expiresAt, createdAt: l.createdAt })),
+    links: lnk.slice(0, SHARE_LIST_MAX).map(l => ({ id: l.id, role: l.role, expiresAt: l.expiresAt, createdAt: l.createdAt, ...(l.hasPasscode ? { hasPasscode: true } : {}), ...(l.noDownload ? { noDownload: true } : {}) })),
     more: inv.length > SHARE_LIST_MAX || lnk.length > SHARE_LIST_MAX,
   };
 }

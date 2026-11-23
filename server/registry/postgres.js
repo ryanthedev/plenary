@@ -74,7 +74,7 @@
 import { SQL } from "bun";
 import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../auth/util.js";
-import { needSchema, migrate, assertShapes, missing } from "../pg/schema.js";
+import { needSchema, migrate, assertShapes, missing, ensureColumn } from "../pg/schema.js";
 
 const UNIQUE = "23505";
 /** SQLSTATEs: insufficient_privilege; lock_not_available (lock_timeout fired); query_canceled (statement_timeout). */
@@ -99,7 +99,7 @@ const REGISTRY_TABLE_DDL = {
   reg_boards: "id TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), title TEXT NOT NULL, member_role TEXT, created_at BIGINT NOT NULL, trashed_at BIGINT, trashed_by TEXT, trashed_with TEXT, purging BOOLEAN NOT NULL DEFAULT FALSE",
   reg_grants: "board TEXT NOT NULL REFERENCES $S.reg_boards(id), member TEXT NOT NULL, role TEXT NOT NULL, n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member)",
   reg_invites: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), email TEXT NOT NULL, role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
-  reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
+  reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL, passcode_hash TEXT, no_download BOOLEAN NOT NULL DEFAULT FALSE",
   reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
   reg_audit: "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), board TEXT, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT, at BIGINT NOT NULL",
   reg_board_versions: "id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES $S.reg_tenants(id), board_id TEXT NOT NULL REFERENCES $S.reg_boards(id) ON DELETE CASCADE, label TEXT NOT NULL, created_by TEXT NOT NULL, created_by_name TEXT, created_at BIGINT NOT NULL, element_count INTEGER NOT NULL, snapshot_json TEXT NOT NULL",
@@ -209,10 +209,14 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       // A schema from before the organization (boards, no Spaces) is an old-format store: refused, never half-filled in.
       if (!(await missing(tx, s, ["reg_boards"])).length && (await missing(tx, s, ["reg_spaces"])).length)
         throw Object.assign(new Error(`postgres registry: schema "${s}" has reg_boards but no reg_spaces: it is from an older version. Reset the store: drop the schema "${s}" (every table in it, never one), and the next start-up recreates it`), { code: "old-format" });
-      // Additive migration for existing origin/main Postgres schemas (adds reg_tenants.name, reg_tenant_members, reg_audit safely before assertShapes).
+      // Additive migration for existing origin/main Postgres schemas (adds reg_tenants.name, reg_links policy columns, reg_tenant_members, reg_audit safely before assertShapes).
       if (!(await missing(tx, s, ["reg_tenants", "reg_spaces"])).length) {
         const haveName = await tx.unsafe(`SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'reg_tenants' AND column_name = 'name'`, [s]);
         if (!haveName.length) await tx.unsafe(`ALTER TABLE ${T} ADD COLUMN IF NOT EXISTS name TEXT`);
+        if (!(await missing(tx, s, ["reg_links"])).length) {
+          await ensureColumn(tx, s, "reg_links", "passcode_hash", "TEXT");
+          await ensureColumn(tx, s, "reg_links", "no_download", "BOOLEAN NOT NULL DEFAULT FALSE");
+        }
         const addTables = await missing(tx, s, ["reg_tenant_members", "reg_audit", "reg_board_versions"]);
         if (addTables.length) {
           const all = registryTables(s);
@@ -364,7 +368,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const tenantOfScope = async (q, type, id) => (type === "unit" ? (await one(q, `SELECT id AS t FROM ${T} WHERE id = $1`, [id]))
     : await one(q, `SELECT tenant AS t FROM ${type === "group" ? GR : type === "space" ? SP : BD} WHERE id = $1`, [id]))?.t ?? null;
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
-  const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
+  const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at), hasPasscode: Boolean(r.passcode_hash), noDownload: Boolean(r.no_download) };
   const rowAudit = r => r && { id: num(r.id), tenant: r.tenant, board: r.board, actor: r.actor, action: r.action, target: r.target, detail: r.detail == null ? null : JSON.parse(r.detail), at: num(r.at) };
   const rowVersionMeta = r => r && { id: r.id, tenantId: r.tenant_id, boardId: r.board_id, label: r.label, createdBy: r.created_by, createdByName: r.created_by_name ?? null, createdAt: num(r.created_at), elementCount: num(r.element_count) };
   const rowVersion = r => r && { ...rowVersionMeta(r), snapshotJson: r.snapshot_json };
@@ -884,20 +888,23 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       return write(async tx => (await tx.unsafe(`UPDATE ${I} SET revoked = true WHERE id = $1`, [id])).count > 0);
     },
 
-    async createLink({ board, role, expiresAt = null, by, idem }) {
+    async createLink({ board, role, expiresAt = null, passcodeHash = null, noDownload = false, by, idem }) {
       ready();
       if (!key(board)) throw new Error("registry: no such board");
+      const hash = typeof passcodeHash === "string" && passcodeHash.length > 0 && key(passcodeHash) ? passcodeHash : null;
+      const noDl = Boolean(noDownload);
       const k = idemStart(idem), createdAt = now();
       return write(async tx => {
         if (!(await boardExists(tx, board))) throw new Error("registry: no such board");
         const id = await fresh(tx, mint.link, L);
         await idemPut(tx, k, id, createdAt);
-        await tx.unsafe(`INSERT INTO ${L} (id, board, role, expires_at, revoked, by_user, created_at)
-          VALUES ($1, $2, $3, $4, false, $5, $6)`, [id, board, role, nz(expiresAt), nz(by), createdAt]);
+        await tx.unsafe(`INSERT INTO ${L} (id, board, role, expires_at, revoked, by_user, created_at, passcode_hash, no_download)
+          VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8)`, [id, board, role, nz(expiresAt), nz(by), createdAt, hash, noDl]);
         return rowLink(await one(tx, `SELECT * FROM ${L} WHERE id = $1`, [id]));
       });
     },
     async link(id) { ready(); return key(id) ? rowLink(await one(db, `SELECT * FROM ${L} WHERE id = $1`, [id])) : null; },
+    async linkPasscodeHash(id) { ready(); return key(id) ? ((await one(db, `SELECT passcode_hash FROM ${L} WHERE id = $1`, [id]))?.passcode_hash ?? null) : null; },
     async links(board) {
       ready();
       return key(board) ? (await db.unsafe(`SELECT * FROM ${L} WHERE board = $1 ORDER BY n`, [board])).map(rowLink) : [];

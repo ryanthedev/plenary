@@ -348,4 +348,50 @@ describe("sqlite registry", () => {
     expect(await r.listBoardVersions({ tenantId: t.id, boardId: b.id })).toEqual([]);
     await r.close();
   });
+
+  test("backwards-compatible additive migration: an existing SQLite registry whose reg_links lacks passcode_hash/no_download upgrades seamlessly", async () => {
+    const path = file();
+    let r = sqliteRegistry({ path, now: () => 1000, fullfsync: false });
+    const t = await r.createTenant({ domain: "acme.com", admins: ["dev:owner"] });
+    const b = await mkBoard(r, { tenant: t.id, title: "Live board", owner: "dev:owner" });
+    const legacyLink = await r.createLink({ board: b.id, role: "viewer", by: "dev:owner" });
+    await r.close();
+
+    // Rewrite reg_links to the pre-#37 8-column schema (without passcode_hash / no_download) while preserving existing rows.
+    const raw = new Database(path, { strict: true });
+    raw.run("PRAGMA foreign_keys=OFF");
+    raw.run(`CREATE TABLE reg_links_old (
+      n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
+      role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`);
+    raw.run(`INSERT INTO reg_links_old (n, id, board, role, expires_at, revoked, by_user, created_at)
+      SELECT n, id, board, role, expires_at, revoked, by_user, created_at FROM reg_links`);
+    raw.run("DROP TABLE reg_links");
+    raw.run("ALTER TABLE reg_links_old RENAME TO reg_links");
+    raw.run("CREATE INDEX reg_links_board ON reg_links (board)");
+    raw.close();
+
+    // Reopen: must NOT throw old-format; must add passcode_hash & no_download via ALTER TABLE.
+    r = sqliteRegistry({ path, now: () => 2000, fullfsync: false });
+    const readOld = await r.link(legacyLink.id);
+    expect(readOld).toMatchObject({ id: legacyLink.id, board: b.id, role: "viewer", hasPasscode: false, noDownload: false });
+    expect("passcode_hash" in readOld).toBe(false);
+    expect(await r.linkPasscodeHash(legacyLink.id)).toBeNull();
+
+    // New policy-protected link persists across close/reopen without ever returning passcode_hash on link()/links().
+    const protectedLink = await r.createLink({
+      board: b.id,
+      role: "editor",
+      passcodeHash: "scrypt$16384$8$1$" + "a".repeat(32) + "$" + "b".repeat(64),
+      noDownload: true,
+      by: "dev:owner",
+    });
+    expect(protectedLink).toMatchObject({ hasPasscode: true, noDownload: true });
+    expect("passcodeHash" in protectedLink).toBe(false);
+    await r.close();
+
+    r = sqliteRegistry({ path, now: () => 3000, fullfsync: false });
+    expect(await r.link(protectedLink.id)).toEqual(protectedLink);
+    expect(await r.linkPasscodeHash(protectedLink.id)).toBe("scrypt$16384$8$1$" + "a".repeat(32) + "$" + "b".repeat(64));
+    await r.close();
+  });
 });

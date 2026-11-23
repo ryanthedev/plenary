@@ -73,7 +73,8 @@ const createSchema = d => {
     d.run("CREATE INDEX IF NOT EXISTS reg_invites_board ON reg_invites (board, email)");
     d.run(`CREATE TABLE IF NOT EXISTS reg_links (
       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES reg_boards(id),
-      role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL)`);
+      role TEXT NOT NULL, expires_at INTEGER, revoked INTEGER NOT NULL, by_user TEXT, created_at INTEGER NOT NULL,
+      passcode_hash TEXT, no_download INTEGER NOT NULL DEFAULT 0)`);
     d.run("CREATE INDEX IF NOT EXISTS reg_links_board ON reg_links (board)");
     d.run(`CREATE TABLE IF NOT EXISTS reg_link_uses (
       board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES reg_links(id), n INTEGER NOT NULL,
@@ -186,6 +187,17 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
           id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES reg_tenants(id), board_id TEXT NOT NULL REFERENCES reg_boards(id) ON DELETE CASCADE,
           label TEXT NOT NULL, created_by TEXT NOT NULL, created_by_name TEXT, created_at INTEGER NOT NULL, element_count INTEGER NOT NULL, snapshot_json TEXT NOT NULL)`);
         db.run("CREATE INDEX IF NOT EXISTS reg_board_versions_board ON reg_board_versions (tenant_id, board_id, created_at DESC, id DESC)");
+      }
+      if (has("reg_links")) {
+        const linkCols = db.query("PRAGMA table_info(reg_links)").all();
+        if (!linkCols.some(c => c.name === "passcode_hash")) {
+          try { db.run("ALTER TABLE reg_links ADD COLUMN passcode_hash TEXT"); }
+          catch (err) { if (!String(err?.message ?? "").includes("duplicate column")) throw err; }
+        }
+        if (!linkCols.some(c => c.name === "no_download")) {
+          try { db.run("ALTER TABLE reg_links ADD COLUMN no_download INTEGER NOT NULL DEFAULT 0"); }
+          catch (err) { if (!String(err?.message ?? "").includes("duplicate column")) throw err; }
+        }
       }
     }).immediate(), clock, onAttempt);
   }
@@ -466,10 +478,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     revokeInvite: db.query("UPDATE reg_invites SET revoked = 1 WHERE id = ?"),
 
     link: db.query("SELECT * FROM reg_links WHERE id = ?"),
+    linkPasscodeHash: db.query("SELECT passcode_hash FROM reg_links WHERE id = ?"),
     links: db.query("SELECT * FROM reg_links WHERE board = ? ORDER BY n"),
     linksForUserInTenant: db.query("SELECT l.board, l.role, l.expires_at, l.revoked FROM reg_link_uses u JOIN reg_links l ON l.id = u.link JOIN reg_boards b ON b.id = l.board WHERE b.tenant = ? AND u.member = ?"),
-    insLink: db.query(`INSERT INTO reg_links (id, board, role, expires_at, revoked, by_user, created_at)
-      VALUES (?, ?, ?, ?, 0, ?, ?)`),
+    insLink: db.query(`INSERT INTO reg_links (id, board, role, expires_at, revoked, by_user, created_at, passcode_hash, no_download)
+      VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`),
     revokeLink: db.query("UPDATE reg_links SET revoked = 1 WHERE id = ?"),
 
     useN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_link_uses WHERE board = ? AND member = ?"),
@@ -500,7 +513,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const rowRole = r => r && { id: r.id, tenant: r.tenant, name: r.name, base: r.base, boardRole: r.board_role, permissions: JSON.parse(r.permissions), createdAt: r.created_at };
   const rowSg = r => ({ subject: { type: r.subject_type, id: r.subject }, role: r.role });
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at };
-  const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at };
+  const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: r.expires_at, revoked: !!r.revoked, by: r.by_user, createdAt: r.created_at, hasPasscode: Boolean(r.passcode_hash), noDownload: Boolean(r.no_download) };
   const rowAudit = r => r && { id: r.id, tenant: r.tenant, board: r.board, actor: r.actor, action: r.action, target: r.target, detail: r.detail == null ? null : JSON.parse(r.detail), at: r.at };
   // undefined → null (bun:sqlite refuses undefined bindings); everything else as given.
   const nz = v => (v === undefined ? null : v);
@@ -717,11 +730,11 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     return rowInvite(q.invite.get(id));
   });
 
-  const createLinkTx = db.transaction((board, role, expiresAt, by, idem, createdAt) => {
+  const createLinkTx = db.transaction((board, role, expiresAt, by, idem, createdAt, passcodeHash, noDownload) => {
     if (!q.boardExists.get(board)) throw new Error("registry: no such board");
     idemEnter(idem, createdAt);
     const id = fresh(mint.link, i => !!q.link.get(i));
-    q.insLink.run(id, board, role, expiresAt, by, createdAt);
+    q.insLink.run(id, board, role, expiresAt, by, createdAt, passcodeHash, noDownload);
     idemPut(idem, id, createdAt);
     return rowLink(q.link.get(id));
   });
@@ -1186,12 +1199,14 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     },
     async revokeInvite(id) { ready(); return str(id) ? q.revokeInvite.run(id).changes > 0 : false; },
 
-    async createLink({ board, role, expiresAt = null, by, idem }) {
+    async createLink({ board, role, expiresAt = null, passcodeHash = null, noDownload = false, by, idem }) {
       ready();
       if (!str(board)) throw new Error("registry: no such board");
-      return createLinkTx.immediate(board, role, nz(expiresAt), nz(by), idemOf(idem), now());
+      const hash = typeof passcodeHash === "string" && passcodeHash.length > 0 ? passcodeHash : null;
+      return createLinkTx.immediate(board, role, nz(expiresAt), nz(by), idemOf(idem), now(), hash, noDownload ? 1 : 0);
     },
     async link(id) { ready(); return str(id) ? rowLink(q.link.get(id)) ?? null : null; },
+    async linkPasscodeHash(id) { ready(); return str(id) ? (q.linkPasscodeHash.get(id)?.passcode_hash ?? null) : null; },
     async links(board) { ready(); return str(board) ? q.links.all(board).map(rowLink) : []; },
     async revokeLink(id) { ready(); return str(id) ? q.revokeLink.run(id).changes > 0 : false; },
 

@@ -39,6 +39,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Map<string, Role>>} */ const grants = new Map();
   /** @type {Map<string, Invite>} */ const invites = new Map();
   /** @type {Map<string, Link>} */ const links = new Map();
+  /** @type {Map<string, string>} link id → scrypt passcode hash (never returned on Link objects) */ const linkHashes = new Map();
   /** @type {Map<string, Set<string>>} key board + "\n" + user → link ids */ const uses = new Map();
   /** @type {AuditEvent[]} */ const audits = [];
   let auditSeq = 0;
@@ -242,7 +243,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       grants.delete(id);
       scoped.delete(sk("board", id));
       for (const [iid, inv] of invites) if (inv.board === id) invites.delete(iid);
-      for (const [lid, lnk] of links) if (lnk.board === id) links.delete(lid);
+      for (const [lid, lnk] of links) if (lnk.board === id) { links.delete(lid); linkHashes.delete(lid); }
       const prefix = id + "\n";
       for (const k of [...uses.keys()]) if (k.startsWith(prefix)) uses.delete(k);
       for (const m of [recent, stars]) for (const x of m.values()) x.delete(id);
@@ -435,7 +436,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       if (!claimed.has("b\n" + board) || b.trashedAt == null) return false;
       grants.delete(board); scoped.delete(sk("board", board));
       for (const [id, i] of invites) if (i.board === board) invites.delete(id);
-      for (const [id, l] of links) if (l.board === board) links.delete(id);
+      for (const [id, l] of links) if (l.board === board) { links.delete(id); linkHashes.delete(id); }
       for (const k of [...uses.keys()]) if (k.startsWith(board + "\n")) uses.delete(k);
       for (const m of [recent, stars]) for (const x of m.values()) x.delete(board);
       for (const k of [...requests.keys()]) if (k.startsWith("board\n" + board + "\n")) requests.delete(k);
@@ -481,15 +482,18 @@ export function memoryRegistry({ now = Date.now } = {}) {
     },
     async revokeInvite(id) { const i = invites.get(id); if (!i) return false; i.revoked = true; return true; },
 
-    async createLink({ board, role, expiresAt = null, by, idem: key }) {
+    async createLink({ board, role, expiresAt = null, passcodeHash = null, noDownload = false, by, idem: key }) {
       if (!boards.has(board)) throw new Error("registry: no such board");
       const k = idemEnter(key);
-      const l = { id: fresh(links, mint.link), board, role, expiresAt, revoked: false, by, createdAt: now() };
+      const hash = typeof passcodeHash === "string" && passcodeHash.length > 0 ? passcodeHash : null;
+      const l = { id: fresh(links, mint.link), board, role, expiresAt, revoked: false, by, createdAt: now(), hasPasscode: hash !== null, noDownload: Boolean(noDownload) };
       links.set(l.id, l);
+      if (hash !== null) linkHashes.set(l.id, hash);
       idemPut(k, l.id);
       return copy(l);
     },
     async link(id) { return copy(links.get(id)); },
+    async linkPasscodeHash(id) { return typeof id === "string" ? (linkHashes.get(id) ?? null) : null; },
     async links(board) { return [...links.values()].filter(l => l.board === board).map(copy); },
     async revokeLink(id) { const l = links.get(id); if (!l) return false; l.revoked = true; return true; },
 

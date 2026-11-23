@@ -79,7 +79,7 @@ export const REGISTRY_METHODS = Object.freeze([
   "roleUsage", "memberCount", "updateRole", "role", "roles", "accessContexts",
   "accessContext", "boardsIn", "scopesOf", "personalScopesOf", "board", "moveBoard", "trashBoard", "restoreBoard", "trashSpace", "restoreSpace", "trashedBoards", "trashedSpaces", "trashDue", "purgeClaim", "purgeBoard", "purgeSpace", "setGrant", "grant",
   "grants", "createInvite", "invite", "invites", "invitesFor", "revokeInvite",
-  "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
+  "createLink", "link", "linkPasscodeHash", "links", "revokeLink", "addLinkUse", "linkUses",
   "appendAudit", "listAudit",
   "createBoardVersion", "listBoardVersions", "getBoardVersion", "deleteBoardVersion",
   "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
@@ -132,7 +132,7 @@ export const mint = {
  * @typedef {{ board: Board, grant: Role|null, teamGrants: ScopedGrant[], myTeams: string[], invites: Invite[], links: Link[] }} BoardRows   `teamGrants`: Team grants on the board; `myTeams`: those of the user's Teams that appear in `teamGrants`; `invites`: non-revoked, to the user's email; `links`: the link records of the user's uses on this board
  * @typedef {{ id: string, tenant: string, scope: ScopeRef, user: string, role: string, state: "pending"|"dismissed"|"granted", at: number, closedAt: number|null }} AccessRequest
  * @typedef {{ id: string, board: string, email: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Invite
- * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
+ * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number, hasPasscode: boolean, noDownload: boolean }} Link
  * @typedef {{ id: number, tenant: string, board: string|null, actor: string, action: string, target: string|null, detail: any, at: number }} AuditEvent
  * @typedef {{ events: AuditEvent[], nextBefore: string|null }} AuditPage
  * @typedef {{ id: string, tenantId: string, boardId: string, label: string, createdBy: string, createdByName: string|null, createdAt: number, elementCount: number }} BoardVersionMeta
@@ -218,8 +218,9 @@ export const mint = {
  *   invites(board: string): Promise<Invite[]>,
  *   invitesFor(board: string, email: string): Promise<Invite[]>,
  *   revokeInvite(id: string): Promise<boolean>,
- *   createLink(o: { board: string, role: Role, expiresAt?: number|null, by: string, idem?: Idem }): Promise<Link>,
+ *   createLink(o: { board: string, role: Role, expiresAt?: number|null, passcodeHash?: string|null, noDownload?: boolean, by: string, idem?: Idem }): Promise<Link>,
  *   link(id: string): Promise<Link|null>,
+ *   linkPasscodeHash(id: string): Promise<string|null>,
  *   links(board: string): Promise<Link[]>,
  *   revokeLink(id: string): Promise<boolean>,
  *   addLinkUse(link: string, user: string): Promise<void>,   // a board in Trash rejects code "in-trash", recording nothing (PROTOCOL.md § Trash and restore)

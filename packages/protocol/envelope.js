@@ -1,6 +1,8 @@
 // @ts-check
 // The rules every message obeys (PROTOCOL.md v1.1): streams, roles, what an op may hold, the limits.
-// Pure: imports nothing, so a room, a browser, a phone and a Herdr pane all check the same way.
+// Pure: imports only pure protocol helpers, so a room, a browser, a phone and a Herdr pane all check the same way.
+
+import { moderationProblem } from "./moderation.js";
 
 export const PROTOCOL_VERSION = 1;
 export const RULES_VERSION = 1;
@@ -221,13 +223,17 @@ const APP_KEYS = {
   grid: v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1000,
   snap: v => typeof v === "boolean",
   timeline: v => isObj(v) && typeof v.duration === "number" && Number.isFinite(v.duration) && v.duration >= 0 && v.duration <= 3_600_000,
+  moderation: v => moderationProblem(v) === null,
 };
 export function appStateProblem(patch) {
   if (!isObj(patch)) return "appState must be an object";
   for (const [k, v] of Object.entries(patch)) {
     // Own keys only: "__proto__" or "constructor" would otherwise find Object.prototype's members.
     if (!Object.prototype.hasOwnProperty.call(APP_KEYS, k)) return `unknown board setting ${JSON.stringify(k)}`;
-    if (!APP_KEYS[k](v)) return `bad value for ${k}`;
+    if (k === "moderation") {
+      const why = moderationProblem(v);
+      if (why) return why;
+    } else if (!APP_KEYS[k](v)) return `bad value for ${k}`;
   }
   return null;
 }

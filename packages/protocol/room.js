@@ -17,6 +17,7 @@ import {
 } from "./envelope.js";
 import { Records } from "./records.js";
 import { Folder, FOLD_STEP_UNITS } from "./fold.js";
+import { moderationOf, canWriteUnderModeration } from "./moderation.js";
 
 const fail = (code, message) => Object.assign(new Error(message), { code });
 const chars = v => JSON.stringify(v).length;
@@ -437,6 +438,10 @@ export class Room {
     }
 
     const mod = canModerate(c.role);
+    if (msg.stream === "notes" || msg.stream === "records") {
+      const modCheck = canWriteUnderModeration(c.role, c.user, moderationOf(this.streams.board.appState));
+      if (!modCheck.allowed) return this.answer(c, { t: "refused", ...id, reason: modCheck.reason }, this.seq);
+    }
     if (msg.stream === "records") {
       const why = this.records.check(msg.op, c.user, c.role);
       if (why) return refuse(why, this.seq);

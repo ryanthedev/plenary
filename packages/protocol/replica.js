@@ -429,6 +429,7 @@ export class Replica {
       }
     } else if (msg.t === "presence") this.presence(msg);
     else if (msg.t === "error") this.error(msg, did);
+    else if (msg.t === "refused") this.error({ ...msg, code: msg.reason ?? "refused" }, did);
     return did;
   }
 

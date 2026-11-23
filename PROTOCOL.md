@@ -55,7 +55,7 @@ element document each); `records` is not.
 
 | Stream | Holds | Merge | Who may write |
 |---|---|---|---|
-| `board` | the drawing (elements, `appState.herdr`: layers, grid, snap, timeline) | herdr-draw's: version, then `seq` for appState | owner, editor |
+| `board` | the drawing (elements, `appState.herdr`: layers, views, grid, snap, timeline, moderation) | herdr-draw's: version, then `seq` for appState | owner, editor |
 | `notes` | annotations: sticky notes, highlighter strokes, pins, pictures | same | owner, editor, annotator |
 | `records` | comment threads, replies, reactions | applied in `seq` order by the room (§ Records) | owner, editor, annotator, commenter |
 
@@ -115,7 +115,8 @@ Excalidraw's `version` and `versionNonce`; `appState` is a shallow patch of `app
   `bad-op`.
 - **`appState` keys are a fixed set**, each checked: `layers` (1–100 of `{id, name, visible, locked, opacity 0–100}`),
   `views` (0–100 of `{id, name, frameId: string | null, visibleLayers: string[] | null}`), `grid` (0–1000),
-  `snap` (boolean), `timeline` (`{duration}` up to an hour). Unknown and prototype keys are refused.
+  `snap` (boolean), `timeline` (`{duration}` up to an hour), `moderation` (`{locked: boolean, mutedUsers: string[]}`,
+  up to 200 unique user ids of 1–128 characters; § Audience moderation). Unknown and prototype keys are refused.
   Only owners and editors set them, on either stream.
 - **`appState` keys merge by `seq`**: a key takes the value of the highest-`seq` op that set it. `appSeq[stream][key]`
   is that `seq` (0 for a key never set). The room only logs a settings op whose bases are current (below), so the
@@ -179,6 +180,28 @@ Excalidraw's `version` and `versionNonce`; `appState` is a shallow patch of `app
   because an append failed, and a later op of the same client was then accepted, the resend is below `high` and
   not in `recent`, so it gets `stale` and the client resyncs (§ Op ids). Safe (nothing is logged twice; the resync
   shows the truth), but it costs the resync the soft refusal avoids. `records` refusals have the same cost.
+
+### Audience moderation
+
+An all-hands presenter (`owner` or `editor`) can lock audience writes or mute specific users via `appState.herdr.moderation`
+on the `board` stream (using ordinary compare-and-set settings ops):
+
+- **Schema:** `{ locked: boolean, mutedUsers: string[] }`. `mutedUsers` holds at most **200** (`MAX_MUTED_USERS`)
+  deduplicated user ids, each **1–128** characters. Unknown keys, non-boolean `locked`, duplicates, or out-of-bounds
+  entries are refused `bad-op`.
+- **Backwards compatibility:** boards with no `appState.herdr.moderation` behave identically to unlocked with no muted users.
+- **Role rules:** only `owner` and `editor` may modify `appState.herdr.moderation` (per existing settings rules).
+  Presenters (`owner` and `editor`) are **never** blocked by `locked` or `mutedUsers` — a presenter can never lock
+  themselves out.
+- **Room enforcement:** after the op-id table check, when accepting an op on `notes` or `records` from a non-moderator
+  (`annotator` or `commenter`), the room checks `this.streams.board.appState.herdr.moderation`:
+  - If `locked === true`, the room refuses the op with `{ t: "refused", id, reason: "board-locked" }` and logs nothing.
+  - Otherwise, if the sender's `user` is in `mutedUsers`, the room refuses the op with `{ t: "refused", id, reason: "user-muted" }`
+    and logs nothing.
+  - Refusals decided against unresolved entries are held until those entries resolve (or become `unavailable` if the append fails),
+    just like other state-dependent refusals.
+  - Clients treat `refused` as a terminal refusal for that op (rule 5): the op is dropped from pending; on `notes`, the replica resets and resyncs; on `records`, it only leaves the overlay with no resync.
+  - Replay (`applyEntry`) never runs moderation checks: entries already in the log remain valid regardless of later lock/mute changes.
 
 ## Limits
 
@@ -267,6 +290,7 @@ Server → client
 | `blob` | `sha1`, `url` | a signed URL, 5 minutes, one blob, one verb |
 | `hb` | (none) | downstream heartbeat sent by the gateway on an idle welcomed connection every ≤ 10 s (§ Pacing); keeps the client's 25 s idle deadline (rule 12) from firing on a quiet board |
 | `error` | `id?`, `sha1?`, `code`, `message` | codes below; `sha1` only on a refused `blob` request (§ Blobs) |
+| `refused` | `id`, `reason` | audience moderation refusal (`"board-locked"` or `"user-muted"`) on `notes` or `records` (§ Audience moderation) |
 
 Error codes, and what the client does:
 

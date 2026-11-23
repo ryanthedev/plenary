@@ -1,0 +1,17 @@
+apiVersion: v2
+name: plenary
+description: Live infinite canvas for enterprise all-hands — supports Simple Single-Node (SQLite + PVC) and Enterprise HA (Postgres + NATS + S3).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/ryanthedev/plenary
+sources:
+  - https://github.com/ryanthedev/plenary
+keywords:
+  - plenary
+  - whiteboard
+  - canvas
+  - collaboration
+  - enterprise
+maintainers:
+  - name: Plenary Maintainers

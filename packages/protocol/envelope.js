@@ -30,6 +30,8 @@ export const MAX_OP_BYTES = 1_000_000;
 export const MAX_VERSION_JUMP = 1000;
 export const MAX_CLIENT_CHARS = 128;
 export const MAX_ID_CHARS = 64;
+export const MAX_TIMELINE_CUES = 50;
+export const MAX_CUE_LABEL_CHARS = 80;
 
 // Op-id table (§ Op ids), fixed per rules version: a room replays old entries under the rules they were
 // accepted with. W = pairs kept per client, H = entries a client may stay silent before it is forgotten,
@@ -209,6 +211,28 @@ export function recordProblem(op) {
   return null;
 }
 
+function isValidTimeline(v) {
+  if (!isObj(v)) return false;
+  for (const k of Object.keys(v)) {
+    if (k !== "duration" && k !== "cues") return false;
+  }
+  if (typeof v.duration !== "number" || !Number.isFinite(v.duration) || v.duration < 0 || v.duration > 3_600_000) return false;
+  if (v.cues === undefined) return true;
+  if (!Array.isArray(v.cues) || v.cues.length > MAX_TIMELINE_CUES) return false;
+  const seen = new Set();
+  for (const c of v.cues) {
+    if (!isObj(c)) return false;
+    for (const ck of Object.keys(c)) {
+      if (ck !== "id" && ck !== "at" && ck !== "label") return false;
+    }
+    if (!isId(c.id) || seen.has(c.id)) return false;
+    seen.add(c.id);
+    if (!isNum(c.at) || c.at < 0 || c.at > 3_600_000) return false;
+    if (typeof c.label !== "string" || c.label.length > MAX_CUE_LABEL_CHARS) return false;
+  }
+  return true;
+}
+
 // Board settings a patch may set (appState.herdr), each checked, so a patch can't put junk in front of
 // every client. Unknown keys are refused.
 const APP_KEYS = {
@@ -222,7 +246,7 @@ const APP_KEYS = {
     (w.visibleLayers === null || (Array.isArray(w.visibleLayers) && w.visibleLayers.length <= 100 && w.visibleLayers.every(id => typeof id === "string" && id.length <= 64)))),
   grid: v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1000,
   snap: v => typeof v === "boolean",
-  timeline: v => isObj(v) && typeof v.duration === "number" && Number.isFinite(v.duration) && v.duration >= 0 && v.duration <= 3_600_000,
+  timeline: isValidTimeline,
   moderation: v => moderationProblem(v) === null,
 };
 export function appStateProblem(patch) {

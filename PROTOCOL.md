@@ -115,7 +115,9 @@ Excalidraw's `version` and `versionNonce`; `appState` is a shallow patch of `app
   `bad-op`.
 - **`appState` keys are a fixed set**, each checked: `layers` (1–100 of `{id, name, visible, locked, opacity 0–100}`),
   `views` (0–100 of `{id, name, frameId: string | null, visibleLayers: string[] | null}`), `grid` (0–1000),
-  `snap` (boolean), `timeline` (`{duration}` up to an hour), `moderation` (`{locked: boolean, mutedUsers: string[]}`,
+  `snap` (boolean), `timeline` (`{duration, cues?}`: `duration` 0–3,600,000 ms; optional `cues` array of up to 50
+  unique-id `{id, at, label}` pause markers with `id` 1–64 chars, finite `at` 0–3,600,000 ms, `label` string ≤ 80 chars),
+  `moderation` (`{locked: boolean, mutedUsers: string[]}`,
   up to 200 unique user ids of 1–128 characters; § Audience moderation). Unknown and prototype keys are refused.
   Only owners and editors set them, on either stream.
 - **`appState` keys merge by `seq`**: a key takes the value of the highest-`seq` op that set it. `appSeq[stream][key]`

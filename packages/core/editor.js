@@ -15,7 +15,12 @@ import {
   bounds, corners, rotate, rotateAbout, angleOf, centerOf, toLocal, toWorld as elToWorld, normAngle,
 } from "./geometry.js";
 import { paintScene, project, rectCmds, withAlpha, paintSnapIndicator, paintHoverHighlight, outlineBoxCmds } from "./render.js";
-import { getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime } from "./anim.js";
+import {
+  getPreset, getEasing, timelineEnd, stepTimeline, effectiveAnimTime,
+  MAX_CUES, MAX_CUE_LABEL, MIN_CLIP_DURATION,
+  timelineTracks, reorderTrackOrder, cascadeTracks, alignTracks,
+  normalizeCues, cuesOf, nextCueAfter, prevCueBefore,
+} from "./anim.js";
 import { labelHostHeight, labelHostWidth } from "./text.js";
 import { isMermaid, mermaidToElements } from "./mermaid.js";
 import { itemFromElements } from "./library.js";
@@ -2036,13 +2041,198 @@ export class Editor {
    * @param {{ explicit?: boolean }} [opts]
    */
   seekTo(ms, opts = {}) {
-    const t = Math.max(0, Math.min(this.duration(), Number.isFinite(ms) ? ms : 0));
+    const cues = cuesOf(this.doc);
+    const maxCueAt = cues.length ? cues[cues.length - 1].at : 0;
+    const maxT = Math.max(this.duration(), maxCueAt);
+    const t = Math.max(0, Math.min(maxT, Number.isFinite(ms) ? ms : 0));
     this.play = null; this.scrub = t;
     if (typeof opts.explicit === "boolean") this.userTimeline = opts.explicit;
     this.changed();
   }
   stepToStart(opts) { this.seekTo(0, opts); }
   stepToEnd(opts) { this.seekTo(this.duration(), opts); }
+  /**
+   * Start explicit playback from the current playhead, stopping cleanly at the next cue marker
+   * (or the end of the timeline if none ahead; if already at/past the end, restarts from 0 to the first cue).
+   * @param {{ explicit?: boolean }} [opts]
+   */
+  playToNextCue(opts = {}) {
+    const dur = this.duration();
+    const cur = this.play ? (this.time() ?? 0) : (this.scrub ?? 0);
+    const from = cur >= dur ? 0 : Math.max(0, cur);
+    const next = nextCueAfter(cuesOf(this.doc), from);
+    const stopAt = next ? next.at : dur;
+    const explicit = opts.explicit !== false;
+    this.scrub = from;
+    this.play = { t0: this.clock(), from, explicit, stopAt };
+    this.userTimeline = explicit;
+    this.changed();
+  }
+  /**
+   * Seek to the previous cue marker strictly before the current playhead (or 0 if none).
+   * @param {{ explicit?: boolean }} [opts]
+   */
+  stepToPrevCue(opts = {}) {
+    const cur = this.play ? (this.time() ?? 0) : (this.scrub ?? 0);
+    const prev = prevCueBefore(cuesOf(this.doc), cur);
+    const target = prev ? prev.at : 0;
+    this.seekTo(target, { explicit: opts.explicit !== false });
+    return target;
+  }
+  /** @param {Array<{ id: string, at: number, label: string }>} cues */
+  _writeTimelineCues(cues) {
+    const prev = this.doc.appState?.herdr?.timeline;
+    const duration = typeof prev?.duration === "number" && Number.isFinite(prev.duration) && prev.duration >= 0 && prev.duration <= 3_600_000
+      ? prev.duration
+      : Math.min(3_600_000, Math.max(0, timelineEnd(this.doc.live())));
+    const normalized = normalizeCues(cues);
+    this.setAppState({ timeline: { duration, cues: normalized } });
+    return normalized;
+  }
+  /** Add a bounded presentation cue marker into `appState.herdr.timeline.cues`. */
+  addCueAt(at, label = "") {
+    if (this.readOnly) return null;
+    const existing = cuesOf(this.doc);
+    if (existing.length >= MAX_CUES) return null;
+    const safeAt = Math.min(3_600_000, Math.max(0, Number.isFinite(at) ? Math.round(at) : 0));
+    const safeLabel = typeof label === "string" ? label.trim().slice(0, MAX_CUE_LABEL) : "";
+    const cue = { id: newId(), at: safeAt, label: safeLabel };
+    this._writeTimelineCues([...existing, cue]);
+    return cue;
+  }
+  /** Move an existing cue marker to `at` ms. */
+  moveCue(id, at) {
+    if (this.readOnly || typeof id !== "string") return false;
+    const existing = cuesOf(this.doc);
+    if (!existing.some(c => c.id === id)) return false;
+    const safeAt = Math.min(3_600_000, Math.max(0, Number.isFinite(at) ? Math.round(at) : 0));
+    this._writeTimelineCues(existing.map(c => (c.id === id ? { ...c, at: safeAt } : c)));
+    return true;
+  }
+  /** Rename an existing cue marker (trimmed, bounded to `MAX_CUE_LABEL`). */
+  renameCue(id, label) {
+    if (this.readOnly || typeof id !== "string") return false;
+    const existing = cuesOf(this.doc);
+    if (!existing.some(c => c.id === id)) return false;
+    const safeLabel = typeof label === "string" ? label.trim().slice(0, MAX_CUE_LABEL) : "";
+    this._writeTimelineCues(existing.map(c => (c.id === id ? { ...c, label: safeLabel } : c)));
+    return true;
+  }
+  /** Remove an existing cue marker by id. */
+  deleteCue(id) {
+    if (this.readOnly || typeof id !== "string") return false;
+    const existing = cuesOf(this.doc);
+    const next = existing.filter(c => c.id !== id);
+    if (next.length === existing.length) return false;
+    this._writeTimelineCues(next);
+    return true;
+  }
+  /** Write `customData.anim` on an element and its bound label in lockstep within a transaction. */
+  _writeElAnim(tx, el, nextAnim) {
+    const c = tx.get(el.id);
+    if (!c) return;
+    c.customData = { ...(c.customData ?? {}), anim: nextAnim };
+    const l = (isShape(el) || isLinear(el)) && this.doc.labelOf(el);
+    if (l) {
+      const lc = tx.get(l.id);
+      if (lc) lc.customData = { ...(lc.customData ?? {}), anim: nextAnim };
+    }
+  }
+  /** Shift either preset `start` or keyframe `t` timestamps so the animation starts at `start`. */
+  _animWithStart(anim, start, extra = null) {
+    const safeStart = Math.min(3_600_000, Math.max(0, Math.round(start)));
+    if (Array.isArray(anim.keys) && anim.keys.length) {
+      const ts = anim.keys.map(k => k.t).filter(Number.isFinite);
+      const minT = ts.length ? Math.min(...ts) : 0;
+      const delta = safeStart - minT;
+      const keys = anim.keys.map(k => (Number.isFinite(k.t) ? { ...k, t: Math.min(3_600_000, Math.max(0, Math.round(k.t + delta))) } : { ...k }));
+      return { ...anim, keys, ...(extra ?? {}) };
+    }
+    return { ...anim, start: safeStart, ...(extra ?? {}) };
+  }
+  /** Reorder animated swimlane tracks in one undoable transaction. */
+  reorderAnimTracks(fromIdx, toIdx) {
+    if (this.readOnly) return false;
+    const tracks = timelineTracks(this.doc);
+    if (!tracks.length || !Number.isFinite(fromIdx) || fromIdx < 0 || fromIdx >= tracks.length) return false;
+    const updates = reorderTrackOrder(tracks, fromIdx, toIdx);
+    const ok = this.transact(tx => {
+      for (const { id, order } of updates) {
+        const el = this.doc.get(id);
+        if (!el || !el.customData?.anim || !this.doc.editable(el)) continue;
+        this._writeElAnim(tx, el, { ...el.customData.anim, order });
+      }
+      return true;
+    });
+    return !!ok;
+  }
+  /** Cascade animated tracks back-to-back in their current lane order in one undoable transaction. */
+  cascadeAnimTracks(opts = {}) {
+    if (this.readOnly) return false;
+    const allTracks = timelineTracks(this.doc);
+    const idSet = Array.isArray(opts.ids) ? new Set(opts.ids) : null;
+    const tracks = idSet ? allTracks.filter(t => idSet.has(t.id)) : allTracks;
+    if (!tracks.length) return false;
+    const updates = cascadeTracks(tracks, opts);
+    const ok = this.transact(tx => {
+      for (const { id, start, order } of updates) {
+        const el = this.doc.get(id);
+        if (!el || !el.customData?.anim || !this.doc.editable(el)) continue;
+        this._writeElAnim(tx, el, this._animWithStart(el.customData.anim, start, idSet ? null : { order }));
+      }
+      return true;
+    });
+    return !!ok;
+  }
+  /** Align animated tracks (specified `ids` or all tracks when omitted) to `atMs` in one undoable transaction. */
+  alignAnimTracks(ids, atMs = 0) {
+    if (this.readOnly) return false;
+    const allTracks = timelineTracks(this.doc);
+    const idSet = ids != null ? new Set(ids) : null;
+    const tracks = idSet ? allTracks.filter(t => idSet.has(t.id)) : allTracks;
+    if (!tracks.length) return false;
+    const updates = alignTracks(tracks, atMs);
+    const ok = this.transact(tx => {
+      for (const { id, start } of updates) {
+        const el = this.doc.get(id);
+        if (!el || !el.customData?.anim || !this.doc.editable(el)) continue;
+        this._writeElAnim(tx, el, this._animWithStart(el.customData.anim, start));
+      }
+      return true;
+    });
+    return !!ok;
+  }
+  /**
+   * Update timing/preset fields on a single animated element (and its bound label) in one undoable transaction.
+   * @param {string} id
+   * @param {{ start?: number, duration?: number, preset?: string, easing?: string, loop?: boolean, order?: number, cueGroup?: string | null }} [patch]
+   */
+  setAnimTiming(id, patch = {}) {
+    if (this.readOnly || typeof id !== "string") return false;
+    const el = this.doc.get(id);
+    if (!el || !el.customData?.anim || !this.doc.editable(el)) return false;
+    const cur = el.customData.anim;
+    let next = { ...cur };
+    if (patch.preset !== undefined && getPreset(patch.preset)) next.preset = patch.preset;
+    if (patch.easing !== undefined && getEasing(patch.easing)) next.easing = patch.easing;
+    if (patch.start != null && Number.isFinite(+patch.start)) {
+      next = this._animWithStart(next, +patch.start);
+    }
+    if (patch.duration != null && Number.isFinite(+patch.duration)) {
+      next.duration = Math.min(3_600_000, Math.max(MIN_CLIP_DURATION, Math.round(+patch.duration)));
+    }
+    if (typeof patch.loop === "boolean") next.loop = patch.loop;
+    if (patch.order != null && Number.isFinite(+patch.order)) next.order = Math.max(0, Math.round(+patch.order));
+    if (patch.cueGroup !== undefined) {
+      if (patch.cueGroup === null || patch.cueGroup === "") delete next.cueGroup;
+      else if (typeof patch.cueGroup === "string") next.cueGroup = patch.cueGroup;
+    }
+    const ok = this.transact(tx => {
+      this._writeElAnim(tx, el, next);
+      return true;
+    });
+    return !!ok;
+  }
   /** @param {{ explicit?: boolean }} [opts] */
   restartPlay(opts = {}) {
     const explicit = opts.explicit !== false;
@@ -2057,14 +2247,34 @@ export class Editor {
     const s = Number(speed);
     if (!Number.isFinite(s) || s <= 0) return;
     const wasExplicit = this.play?.explicit !== false;
+    const prevStopAt = this.play?.stopAt ?? null;
     const t = this.play ? this.time() : null;
-    if (this.play && t != null) this.play = { t0: this.clock(), from: t, explicit: wasExplicit };
+    if (this.play && t != null) {
+      this.play = { t0: this.clock(), from: t, explicit: wasExplicit, ...(prevStopAt != null ? { stopAt: prevStopAt } : {}) };
+    }
     this.playSpeed = s;
     this.changed();
   }
   time() {
     if (this.play) {
-      const res = stepTimeline({ from: this.play.from, elapsedMs: this.clock() - this.play.t0, duration: this.duration(), speed: this.playSpeed, loop: this.playLoop });
+      const stopAt = Number.isFinite(this.play.stopAt) ? this.play.stopAt : null;
+      const dur = Math.max(this.duration(), stopAt ?? 0);
+      const res = stepTimeline({
+        from: this.play.from,
+        elapsedMs: this.clock() - this.play.t0,
+        duration: dur,
+        speed: this.playSpeed,
+        loop: stopAt != null ? false : this.playLoop,
+        stopAt,
+      });
+      if (res.pausedAtCue) {
+        const wasExplicit = !!this.play.explicit;
+        this.play = null;
+        this.scrub = res.time;
+        this.userTimeline = wasExplicit;
+        this.changed();
+        return this.scrub;
+      }
       // Transitioning out of playback bumps version once so adapters repaint the resting canvas even if time() was polled outside tick().
       if (res.ended) { this.play = null; this.scrub = null; this.userTimeline = false; this.changed(); return null; }
       return res.time;

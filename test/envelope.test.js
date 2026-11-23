@@ -123,3 +123,31 @@ test("blobRefsOf (§ Blobs, References): the distinct SHA-1 fileIds of image ele
   expect(blobRefsOf(entries).sort()).toEqual([A, B]);
   expect(blobRefsOf([])).toEqual([]);
 });
+
+test("appState.timeline validates optional bounded cues without breaking duration-only ops", () => {
+  const tl = timeline => op({ op: { appState: { timeline }, appBase: { timeline: 0 } } });
+  expect(opProblem(tl({ duration: 5000 }))).toBeNull();
+  expect(opProblem(tl({ duration: 5000, cues: [] }))).toBeNull();
+  expect(opProblem(tl({ duration: 5000, cues: [{ id: "c1", at: 0, label: "" }, { id: "c2", at: 2500, label: "Point 2" }] }))).toBeNull();
+  // Exactly 50 cues passes; 51 fails
+  const fifty = Array.from({ length: 50 }, (_, i) => ({ id: `c${i}`, at: i * 100, label: "x".repeat(80) }));
+  expect(opProblem(tl({ duration: 10_000, cues: fifty }))).toBeNull();
+  expect(opProblem(tl({ duration: 10_000, cues: [...fifty, { id: "c50", at: 5000, label: "" }] }))?.code).toBe("bad-op");
+  // Invalid cue shapes, duplicate ids, out-of-range at, overlong labels, unknown keys
+  for (const bad of [
+    { duration: 5000, cues: "nope" },
+    { duration: 5000, cues: [null] },
+    { duration: 5000, cues: [{ id: "", at: 0, label: "" }] },
+    { duration: 5000, cues: [{ id: "x".repeat(65), at: 0, label: "" }] },
+    { duration: 5000, cues: [{ id: "dup", at: 100, label: "A" }, { id: "dup", at: 200, label: "B" }] },
+    { duration: 5000, cues: [{ id: "c1", at: -1, label: "" }] },
+    { duration: 5000, cues: [{ id: "c1", at: Infinity, label: "" }] },
+    { duration: 5000, cues: [{ id: "c1", at: 3_600_001, label: "" }] },
+    { duration: 5000, cues: [{ id: "c1", at: 100, label: 123 }] },
+    { duration: 5000, cues: [{ id: "c1", at: 100, label: "x".repeat(81) }] },
+    { duration: 5000, cues: [{ id: "c1", at: 100, label: "ok", extra: 1 }] },
+    { duration: 5000, extra: true },
+  ]) {
+    expect([bad, opProblem(tl(bad))?.code]).toEqual([bad, "bad-op"]);
+  }
+});

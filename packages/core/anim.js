@@ -213,6 +213,13 @@ export function animState(el, t) {
 // ── Timeline helpers (pure) ────────────────────────────────────────────────
 
 export const PLAYBACK_SPEEDS = [0.5, 1, 1.5, 2];
+export const MAX_CUES = 50;
+export const MAX_CUE_LABEL = 80;
+export const MIN_CLIP_DURATION = 100;
+
+const MAX_TRACK_LABEL = 32;
+const MAX_CUE_ID_CHARS = 64;
+const MAX_TIMELINE_MS = 3_600_000;
 
 // When does the last animation end? (The timeline's natural length.)
 export function timelineEnd(elements) {
@@ -242,12 +249,48 @@ export function formatTime(ms) {
   return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}.${tenths}`;
 }
 
-/** Pure playback step: advances from `from` by `elapsedMs * speed`, wrapping on `loop` or ending after `holdMs`. */
-export function stepTimeline({ from = 0, elapsedMs = 0, duration = 1, speed = 1, loop = false, holdMs = 400 } = {}) {
+/**
+ * Pure playback step: advances from `from` by `elapsedMs * speed`, wrapping on `loop`,
+ * pausing cleanly at `stopAt` (when finite and > start time), or ending after `holdMs`.
+ * Supports both `stepTimeline({ from, elapsedMs, duration, speed, loop, holdMs, stopAt })`
+ * and positional `stepTimeline(play, now, dur, { stopAt })`.
+ * @param {any} [arg0]
+ * @param {number} [now]
+ * @param {number} [durArg]
+ * @param {{ stopAt?: number | null, holdMs?: number }} [opts]
+ * @returns {{ time: number | null, t?: number | null, ended: boolean, pausedAtCue?: boolean }}
+ */
+export function stepTimeline(arg0 = {}, now, durArg, opts) {
+  if (typeof now === "number") {
+    const play = arg0 && typeof arg0 === "object" ? arg0 : {};
+    const startFrom = Math.max(0, Number.isFinite(play.at) ? play.at : (Number.isFinite(play.from) ? play.from : 0));
+    const t0 = Number.isFinite(play.t0) ? play.t0 : now;
+    const elapsedMs = Math.max(0, now - t0);
+    const dur = Math.max(1, Number.isFinite(durArg) ? durArg : 1);
+    const spd = Number.isFinite(play.speed) && play.speed > 0 ? play.speed : 1;
+    const loop = !!play.loop;
+    const holdMs = Number.isFinite(opts?.holdMs) ? opts.holdMs : 400;
+    const stopAt = opts && Number.isFinite(opts.stopAt) ? opts.stopAt : null;
+    const raw = startFrom + elapsedMs * spd;
+    if (stopAt != null && stopAt > startFrom && raw >= stopAt) {
+      return { t: stopAt, time: stopAt, ended: true, pausedAtCue: true };
+    }
+    if (loop) {
+      const t = raw % dur;
+      return { t, time: t, ended: false };
+    }
+    if (raw > dur + holdMs) return { t: null, time: null, ended: true };
+    return { t: raw, time: raw, ended: false };
+  }
+  const { from = 0, elapsedMs = 0, duration = 1, speed = 1, loop = false, holdMs = 400, stopAt = null } = arg0 ?? {};
   const dur = Math.max(1, Number.isFinite(duration) ? duration : 1);
   const spd = Number.isFinite(speed) && speed > 0 ? speed : 1;
+  const startFrom = Math.max(0, Number.isFinite(from) ? from : 0);
   const dt = Math.max(0, Number.isFinite(elapsedMs) ? elapsedMs : 0) * spd;
-  const raw = Math.max(0, Number.isFinite(from) ? from : 0) + dt;
+  const raw = startFrom + dt;
+  if (stopAt != null && Number.isFinite(stopAt) && stopAt > startFrom && raw >= stopAt) {
+    return { time: stopAt, ended: true, pausedAtCue: true };
+  }
   if (loop) return { time: raw % dur, ended: false };
   if (raw > dur + holdMs) return { time: null, ended: true };
   return { time: raw, ended: false };
@@ -304,6 +347,277 @@ export function timelineSpans(elements) {
   }
   out.sort((a, b) => a.start - b.start || a.end - b.end || String(a.id).localeCompare(String(b.id)));
   return out;
+}
+
+/** Truncate a single-line track label cleanly to <= 32 chars. */
+function cleanTrackLabel(raw) {
+  if (typeof raw !== "string") return "";
+  const single = raw.replace(/\s+/g, " ").trim();
+  if (!single) return "";
+  if (single.length <= MAX_TRACK_LABEL) return single;
+  return single.slice(0, MAX_TRACK_LABEL - 1).trimEnd() + "…";
+}
+
+function capitalizeType(type) {
+  if (typeof type !== "string" || !type.length) return "Element";
+  return type[0].toUpperCase() + type.slice(1);
+}
+
+/**
+ * Extract live animated elements as multi-swimlane tracks sorted deterministically by
+ * `(anim.order ?? Infinity, anim.start, id)`. Skips bound labels and deleted elements.
+ * @param {any} doc Doc instance, scene object, or elements array
+ */
+export function timelineTracks(doc) {
+  const elements = Array.isArray(doc)
+    ? doc.filter(e => e && !e.isDeleted)
+    : (typeof doc?.live === "function"
+      ? doc.live()
+      : (Array.isArray(doc?.elements) ? doc.elements.filter(e => e && !e.isDeleted) : []));
+  const labelByContainer = typeof doc?.labelOf === "function"
+    ? null
+    : new Map(elements.filter(e => e.type === "text" && e.containerId).map(e => [e.containerId, e]));
+  const out = [];
+  for (const el of elements) {
+    if (!el || el.isDeleted) continue;
+    if (el.type === "text" && el.containerId) continue;
+    const a = el.customData?.anim;
+    if (!a) continue;
+
+    const bound = typeof doc?.labelOf === "function" ? doc.labelOf(el) : labelByContainer?.get(el.id);
+    const label = cleanTrackLabel(bound?.text)
+      || cleanTrackLabel(el.text)
+      || cleanTrackLabel(el.name)
+      || cleanTrackLabel(capitalizeType(el.type));
+    const order = typeof a.order === "number" && Number.isFinite(a.order) ? a.order : null;
+    const cueGroup = typeof a.cueGroup === "string" && a.cueGroup.length ? a.cueGroup : null;
+
+    if (Array.isArray(a.keys)) {
+      if (!a.keys.length) continue;
+      const ts = a.keys.map(k => k.t).filter(Number.isFinite);
+      if (!ts.length) continue;
+      const start = Math.max(0, Math.min(...ts));
+      const rawEnd = Math.max(...ts);
+      const duration = Math.max(1, rawEnd - start);
+      out.push({
+        id: el.id,
+        type: el.type,
+        label,
+        preset: "keyframes",
+        category: "emphasis",
+        start,
+        duration,
+        end: start + duration,
+        easing: "ease-in-out",
+        loop: false,
+        order,
+        cueGroup,
+      });
+      continue;
+    }
+
+    const meta = getPreset(a.preset);
+    if (!meta) continue;
+    const start = Math.max(0, Number.isFinite(a.start) ? a.start : 0);
+    const duration = Math.max(1, Number.isFinite(a.duration) ? a.duration : (meta.duration ?? 600));
+    out.push({
+      id: el.id,
+      type: el.type,
+      label,
+      preset: a.preset,
+      category: meta.category,
+      start,
+      duration,
+      end: start + duration,
+      easing: canonicalEasing(a.easing ?? meta.easing ?? "ease-out"),
+      loop: a.loop ?? meta.loop ?? false,
+      order,
+      cueGroup,
+    });
+  }
+  out.sort((a, b) => {
+    const oa = a.order ?? Infinity;
+    const ob = b.order ?? Infinity;
+    if (oa !== ob) return oa - ob;
+    if (a.start !== b.start) return a.start - b.start;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  return out;
+}
+
+/**
+ * Snap a timeline timestamp `ms >= 0` to the nearest clip edge or cue marker within `snapTol`,
+ * else to `step` ms grid ticks. When `free` is true, clamps `>= 0` and rounds to integer ms.
+ * @param {number} ms
+ * @param {number[]} [otherEdges]
+ * @param {{ step?: number, snapTol?: number, free?: boolean }} [opts]
+ */
+export function snapTrackTime(ms, otherEdges = [], { step = 100, snapTol = 120, free = false } = {}) {
+  const clamped = Math.max(0, Number.isFinite(ms) ? ms : 0);
+  if (free) return Math.round(clamped);
+  const tol = Number.isFinite(snapTol) && snapTol >= 0 ? snapTol : 120;
+  let best = null;
+  let bestDist = Infinity;
+  if (Array.isArray(otherEdges)) {
+    for (const edge of otherEdges) {
+      if (typeof edge !== "number" || !Number.isFinite(edge) || edge < 0) continue;
+      const d = Math.abs(edge - clamped);
+      if (d <= tol && (d < bestDist || (d === bestDist && best != null && edge < best))) {
+        best = edge;
+        bestDist = d;
+      }
+    }
+  }
+  if (best != null) return Math.max(0, Math.round(best));
+  const s = Number.isFinite(step) && step > 0 ? step : 100;
+  return Math.max(0, Math.round(clamped / s) * s);
+}
+
+/**
+ * Reorder swimlane tracks by moving `fromIndex` to `toIndex`, returning explicit `0..N-1` `{ id, order }[]`.
+ * @param {Array<{ id: string } | string>} tracks
+ * @param {number} fromIndex
+ * @param {number} toIndex
+ */
+export function reorderTrackOrder(tracks, fromIndex, toIndex) {
+  if (!Array.isArray(tracks) || !tracks.length) return [];
+  const ids = tracks.map(t => (typeof t === "string" ? t : t?.id)).filter(id => typeof id === "string");
+  if (!ids.length) return [];
+  const from = Number.isFinite(fromIndex) ? Math.trunc(fromIndex) : -1;
+  if (from < 0 || from >= ids.length) return ids.map((id, order) => ({ id, order }));
+  const to = Number.isFinite(toIndex) ? Math.max(0, Math.min(ids.length - 1, Math.trunc(toIndex))) : from;
+  const next = [...ids];
+  if (from !== to) {
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+  }
+  return next.map((id, order) => ({ id, order }));
+}
+
+/**
+ * Space tracks back-to-back in their current lane order (`start = prevEnd + gap`),
+ * returning `{ id, start, order }[]`.
+ * @param {Array<{ id: string, start?: number, duration?: number, end?: number }>} tracks
+ * @param {{ gap?: number, startAt?: number }} [opts]
+ */
+export function cascadeTracks(tracks, { gap = 150, startAt = 0 } = {}) {
+  if (!Array.isArray(tracks) || !tracks.length) return [];
+  const safeGap = Number.isFinite(gap) ? Math.round(gap) : 150;
+  let cursor = Math.max(0, Number.isFinite(startAt) ? Math.round(startAt) : 0);
+  const out = [];
+  for (let i = 0; i < tracks.length; i++) {
+    const t = tracks[i];
+    if (!t || typeof t.id !== "string") continue;
+    const start = Math.max(0, cursor);
+    const dur = Number.isFinite(t.duration)
+      ? Math.max(1, Math.round(t.duration))
+      : (Number.isFinite(t.end) && Number.isFinite(t.start) ? Math.max(1, Math.round(t.end - t.start)) : 600);
+    out.push({ id: t.id, start, order: out.length });
+    cursor = Math.max(0, start + dur + safeGap);
+  }
+  return out;
+}
+
+/**
+ * Align tracks to a common start timestamp `Math.max(0, Math.round(atMs))`.
+ * @param {Array<{ id: string } | string>} tracks
+ * @param {number} [atMs]
+ */
+export function alignTracks(tracks, atMs = 0) {
+  if (!Array.isArray(tracks) || !tracks.length) return [];
+  const start = Math.max(0, Number.isFinite(atMs) ? Math.round(atMs) : 0);
+  const out = [];
+  for (const t of tracks) {
+    const id = typeof t === "string" ? t : t?.id;
+    if (typeof id === "string") out.push({ id, start });
+  }
+  return out;
+}
+
+function formatRulerLabel(ms) {
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Compute clean `{ at, label, major }[]` tick marks for an NLE time ruler over `[0, totalMs]`
+ * (clamped to `MAX_TIMELINE_MS` so tick generation is always strictly bounded).
+ * @param {number} totalMs
+ */
+export function rulerTicks(totalMs) {
+  const total = Math.min(MAX_TIMELINE_MS, Math.max(0, Number.isFinite(totalMs) ? Math.ceil(totalMs) : 0));
+  if (total === 0) return [{ at: 0, label: "0s", major: true }];
+  let majorStep = 500;
+  let minorStep = 100;
+  if (total <= 3000) {
+    majorStep = 500; minorStep = 100;
+  } else if (total <= 10_000) {
+    majorStep = 1000; minorStep = 500;
+  } else if (total <= 25_000) {
+    majorStep = 2000; minorStep = 1000;
+  } else if (total <= 60_000) {
+    majorStep = 5000; minorStep = 1000;
+  } else if (total <= 180_000) {
+    majorStep = 10_000; minorStep = 5000;
+  } else if (total <= 600_000) {
+    majorStep = 30_000; minorStep = 10_000;
+  } else {
+    majorStep = 60_000; minorStep = 30_000;
+  }
+  const ticks = [];
+  for (let at = 0; at <= total; at += minorStep) {
+    const major = at % majorStep === 0;
+    ticks.push({ at, label: major ? formatRulerLabel(at) : "", major });
+  }
+  return ticks;
+}
+
+/**
+ * Pure, sorted, deduplicated cue markers `{ id, at, label }[]` bounded by `MAX_CUES`.
+ * @param {any} raw
+ * @returns {Array<{ id: string, at: number, label: string }>}
+ */
+export function normalizeCues(raw) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    if (typeof item.id !== "string" || item.id.length === 0 || item.id.length > MAX_CUE_ID_CHARS) continue;
+    if (seen.has(item.id)) continue;
+    if (typeof item.at !== "number" || !Number.isFinite(item.at) || item.at < 0) continue;
+    const at = Math.min(MAX_TIMELINE_MS, Math.round(item.at));
+    const label = typeof item.label === "string" ? item.label.trim().slice(0, MAX_CUE_LABEL) : "";
+    seen.add(item.id);
+    out.push({ id: item.id, at, label });
+  }
+  out.sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
+  return out.length > MAX_CUES ? out.slice(0, MAX_CUES) : out;
+}
+
+/** Extract normalized cue markers from `doc.appState?.herdr?.timeline?.cues`. */
+export function cuesOf(doc) {
+  return normalizeCues(doc?.appState?.herdr?.timeline?.cues);
+}
+
+/** Return the earliest cue marker strictly after `ms`, or `null`. */
+export function nextCueAfter(cues, ms) {
+  const list = normalizeCues(cues);
+  const t = Number.isFinite(ms) ? ms : -Infinity;
+  for (const c of list) {
+    if (c.at > t) return c;
+  }
+  return null;
+}
+
+/** Return the latest cue marker strictly before `ms`, or `null`. */
+export function prevCueBefore(cues, ms) {
+  const list = normalizeCues(cues);
+  const t = Number.isFinite(ms) ? ms : Infinity;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].at < t) return list[i];
+  }
+  return null;
 }
 
 /** Respect prefers-reduced-motion: settle passive/ambient playback to timeline end, but allow explicit user-initiated Play to animate. */

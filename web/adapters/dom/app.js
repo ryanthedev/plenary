@@ -12,6 +12,8 @@ import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel, layerOf } from "../../../packages/core/model.js";
 import { listNamedFrames, viewsOf, addView, deleteView, resolveLocalLayers, captureCurrentView, stepViewIndex } from "../../../packages/core/views.js";
 import { parseLinkCardUrl, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "../../../packages/core/link-card.js";
+import { parseEmbedUrl, parseEmbedFromElement, embedPlayButtonRect } from "../../../packages/core/embed.js";
+import { buildTemplateScene, getTemplate } from "../../../packages/core/templates.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
@@ -21,7 +23,7 @@ import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, should
 export const PROBE_JITTER_MS = Object.freeze({ presenter: 2000, other: 15_000 });
 export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.presenter : PROBE_JITTER_MS.other);
 import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
-import { exportSvg, exportExcalidraw, paintPng, loadPictures } from "./export.js";
+import { exportSvg, exportExcalidraw, paintPng, loadPictures, buildPrintHtml } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
 import { icon } from "./icons.js";
@@ -36,6 +38,8 @@ import { probeMove } from "../../core/move.js";
 import { mountCollab } from "./collab/ui.js";
 import { collabFrame } from "./collab/frame.js";
 import { createVideoOverlay } from "./video-overlay.js";
+import { createEmbedOverlay } from "./embed-overlay.js";
+import { consumePendingTemplate } from "./home.js";
 import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
 import { createViewsMenu } from "./views-menu.js";
 import { createSettingsDialog } from "./settings-dialog.js";
@@ -50,7 +54,7 @@ import {
   parseDeepLink,
   buildDeepLink,
 } from "../../core/settings.js";
-import { hitTest } from "../../../packages/core/geometry.js";
+import { hitTest, toLocal } from "../../../packages/core/geometry.js";
 
 const RAW_BOARD_ID_RE = /^(?:b-[a-z0-9]{8,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const CONTROL_BIDI_RE = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/gu;
@@ -112,7 +116,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     localView: { soloLayerId: null, activeViewId: null },
     renamingBoard: false,
     mermaid: { src: "flowchart LR\n  A[Idea] --> B[Spec]\n  B --> C{Review?}\n  C -->|yes| D[Build]\n  C -->|no| B\n  D --> E[Ship]", elbow: true },
-    export: { format: "svg", scale: 2, page: "board" },
+    embed: { url: "", error: "" },
+    export: { format: "svg", scale: 2, page: "board", frameId: null },
   };
   let currentBoardTitle = typeof boardTitle === "string" ? boardTitle.replace(CONTROL_BIDI_RE, "").trim() : null;
   let serverCanRename = null;
@@ -183,6 +188,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   // ── collaboration (p7-wire): the collab UI over the root's port, presence painted on its own canvas ──
   const videoOverlay = createVideoOverlay({ root: $("#canvas") });
+  const embedOverlay = createEmbedOverlay({ root: $("#canvas") });
   const overlay = h("canvas.collab-overlay", { "aria-hidden": "true" });
   canvas.after(overlay);
   // Centre the board on a world point; `scale` (optional: a cluster click zooms in) is clamped to the page's zoom
@@ -544,6 +550,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         reorder: how => { S.act(stream, x => x.reorder(how)); chromeDirty = true; },
         moveToLayer: layerId => { S.act("board", x => x.moveToLayer(layerId)); chromeDirty = true; },
         toggleLock: () => { S.act(stream, x => x.toggleLock()); chromeDirty = true; },
+        spliceImage: (cols, rows) => {
+          const selectedList = hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [];
+          const imgs = selectedList.filter(el => el && !isLabel(el) && el.type === "image");
+          if (imgs.length !== 1) return;
+          S.act(stream, x => x.spliceImage(imgs[0].id, { cols, rows }));
+          chromeDirty = true;
+        },
         copyLink: () => {
           const selectedList = hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [];
           const els = selectedList.filter(el => el && !isLabel(el));
@@ -595,13 +608,22 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     for (const f of S.unsavedFiles()) net.put?.(f);
     const { w, h: hh } = S.eds.board.size;
     paint(ctx, items, { width: w, height: hh, dpr: canvas.width / Math.max(1, w), background: theme.bg, image });
+    const visibleElements = [...S.eds.board.doc.visible(), ...(S.eds.board.time() == null ? S.eds.notes.doc.visible() : [])];
+    const selectedIds = new Set([...S.eds.board.sel, ...S.eds.notes.sel]);
     videoOverlay.sync({
       displayItems: items,
-      elements: [...S.eds.board.doc.visible(), ...(S.eds.board.time() == null ? S.eds.notes.doc.visible() : [])],
+      elements: visibleElements,
       files: allFiles(),
       view: S.eds.board.view,
       viewport: { w, h: hh },
-      selectedIds: new Set([...S.eds.board.sel, ...S.eds.notes.sel]),
+      selectedIds,
+      dragging: !!S.gesture,
+    });
+    embedOverlay.sync({
+      elements: visibleElements,
+      view: S.eds.board.view,
+      viewport: { w, h: hh },
+      selectedIds,
       dragging: !!S.gesture,
     });
     canvas.style.cursor = S.may() || S.tool === "hand" ? S.ed.cursor() ?? "default" : "grab";
@@ -689,6 +711,23 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     return null;
   }
+  function findEmbedHit(p, { playOnly = true } = {}) {
+    for (const ed of [S.eds.notes, S.eds.board]) {
+      const w = ed.toWorld(p);
+      const hit = hitTest(ed.doc, w, ed.tol());
+      if (!hit) continue;
+      const embed = parseEmbedFromElement(hit);
+      if (!embed) continue;
+      if (playOnly) {
+        const btn = embedPlayButtonRect(hit);
+        if (!btn) continue;
+        const loc = hit.angle ? toLocal(hit, w) : w;
+        if (loc.x < btn.x || loc.x > btn.x + btn.w || loc.y < btn.y || loc.y > btn.y + btn.h) continue;
+      }
+      return { el: hit, embed };
+    }
+    return null;
+  }
 
   // Pointer input: core Editor owns multi-touch (pinch-zoom/pan, 2/3-finger tap undo/redo, palm rejection).
   canvas.addEventListener("pointerdown", e => {
@@ -703,6 +742,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       const linkHit = findLinkCardHit(p, { badgeOnly });
       if (linkHit) {
         openSafeLink(linkHit.card.url);
+        chromeDirty = true;
+        return;
+      }
+      const embedHit = findEmbedHit(p, { playOnly: clicks < 2 });
+      if (embedHit) {
+        embedOverlay.activate(embedHit.el.id);
         chromeDirty = true;
         return;
       }
@@ -1364,6 +1409,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function openDialog(d, opener = null) {
     cancelActiveSampler();
     dismissOverlays({ keepDialog: false });
+    if (d === "embed") ui.embed.error = "";
     dialogOpener = captureOpener(opener);
     ui.dialog = d;
     chromeDirty = true;
@@ -1548,9 +1594,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     } }, h("span.ic", {}, icon("menu", { size: 17 })), h("span.header-more-label", {}, "Menu"));
     const boardSection = menuSection("Board", [
       canRenameBoard() ? boardMenuItem("edit", "Rename board", "Rename board", () => startBoardRename()) : null,
-      role === "presenter" ? boardMenuItem("export", "Export", "Export SVG / PNG / .excalidraw", toggleExport, { kbd: "⌘⇧E" }) : null,
+      role === "presenter" ? boardMenuItem("export", "Export", "Export SVG / PNG / PDF", toggleExport, { kbd: "⌘⇧E" }) : null,
       role === "presenter" ? boardMenuItem("importFile", "Import .excalidraw", "Import .excalidraw", openExcalidrawImport, { disabled: !may }) : null,
       role === "presenter" ? boardMenuItem("mermaid", "Mermaid", "Insert Mermaid", () => openDialog("mermaid"), { disabled: !may }) : null,
+      role === "presenter" ? boardMenuItem("play", "Embed URL", "Embed URL…", () => openDialog("embed"), { disabled: !may }) : null,
     ]);
     const effKeys = effectiveKeybinds(userSettings);
     const viewSection = menuSection("View", [
@@ -1893,6 +1940,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         canRenameBoard() ? h("button.tb", { "aria-label": "Rename board", onclick: () => { setSheet(null, { restore: false }); startBoardRename(); } }, h("span.ic", {}, icon("edit", { size: 20 })), "Rename") : null,
         S.role === "presenter" ? [
           h("button.tb", { disabled: !may, "aria-haspopup": "dialog", onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"),
+          h("button.tb", { disabled: !may, "aria-haspopup": "dialog", "aria-label": "Embed URL", onclick: () => openDialog("embed") }, h("span.ic", {}, icon("play", { size: 20 })), "Embed"),
           h("button.tb", { "aria-haspopup": "dialog", onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export"),
           h("button.tb", { disabled: !may, "aria-label": "Import .excalidraw", onclick: () => { openExcalidrawImport(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("importFile", { size: 20 })), "Import"),
           h("button.tb" + (gridOn ? ".on" : ""), { disabled: !may, "aria-label": "Toggle grid", "aria-pressed": String(gridOn), onclick: () => { S.act("board", e => e.setAppState({ grid: e.grid ? 0 : 20 }), { settings: true }); chromeDirty = true; } }, h("span.ic", {}, icon("grid", { size: 20 })), "Grid"),
@@ -1934,18 +1982,45 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return true;
   }
   function exportPreview(cv) {
-    const { page, scale } = ui.export;
+    const { page, scale, frameId } = ui.export;
+    const frames = listNamedFrames(S.eds.board.doc);
+    const activeFrameId = frameId && frames.some(f => f.id === frameId) ? frameId : undefined;
     const tmp = document.createElement("canvas");
-    paintPng(S.eds.board.doc, tmp, { page, theme: ui.theme, scale: 1, loadImage: image });
+    paintPng(S.eds.board.doc, tmp, { page, theme: ui.theme, scale: 1, loadImage: image, ...(activeFrameId ? { frameId: activeFrameId } : {}) });
     cv.width = tmp.width; cv.height = tmp.height; cv.getContext("2d").drawImage(tmp, 0, 0);
     return scale;
   }
   async function download() {
-    const { format, scale, page } = ui.export, doc = S.eds.board.doc, name = `${board}.${format}`;
+    const { format, scale, page, frameId: rawFrameId } = ui.export, doc = S.eds.board.doc;
+    const frames = listNamedFrames(doc);
+    const activeFrame = rawFrameId ? (frames.find(f => f.id === rawFrameId) ?? null) : null;
+    const frameId = activeFrame?.id;
+    if (format === "pdf") {
+      const title = activeFrame ? `${displayBoardTitle()} — ${activeFrame.name}` : displayBoardTitle();
+      const html = buildPrintHtml(doc, { theme: ui.theme, page, frameIds: frameId ? [frameId] : null, title });
+      const opener = globalThis.window?.open ?? globalThis.open;
+      const win = typeof opener === "function" ? opener.call(globalThis.window ?? globalThis, "", "_blank") : null;
+      if (win && win.document && typeof win.document.write === "function") {
+        try { win.opener = null; } catch {}
+        win.document.open?.();
+        win.document.write(html);
+        win.document.close?.();
+        win.focus?.();
+        if (typeof win.print === "function") clock.set(() => { try { win.print(); } catch {} }, 150);
+      } else {
+        const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+        const a = h("a", { href: URL.createObjectURL(blob), download: `${board}${frameId ? `-${frameId}` : ""}-print.html` });
+        document.body.append(a); a.click(); a.remove();
+        clock.set(() => URL.revokeObjectURL(a.href), 5000);
+        toast("Popup blocked — downloaded printable HTML");
+      }
+      return;
+    }
+    const name = `${board}${frameId && format !== "excalidraw" ? `-${frameId}` : ""}.${format}`;
     let blob;
     if (format === "excalidraw") blob = new Blob([exportExcalidraw(doc, { page, theme: ui.theme })], { type: "application/vnd.excalidraw+json" });
-    else if (format === "svg") blob = new Blob([exportSvg(doc, { page, theme: ui.theme, scale })], { type: "image/svg+xml" });
-    else { const cv = paintPng(doc, document.createElement("canvas"), { page, theme: ui.theme, scale, loadImage: await loadPictures(doc.files) }); blob = await new Promise(r => cv.toBlob(r, "image/png")); }
+    else if (format === "svg") blob = new Blob([exportSvg(doc, { page, theme: ui.theme, scale, ...(frameId ? { frameId } : {}) })], { type: "image/svg+xml" });
+    else { const cv = paintPng(doc, document.createElement("canvas"), { page, theme: ui.theme, scale, loadImage: await loadPictures(doc.files), ...(frameId ? { frameId } : {}) }); blob = await new Promise(r => cv.toBlob(r, "image/png")); }
     const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
     clock.set(() => URL.revokeObjectURL(a.href), 5000);
   }
@@ -1984,19 +2059,111 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
       dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, focusOnActivate: !rebuilding });
       mermaidPreview(cv);
+    } else if (ui.dialog === "embed" && S.role === "presenter") {
+      dialogTrap?.deactivate({ restoreFocus: false });
+      const errEl = h("div.hint", { role: "alert", hidden: !ui.embed.error, style: { color: "var(--danger, #e03131)" } }, ui.embed.error);
+      const setErr = msg => { ui.embed.error = msg; errEl.textContent = msg; errEl.hidden = !msg; };
+      const submitEmbed = () => {
+        if (!S.may()) return;
+        const parsed = parseEmbedUrl(ui.embed.url);
+        if (!parsed) {
+          setErr("Enter a valid YouTube, video (.mp4/.webm/.mov), or image (.png/.jpg/.webp/.gif) HTTPS URL.");
+          urlInput.focus?.();
+          return;
+        }
+        const ok = S.act("board", e => e.addEmbed(parsed));
+        if (!ok) return;
+        ui.embed.url = "";
+        ui.embed.error = "";
+        close();
+      };
+      const urlInput = h("input.field", {
+        type: "url",
+        "aria-label": "Embed URL",
+        placeholder: "https://youtube.com/watch?v=… or direct .mp4 / .png URL",
+        value: ui.embed.url,
+        style: { width: "100%" },
+        oninput: e => { ui.embed.url = e.target.value; if (ui.embed.error) setErr(""); },
+        onkeydown: e => {
+          if (e.key === "Escape") { e.preventDefault?.(); close(); return; }
+          if (e.key === "Enter") { e.preventDefault?.(); submitEmbed(); return; }
+          e.stopPropagation();
+        },
+      });
+      const pasteBtn = h("button.btn", {
+        type: "button",
+        "data-action": "embed-paste",
+        "aria-label": "Paste URL from clipboard",
+        onclick: async () => {
+          const clip = globalThis.navigator?.clipboard;
+          if (typeof clip?.readText !== "function") {
+            setErr("Clipboard unavailable — paste directly into the URL field.");
+            urlInput.focus?.();
+            return;
+          }
+          try {
+            const text = (await clip.readText())?.trim() ?? "";
+            if (!text) {
+              setErr("Clipboard is empty.");
+              urlInput.focus?.();
+              return;
+            }
+            ui.embed.url = text;
+            urlInput.value = text;
+            setErr("");
+            urlInput.focus?.();
+          } catch {
+            setErr("Clipboard access was denied — paste directly into the URL field.");
+            urlInput.focus?.();
+          }
+        },
+      }, icon("paste", { size: 15 }), " Paste from clipboard");
+      const dlg = h("div.dialog", { style: { width: "min(480px,100%)" }, role: "dialog", "aria-modal": "true", "aria-labelledby": "embed-dialog-title", "aria-label": "Embed URL", tabindex: "-1" },
+        h("h2", { id: "embed-dialog-title" }, icon("play", { size: 17 }), " Embed URL", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
+        h("div.dbody", {},
+          h("div.row", { style: { flexDirection: "column", alignItems: "stretch", gap: "8px" } },
+            urlInput,
+            h("div", { style: { display: "flex", gap: "8px" } }, pasteBtn)),
+          errEl,
+          h("div.hint", {}, "Supports YouTube links, direct video (.mp4, .webm, .mov), and image (.png, .jpg, .webp, .gif) HTTPS URLs. Click Play on the card to activate.")),
+        h("footer", {},
+          h("button.btn", { onclick: close }, "Cancel"),
+          h("button.btn.primary", { disabled: !may, "data-action": "embed-submit", onclick: submitEmbed }, "Embed")));
+      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
+      dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, initialFocus: urlInput, focusOnActivate: !rebuilding });
     } else if (ui.dialog === "export" && S.role === "presenter") {
       dialogTrap?.deactivate({ restoreFocus: false });
       const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; rebuildDialog(d); };
+      const frames = listNamedFrames(S.eds.board.doc);
+      if (x.frameId && !frames.some(f => f.id === x.frameId)) x.frameId = null;
+      const scopeSelect = frames.length && x.format !== "excalidraw"
+        ? h("select.field", {
+          "aria-label": "Export scope",
+          value: x.frameId ?? "",
+          onchange: e => set("frameId", e.target.value || null),
+        },
+        h("option", { value: "", selected: !x.frameId }, x.format === "pdf" ? `Whole board (${frames.length} frames)` : "Whole board"),
+        frames.map(f => h("option", { value: f.id, selected: x.frameId === f.id }, f.name)))
+        : null;
       const dlg = h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-modal": "true", "aria-labelledby": "export-dialog-title", "aria-label": "Export the board", tabindex: "-1" },
         h("h2", { id: "export-dialog-title" }, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
         h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
-          h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {}, chip("SVG", x.format === "svg", () => set("format", "svg")), chip("PNG", x.format === "png", () => set("format", "png")), chip(".excalidraw", x.format === "excalidraw", () => set("format", "excalidraw")))),
-          x.format !== "excalidraw" ? h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))) : null,
+          h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {},
+            chip("SVG", x.format === "svg", () => set("format", "svg")),
+            chip("PNG", x.format === "png", () => set("format", "png")),
+            chip("PDF / Print", x.format === "pdf", () => set("format", "pdf")),
+            chip(".excalidraw", x.format === "excalidraw", () => set("format", "excalidraw")))),
+          scopeSelect ? h("div.row", {}, h("span.lab", {}, "Scope"), scopeSelect) : null,
+          (x.format === "svg" || x.format === "png") ? h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))) : null,
           h("div.row", {}, h("span.lab", {}, "Page"), h("span.opts", {}, chip("board color", x.page === "board", () => set("page", "board")), chip("white", x.page === "white", () => set("page", "white")))),
           h("div.hint", {}, x.format === "excalidraw"
             ? "Excalidraw v2 JSON with embedded images. Opens directly in excalidraw.com or Plenary."
-            : "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
-        h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, "Download")));
+            : x.format === "pdf"
+              ? "Opens a print-ready landscape document (one page per frame) for Print or Save as PDF."
+              : x.frameId
+                ? "Cropped tightly to the selected frame. Notes, selection, cursors and comments never show."
+                : "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
+        h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, x.format === "pdf" ? "Print / Save PDF" : "Download")));
       replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
       dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, focusOnActivate: !rebuilding });
       exportPreview(cv);
@@ -2111,7 +2278,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     overlays: { key: () => JSON.stringify([S.status, trashShown(), S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },
     sheet: { key: () => (!ui.sheet || !isPhone() ? "" : ui.sheet === "panel" ? panelKey() : ui.sheet === "tools" ? "" : notesRowsKey()), build: sheetView },
-    dialogs: { key: () => (ui.dialog === "export" ? `${S.eds.board.doc.rev}|${JSON.stringify(ui.export)}` : `${ui.mermaid.elbow}`), build: dialogs },
+    dialogs: { key: () => (ui.dialog === "export" ? `${S.eds.board.doc.rev}|${JSON.stringify(ui.export)}` : ui.dialog === "embed" ? `embed|${ui.embed.error}` : `${ui.mermaid.elbow}`), build: dialogs },
   };
   const keys = {};
   function buildPanel() {
@@ -2267,7 +2434,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (!e.matches && ui.moreOpen) { ui.moreOpen = false; chromeDirty = true; }
   });
   setTheme(ui.theme);
-  let savedMine = 0, fitted = false, mineUser = me.user;
+  let savedMine = 0, fitted = false, templateChecked = false, mineUser = me.user;
   function saveMine() {
     const u = S.connection.lastUser;
     if (u != null && u !== mineUser) {
@@ -2279,10 +2446,52 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKeyOf(mineUser), JSON.stringify([...S.mine].slice(-5000))); }
   }
-  // First catch-up done: resolve any deep link, or fit everything once.
+  // Auto-seed a pending template chosen from Home when a brand-new empty board first goes live (#25).
+  function maybeSeedTemplate() {
+    if (templateChecked || S.status !== "live") return false;
+    templateChecked = true;
+    if (!S.may() || S.role !== "presenter") return false;
+    if (S.eds.board.doc.live().length !== 0) return false;
+    const tplId = consumePendingTemplate(null, clock.now());
+    if (!tplId || tplId === "blank") return false;
+    const scene = buildTemplateScene(tplId);
+    if (!scene || !Array.isArray(scene.elements) || !scene.elements.length) return false;
+    const herdr = scene.appState?.herdr;
+    if (herdr) {
+      const patch = {};
+      if (Array.isArray(herdr.layers) && herdr.layers.length) patch.layers = herdr.layers;
+      if (Array.isArray(herdr.views)) patch.views = herdr.views;
+      if (herdr.timeline) patch.timeline = herdr.timeline;
+      if (Object.keys(patch).length) S.act("board", ed => ed.setAppState(patch), { settings: true });
+    }
+    let seeded = false;
+    S.act("board", ed => {
+      const ok = Boolean(ed.transact(tx => {
+        for (const el of scene.elements) tx.add(el);
+        return true;
+      }, { history: false }));
+      if (ok) { ed.fixLayer(); ed.select([]); seeded = true; }
+    });
+    if (!seeded) return false;
+    const frames = listNamedFrames(S.eds.board.doc);
+    if (frames.length) {
+      jumpToFrame(frames[0].id, { animate: false });
+      S.eds.board.flash = null;
+    } else {
+      S.fit({ animate: false });
+    }
+    fitted = true;
+    const meta = getTemplate(tplId);
+    toast(`Loaded template: ${meta?.title ?? tplId}`, 2400);
+    chromeDirty = true;
+    dirty = true;
+    return true;
+  }
+  // First catch-up done: seed any pending template on an empty board, resolve any deep link, or fit everything once.
   function fitOnce() {
     if (S.status !== "live") return;
     if (!S.eds.board.size.w || !S.eds.board.size.h) return;
+    if (maybeSeedTemplate()) return;
     if (pendingDeepLink) {
       const target = pendingDeepLink;
       const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length || viewsOf(S.eds.board.doc).length;

@@ -65,6 +65,7 @@ export function clampMenuPosition({ x, y, width, height, viewportWidth, viewport
  *     reorder: (how: "front" | "forward" | "backward" | "back") => void,
  *     moveToLayer: (layerId: string) => void,
  *     toggleLock: () => void,
+ *     spliceImage?: (cols: number, rows: number) => void,
  *     copyLink?: () => void,
  *     addComment: () => void,
  *     selectAll: () => void,
@@ -134,6 +135,14 @@ export function buildCanvasMenuItems(ctx) {
       disabled: !canWrite,
       action: actions.toggleLock,
     });
+
+    if (els.length === 1 && els[0].type === "image" && canWrite && !els[0].locked && typeof actions.spliceImage === "function") {
+      sep();
+      items.push(
+        { id: "splice-2x1", label: "Splice 2×1", icon: "grid", action: () => actions.spliceImage(2, 1) },
+        { id: "splice-2x2", label: "Splice 2×2", icon: "grid", action: () => actions.spliceImage(2, 2) },
+      );
+    }
 
     if (els.length >= 1 && typeof actions.copyLink === "function") {
       const isFrame = els.length === 1 && els[0].type === "frame";

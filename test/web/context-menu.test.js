@@ -290,4 +290,50 @@ describe("#114 Canvas Right-Click Context Menu", () => {
     expect(S.eds.notes.sel.has(adaNote.id)).toBe(false);
     expect(menuItem(activeMenu(page), "delete").disabled).toBe(true);
   });
+
+  test("#117 right-clicking a single writable image shows Splice 2×1 and Splice 2×2 and splices into tiles", () => {
+    const prevImage = globalThis.Image;
+    globalThis.Image = /** @type {any} */ (class { set src(_) {} });
+    try {
+      const { page, S, step } = setup({ collab: false });
+      const file = {
+        id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        mimeType: "image/png",
+        dataURL: "data:image/png;base64,iVBORw0KGgo=",
+        width: 400,
+        height: 200,
+      };
+      let imgId;
+      S.act("board", ed => { imgId = ed.addImage(file, { x: 200, y: 200 }); });
+      step(2);
+      const img = S.eds.board.doc.get(imgId);
+      expect(img).toBeTruthy();
+
+      const p = S.eds.board.toScreen({ x: img.x + img.width / 2, y: img.y + img.height / 2 });
+      openMenuAt(page, p.x, p.y);
+      const menu = activeMenu(page);
+      expect(menuItem(menu, "splice-2x1")).toBeTruthy();
+      expect(menuItem(menu, "splice-2x2")).toBeTruthy();
+
+      // Splice 2x2 replaces the image with 4 cropped tiles sharing the same fileId
+      menuItem(menu, "splice-2x2").click();
+      step(2);
+      const tiles = S.eds.board.doc.live().filter(e => e.type === "image");
+      expect(tiles.length).toBe(4);
+      expect(tiles.every(t => t.fileId === file.id && t.crop)).toBe(true);
+
+      // Undo restores original single image, then test Splice 2x1
+      S.act("board", ed => ed.undo());
+      step(2);
+      expect(S.eds.board.doc.live().filter(e => e.type === "image").length).toBe(1);
+      const restored = S.eds.board.doc.live().find(e => e.type === "image");
+      const p2 = S.eds.board.toScreen({ x: restored.x + restored.width / 2, y: restored.y + restored.height / 2 });
+      openMenuAt(page, p2.x, p2.y);
+      menuItem(activeMenu(page), "splice-2x1").click();
+      step(2);
+      expect(S.eds.board.doc.live().filter(e => e.type === "image").length).toBe(2);
+    } finally {
+      globalThis.Image = prevImage;
+    }
+  });
 });

@@ -21,6 +21,7 @@ import { isMermaid, mermaidToElements } from "./mermaid.js";
 import { itemFromElements } from "./library.js";
 import { parseExcalidraw, toExcalidrawClipboard, remapExcalidrawIds } from "./excalidraw.js";
 import { parseLinkCardUrl, buildLinkCard, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "./link-card.js";
+import { parseEmbedUrl, buildEmbedElement, parseEmbedFromElement } from "./embed.js";
 
 export const TOOLS = [
   { id: "select", keys: ["v", "1"], icon: "↖", name: "Select" },
@@ -466,6 +467,7 @@ export class Editor {
         if (typeof this.onOpenLink === "function") this.onOpenLink(card.url, hit, card);
         return;
       }
+      if (hit && parseEmbedFromElement(hit)) return;
       if (hit && (isShape(hit) || hit.type === "text" || isLinear(hit)) && this.doc.editable(hit)) return this.beginText(hit, w);
       if (!hit) return this.beginText(null, w);
     }
@@ -1544,6 +1546,24 @@ export class Editor {
     return cardEl.id;
   }
 
+  // Create and select a YouTube or direct media URL embed poster card centered at `at`. Returns its id, or null if invalid.
+  addEmbed(parsedOrUrl, at = this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 })) {
+    const parsed = typeof parsedOrUrl === "string" ? parseEmbedUrl(parsedOrUrl) : (parsedOrUrl?.url ? parseEmbedUrl(parsedOrUrl.url) : null);
+    if (!parsed) return null;
+    const embedEl = buildEmbedElement(parsed, {
+      x: 0, y: 0,
+      layer: this.activeLayer,
+      z: this.doc.maxZ(this.activeLayer) + 1,
+    });
+    if (!embedEl) return null;
+    embedEl.x = at.x - embedEl.width / 2;
+    embedEl.y = at.y - embedEl.height / 2;
+    this.transact(tx => tx.add(embedEl));
+    this.select([embedEl.id]);
+    this.flash = `Added ${parsed.providerName} embed`;
+    return embedEl.id;
+  }
+
   paste(text = this.clipboard, at) {
     if (isMermaid(text)) { try { this.importMermaid(text, at); this.flash = "imported Mermaid"; } catch (e) { this.flash = String(e.message ?? e); } return; }
     if (typeof text === "string") {
@@ -1554,6 +1574,8 @@ export class Editor {
       }
       const linkCard = parseLinkCardUrl(text);
       if (linkCard) { this.addLinkCard(linkCard, at); return; }
+      const embed = parseEmbedUrl(text);
+      if (embed) { this.addEmbed(embed, at); return; }
     }
     let data; try { data = JSON.parse(text); } catch { data = null; }
     if (!data?.elements?.length) {

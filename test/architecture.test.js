@@ -76,6 +76,7 @@ const NOT_ADAPTERS = {
   "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
   "server/auth/versions.js": "core: board version history & named snapshots over the Registry port and tenancy (#19)",
   "server/auth/compliance.js": "core: per-board/tenant data export and GDPR user erasure over the Registry port (#34)",
+  "server/auth/share-policy.js": "core: share link policy (scrypt passcodes, expiry, noDownload, brute-force backoff) (#37)",
 };
 /** Non-port modules a driven adapter may import. */
 const SHARED = ["server/ids.js", "server/auth/util.js"];
@@ -102,7 +103,7 @@ const adapterMayImport = (to, from) => isPort(to) || SHARED.includes(to) || (fro
 const ALLOWLIST = [];
 
 const config = { isCore, isAdapter, adapterGroup, compositionRoots: COMPOSITION_ROOTS, allowed, adapterMayImport,
-  allowPackage: () => false, urls: true };
+  allowPackage: (spec, from) => spec === "node:crypto" && from === "server/auth/share-policy.js", urls: true };
 const FILES = listFiles(SCAN.filter(d => existsSync(join(ROOT, d))));
 
 test("packages/, server/ and scripts/ follow the hexagonal import rules", () => {

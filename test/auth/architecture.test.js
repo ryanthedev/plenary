@@ -43,6 +43,7 @@ export const CLASSES = {
   "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
   "server/auth/versions.js": "core",         // board version history & named snapshots (#19)
   "server/auth/compliance.js": "core",       // per-board/tenant data export & GDPR user erasure (#34)
+  "server/auth/share-policy.js": "core",     // share link policy: scrypt passcodes, expiry, noDownload (#37)
   "server/admin/boards.js": "core",          // admin use cases over the Registry port
   "server/admin/tenants.js": "core",         // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)
   "server/auth/registry.js": "adapter",      // in-memory Registry

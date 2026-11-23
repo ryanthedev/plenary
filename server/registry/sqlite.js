@@ -18,7 +18,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../auth/util.js";
 import { assertShapes, onBusyRetry } from "../sqlite/schema.js";
 
@@ -141,6 +141,10 @@ const createSchema = d => {
       actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT, at INTEGER NOT NULL)`);
     d.run("CREATE INDEX IF NOT EXISTS reg_audit_tenant ON reg_audit (tenant, at DESC, id DESC)");
     d.run("CREATE INDEX IF NOT EXISTS reg_audit_board ON reg_audit (tenant, board, at DESC, id DESC)");
+    d.run(`CREATE TABLE IF NOT EXISTS reg_board_versions (
+      id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES reg_tenants(id), board_id TEXT NOT NULL REFERENCES reg_boards(id) ON DELETE CASCADE,
+      label TEXT NOT NULL, created_by TEXT NOT NULL, created_by_name TEXT, created_at INTEGER NOT NULL, element_count INTEGER NOT NULL, snapshot_json TEXT NOT NULL)`);
+    d.run("CREATE INDEX IF NOT EXISTS reg_board_versions_board ON reg_board_versions (tenant_id, board_id, created_at DESC, id DESC)");
 };
 
 /**
@@ -176,6 +180,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
           actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT, at INTEGER NOT NULL)`);
         db.run("CREATE INDEX IF NOT EXISTS reg_audit_tenant ON reg_audit (tenant, at DESC, id DESC)");
         db.run("CREATE INDEX IF NOT EXISTS reg_audit_board ON reg_audit (tenant, board, at DESC, id DESC)");
+      }
+      if (!has("reg_board_versions")) {
+        db.run(`CREATE TABLE IF NOT EXISTS reg_board_versions (
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES reg_tenants(id), board_id TEXT NOT NULL REFERENCES reg_boards(id) ON DELETE CASCADE,
+          label TEXT NOT NULL, created_by TEXT NOT NULL, created_by_name TEXT, created_at INTEGER NOT NULL, element_count INTEGER NOT NULL, snapshot_json TEXT NOT NULL)`);
+        db.run("CREATE INDEX IF NOT EXISTS reg_board_versions_board ON reg_board_versions (tenant_id, board_id, created_at DESC, id DESC)");
       }
     }).immediate(), clock, onAttempt);
   }
@@ -419,7 +429,14 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     purgeRecents: db.query("DELETE FROM reg_recents WHERE board = ?"),
     purgeStars: db.query("DELETE FROM reg_stars WHERE board = ?"),
     purgeAsks: db.query("DELETE FROM reg_access_requests WHERE scope_type = ?1 AND scope_id = ?2"),
+    purgeVersions: db.query("DELETE FROM reg_board_versions WHERE board_id = ?"),
     purgeBoardSpace: db.query("DELETE FROM reg_board_spaces WHERE board = ?"),
+    versionExists: db.query("SELECT 1 AS x FROM reg_board_versions WHERE id = ?"),
+    versionCount: db.query("SELECT count(*) AS n FROM reg_board_versions WHERE tenant_id = ? AND board_id = ?"),
+    insVersion: db.query("INSERT INTO reg_board_versions (id, tenant_id, board_id, label, created_by, created_by_name, created_at, element_count, snapshot_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+    listVersions: db.query("SELECT id, tenant_id, board_id, label, created_by, created_by_name, created_at, element_count FROM reg_board_versions WHERE tenant_id = ? AND board_id = ? ORDER BY created_at DESC, id DESC LIMIT ?"),
+    getVersion: db.query("SELECT id, tenant_id, board_id, label, created_by, created_by_name, created_at, element_count, snapshot_json FROM reg_board_versions WHERE id = ? AND tenant_id = ? AND board_id = ?"),
+    delVersion: db.query("DELETE FROM reg_board_versions WHERE id = ? AND tenant_id = ? AND board_id = ?"),
     purgeBoardRow: db.query("DELETE FROM reg_boards WHERE id = ?"),
     purgeSpaceRow: db.query("DELETE FROM reg_spaces WHERE id = ?"),
     boardExists: db.query("SELECT 1 AS x FROM reg_boards WHERE id = ?"),
@@ -581,6 +598,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     q.purgeRecents.run(id);
     q.purgeStars.run(id);
     q.purgeAsks.run("board", id);
+    q.purgeVersions.run(id);
     q.purgeBoardSpace.run(id);
     return q.delBoard.run(id).changes > 0;
   });
@@ -669,7 +687,7 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     if (!b) return true;
     if (!b.purging || b.trashed_at == null) return false;
     q.purgeGrants.run(board); q.purgeScoped.run("board", board); q.purgeInvites.run(board); q.purgeUses.run(board); q.purgeLinks.run(board);
-    q.purgeRecents.run(board); q.purgeStars.run(board); q.purgeAsks.run("board", board); q.purgeBoardSpace.run(board); q.purgeBoardRow.run(board);
+    q.purgeRecents.run(board); q.purgeStars.run(board); q.purgeAsks.run("board", board); q.purgeVersions.run(board); q.purgeBoardSpace.run(board); q.purgeBoardRow.run(board);
     return true;
   });
   const purgeSpaceTx = db.transaction(space => {
@@ -718,6 +736,29 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const appendAuditTx = db.transaction((tenant, board, actor, action, target, detail, at) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
     return rowAudit(q.insAudit.get(tenant, board, actor, action, target, detail, at));
+  });
+
+  const rowVersionMeta = r => r && {
+    id: r.id,
+    tenantId: r.tenant_id,
+    boardId: r.board_id,
+    label: r.label,
+    createdBy: r.created_by,
+    createdByName: r.created_by_name ?? null,
+    createdAt: r.created_at,
+    elementCount: r.element_count,
+  };
+  const rowVersion = r => r && { ...rowVersionMeta(r), snapshotJson: r.snapshot_json };
+
+  const createVersionTx = db.transaction((tenantId, boardId, label, createdBy, createdByName, elementCount, snapshotJson, maxPerBoard, createdAt) => {
+    const b = q.board.get(boardId);
+    if (!b || b.tenant !== tenantId) throw new Error("registry: no such board");
+    if (b.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");
+    if (q.versionCount.get(tenantId, boardId).n >= maxPerBoard) throw new RegistryError("limit", "registry: board version limit reached");
+    let id = mint.version();
+    while (q.versionExists.get(id)) id = mint.version();
+    q.insVersion.run(id, tenantId, boardId, label, createdBy, createdByName, createdAt, elementCount, snapshotJson);
+    return { id, tenantId, boardId, label, createdBy, createdByName, createdAt, elementCount };
   });
 
   // ---- organization ----
@@ -1201,6 +1242,31 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       const events = (hasMore ? rows.slice(0, cap) : rows).map(rowAudit);
       const last = events[events.length - 1];
       return { events, nextBefore: hasMore ? `${last.at}:${last.id}` : null };
+    },
+
+    async createBoardVersion({ tenantId, boardId, label, createdBy, createdByName = null, elementCount = 0, snapshotJson, maxPerBoard = BOARD_VERSIONS.maxPerBoard, at }) {
+      ready();
+      if (!str(tenantId) || !str(boardId)) throw new Error("registry: no such board");
+      const cap = Number.isInteger(maxPerBoard) && maxPerBoard > 0 ? maxPerBoard : BOARD_VERSIONS.maxPerBoard;
+      const ts = Number.isFinite(at) ? Math.floor(at) : now();
+      const ec = Number.isSafeInteger(elementCount) && elementCount >= 0 ? elementCount : 0;
+      return createVersionTx.immediate(tenantId, boardId, String(label), String(createdBy), createdByName == null ? null : String(createdByName), ec, String(snapshotJson), cap, ts);
+    },
+    async listBoardVersions({ tenantId, boardId, limit = BOARD_VERSIONS.maxPerBoard } = /** @type {any} */ ({})) {
+      ready();
+      if (!str(tenantId) || !str(boardId)) return [];
+      const cap = Math.min(BOARD_VERSIONS.maxPerBoard, Math.max(1, Math.floor(Number(limit) || BOARD_VERSIONS.maxPerBoard)));
+      return q.listVersions.all(tenantId, boardId, cap).map(rowVersionMeta);
+    },
+    async getBoardVersion({ tenantId, boardId, versionId } = /** @type {any} */ ({})) {
+      ready();
+      if (!str(tenantId) || !str(boardId) || !str(versionId)) return null;
+      return rowVersion(q.getVersion.get(versionId, tenantId, boardId)) ?? null;
+    },
+    async deleteBoardVersion({ tenantId, boardId, versionId } = /** @type {any} */ ({})) {
+      ready();
+      if (!str(tenantId) || !str(boardId) || !str(versionId)) return false;
+      return db.transaction(() => q.delVersion.run(versionId, tenantId, boardId).changes > 0).immediate();
     },
 
     // ---- organization (PROTOCOL.md § Registry, "Organization") ----

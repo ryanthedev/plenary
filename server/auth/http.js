@@ -91,6 +91,7 @@
 //   This handler never throws (the engine would turn a throw into a 500).
 
 import { b64url, unb64url, utf8, fromUtf8, higher, isTenantAdminRecord } from "./util.js";
+import { BOARD_VERSIONS } from "./registry-port.js";
 import { spaceService } from "./spaces.js";
 import { accessService } from "./access.js";
 import { explainService } from "./explain.js";
@@ -98,6 +99,7 @@ import { rolesService } from "./roles.js";
 import { moveService } from "./move.js";
 import { trashService } from "./trash.js";
 import { offboardService } from "./offboard.js";
+import { versionService } from "./versions.js";
 import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView, listBoardAudit, listTenantAudit } from "../admin/boards.js";
 import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../admin/tenants.js";
 
@@ -154,6 +156,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   access?: ReturnType<typeof accessService>,
  *   roles?: ReturnType<typeof rolesService>,
  *   offboard?: ReturnType<typeof offboardService>,
+ *   versions?: ReturnType<typeof versionService>,
  *   config?: Record<string, any>,
  *   dev?: { enabled?: boolean, verify(t: string): Promise<import("./idp-port.js").Session|null> } | null,
  *   log?: { warn(msg: string, fields?: object): void, info?(msg: string, fields?: object): void, error?(msg: string, fields?: object): void },
@@ -163,7 +166,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
  * }} deps
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), versions = versionService({ registry, tenancy, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
   const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
@@ -187,6 +190,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   }
   const verifiers = [sessions, dev && dev.enabled === true ? dev : null].filter(Boolean);
   const maxBody = Number.isInteger(config.maxBody) && config.maxBody > 0 ? config.maxBody : 16_384;
+  const versionMaxBody = Math.max(maxBody, BOARD_VERSIONS.maxSnapshotBytes + 4096);
 
   // ---- login cookie ----
   let macKey = null;
@@ -388,12 +392,12 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     return id;
   }
 
-  /** Read a JSON object body: JSON content type, ≤ maxBody bytes (counted as read), only `allowed` fields. */
-  async function body(req, allowed) {
+  /** Read a JSON object body: JSON content type, ≤ limit bytes (counted as read), only `allowed` fields. */
+  async function body(req, allowed, limit = maxBody) {
     const ct = (req.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
     if (ct !== "application/json") throw refuse(415, "unsupported-media-type");
     const len = Number(req.headers.get("content-length"));
-    if (Number.isFinite(len) && len > maxBody) throw refuse(413, "too-large");
+    if (Number.isFinite(len) && len > limit) throw refuse(413, "too-large");
     const chunks = [];
     let n = 0;
     try {
@@ -403,7 +407,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
           const { done, value } = await reader.read();
           if (done) break;
           n += value.byteLength;
-          if (n > maxBody) { try { await reader.cancel(); } catch {} throw refuse(413, "too-large"); }
+          if (n > limit) { try { await reader.cancel(); } catch {} throw refuse(413, "too-large"); }
           chunks.push(value);
         }
       }
@@ -815,6 +819,21 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       return json(200, await listBoardAudit({ caller: who, board: p.board, limit, before }, admin));
     } }],
     ["/boards/:board/snapshot", { GET: serveSnapshot, HEAD: serveSnapshot }],
+    ["/boards/:board/versions", {
+      GET: async (req, p) => json(200, await versions.list(await caller(req), p.board)),
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["label", "snapshot"], versionMaxBody);
+        return json(201, await versions.create(who, p.board, b));
+      },
+    }],
+    ["/boards/:board/versions/:versionId", {
+      GET: async (req, p) => json(200, await versions.get(await caller(req), p.board, p.versionId)),
+      DELETE: async (req, p) => {
+        await versions.remove(await caller(req), p.board, p.versionId);
+        return json(204);
+      },
+    }],
     ["/boards/:board/invites", {
       GET: async (req, p) => json(200, { invites: await listInvites({ caller: await caller(req), board: p.board }, admin) }),
       POST: async (req, p) => {
@@ -928,7 +947,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
         if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
         if (e.code === "limit") return err(429, "limit", { message: String(e.message).slice(0, 200) });
         if (e.code === "last-owner") return err(409, "last-owner");
-        if (e.code === "too-large") return err(409, "too-large");
+        if (e.code === "too-large") return err(e.data?.httpStatus === 413 ? 413 : 409, "too-large");
         if (e.code === "in-use" || e.code === "confirm-required") return err(409, e.code, e.data ?? {});
         if (e.code === "superseded") return err(409, "superseded");
         if (e.code === "moved") return err(409, "moved");

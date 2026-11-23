@@ -3,7 +3,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "./util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "./registry-port.js";
 
 /**
  * @typedef {import("./registry-port.js").Registry} Registry
@@ -42,6 +42,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
   /** @type {Map<string, Set<string>>} key board + "\n" + user → link ids */ const uses = new Map();
   /** @type {AuditEvent[]} */ const audits = [];
   let auditSeq = 0;
+  /** @type {Map<string, import("./registry-port.js").BoardVersion>} */ const boardVersions = new Map();
   /** @type {Map<string, Group>} */ const groups = new Map();
   /** @type {Map<string, Space>} */ const spaces = new Map();
   /** @type {Map<string, Team>} */ const teams = new Map();
@@ -246,6 +247,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const k of [...uses.keys()]) if (k.startsWith(prefix)) uses.delete(k);
       for (const m of [recent, stars]) for (const x of m.values()) x.delete(id);
       for (const k of [...requests.keys()]) if (k.startsWith("board\n" + id + "\n")) requests.delete(k);
+      for (const [vid, v] of boardVersions) if (v.boardId === id) boardVersions.delete(vid);
       claimed.delete("b\n" + id);
       return true;
     },
@@ -437,6 +439,7 @@ export function memoryRegistry({ now = Date.now } = {}) {
       for (const k of [...uses.keys()]) if (k.startsWith(board + "\n")) uses.delete(k);
       for (const m of [recent, stars]) for (const x of m.values()) x.delete(board);
       for (const k of [...requests.keys()]) if (k.startsWith("board\n" + board + "\n")) requests.delete(k);
+      for (const [vid, v] of boardVersions) if (v.boardId === board) boardVersions.delete(vid);
       boards.delete(board); claimed.delete("b\n" + board);
       return true;
     },
@@ -535,6 +538,54 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const events = (hasMore ? filtered.slice(0, cap) : filtered).map(copy);
       const last = events[events.length - 1];
       return { events, nextBefore: hasMore ? `${last.at}:${last.id}` : null };
+    },
+
+    async createBoardVersion({ tenantId, boardId, label, createdBy, createdByName = null, elementCount = 0, snapshotJson, maxPerBoard = BOARD_VERSIONS.maxPerBoard, at }) {
+      const b = typeof boardId === "string" ? boards.get(boardId) : null;
+      if (!b || b.tenant !== tenantId) throw new Error("registry: no such board");
+      if (b.trashedAt != null) throw new RegistryError("in-trash", "the board is in Trash");
+      const cap = Number.isInteger(maxPerBoard) && maxPerBoard > 0 ? maxPerBoard : BOARD_VERSIONS.maxPerBoard;
+      let existing = 0;
+      for (const v of boardVersions.values()) if (v.tenantId === tenantId && v.boardId === boardId) existing++;
+      if (existing >= cap) throw new RegistryError("limit", "registry: board version limit reached");
+      let id = mint.version();
+      while (boardVersions.has(id)) id = mint.version();
+      const rec = {
+        id,
+        tenantId,
+        boardId,
+        label: String(label),
+        createdBy: String(createdBy),
+        createdByName: createdByName == null ? null : String(createdByName),
+        createdAt: Number.isFinite(at) ? Math.floor(at) : now(),
+        elementCount: Number.isSafeInteger(elementCount) && elementCount >= 0 ? elementCount : 0,
+        snapshotJson: String(snapshotJson),
+      };
+      boardVersions.set(id, rec);
+      const { snapshotJson: _omitted, ...meta } = rec;
+      return copy(meta);
+    },
+    async listBoardVersions({ tenantId, boardId, limit = BOARD_VERSIONS.maxPerBoard } = /** @type {any} */ ({})) {
+      if (typeof tenantId !== "string" || typeof boardId !== "string") return [];
+      const cap = Math.min(BOARD_VERSIONS.maxPerBoard, Math.max(1, Math.floor(Number(limit) || BOARD_VERSIONS.maxPerBoard)));
+      return [...boardVersions.values()]
+        .filter(v => v.tenantId === tenantId && v.boardId === boardId)
+        .sort((a, b) => (b.createdAt !== a.createdAt ? b.createdAt - a.createdAt : b.id < a.id ? -1 : b.id > a.id ? 1 : 0))
+        .slice(0, cap)
+        .map(({ snapshotJson: _omitted, ...meta }) => copy(meta));
+    },
+    async getBoardVersion({ tenantId, boardId, versionId } = /** @type {any} */ ({})) {
+      if (typeof tenantId !== "string" || typeof boardId !== "string" || typeof versionId !== "string") return null;
+      const v = boardVersions.get(versionId);
+      if (!v || v.tenantId !== tenantId || v.boardId !== boardId) return null;
+      return copy(v);
+    },
+    async deleteBoardVersion({ tenantId, boardId, versionId } = /** @type {any} */ ({})) {
+      if (typeof tenantId !== "string" || typeof boardId !== "string" || typeof versionId !== "string") return false;
+      const v = boardVersions.get(versionId);
+      if (!v || v.tenantId !== tenantId || v.boardId !== boardId) return false;
+      boardVersions.delete(versionId);
+      return true;
     },
 
     // ---- organization: Groups, Spaces, Teams, scoped grants, roles ----

@@ -191,9 +191,9 @@ describe("CLI v2 argument parsing & dispatch", () => {
 });
 
 describe("MCP v2 handler", () => {
-  test("exposes 16 tools with version 0.2.0 and preserves structured version-conflict details", async () => {
-    expect(SERVER_INFO.version).toBe("0.2.0");
-    expect(TOOLS.length).toBe(16);
+  test("exposes all 16 v0.2 tools (22 total in v0.3.0) and preserves structured version-conflict details", async () => {
+    expect(SERVER_INFO.version).toBe("0.3.0");
+    expect(TOOLS.length).toBe(22);
 
     const handle = createMcpHandler({
       clientFactory: () => ({

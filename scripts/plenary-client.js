@@ -5,6 +5,7 @@
 import { Replica } from "../packages/protocol/replica.js";
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { ELEMENT_STREAMS, MAX_ID_CHARS, MAX_OP_BYTES, utf8Bytes } from "../packages/protocol/envelope.js";
+import { moderationOf, moderationProblem } from "../packages/protocol/moderation.js";
 import { BASE_LAYER, clone, isLabel, isShape, layerOf, layersOf, makeElement, newId, touch } from "../packages/core/model.js";
 import { mermaidToElements } from "../packages/core/mermaid.js";
 import { getEasing, getPreset } from "../packages/core/anim.js";
@@ -18,9 +19,13 @@ const MAX_LAYER_NAME_CHARS = 200;
 const MAX_LAYERS = 100;
 const MAX_VIEWS = 100;
 const MAX_ANIM_MS = 3_600_000;
+const PASSCODE_MIN_LEN = 4;
+const PASSCODE_MAX_LEN = 128;
+const MAX_VERSION_LABEL_CHARS = 120;
 
 const NOTE_DEFAULTS = { width: 200, height: 140, backgroundColor: "#fef08a", strokeColor: "#1e1e1e" };
 const BOARD_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const ALLOWED_ELEMENT_TYPES = new Set([
   "rectangle", "ellipse", "diamond", "frame", "arrow", "line", "freedraw", "text",
 ]);
@@ -29,6 +34,10 @@ const LINEAR_TYPES = new Set(["arrow", "line", "freedraw"]);
 const BINDING_SIDES = new Set(["top", "right", "bottom", "left"]);
 const LAYER_ACTIONS = new Set(["list", "create", "rename", "toggle_visible", "toggle_locked", "reorder"]);
 const VIEW_ACTIONS = new Set(["list", "create", "delete"]);
+const VERSION_ACTIONS = new Set(["list", "create", "get", "delete"]);
+const SPACE_ACTIONS = new Set(["list_home", "create_area", "create_space", "trash_board", "restore_board"]);
+const ORG_ACTIONS = new Set(["list_members", "add_member", "remove_member", "list_roles"]);
+const GENERAL_ROLES = new Set(["editor", "annotator", "commenter", "viewer"]);
 
 export class PlenaryError extends Error {
   /**
@@ -120,6 +129,22 @@ function assertId(val, name = "id") {
     throw new PlenaryError(`${name} must be 1..${MAX_ID_CHARS} characters`, { code: "bad-request" });
   }
   return id;
+}
+
+function assertPathId(val, name = "id", maxLen = 128) {
+  const raw = assertString(val, name).trim();
+  if (!raw.length || raw.length > maxLen || raw === "." || raw === ".." || /[/\\?#\0\r\n]/.test(raw)) {
+    throw new PlenaryError(`${name} must be a valid identifier (1..${maxLen} chars, no path separators)`, { code: "bad-request" });
+  }
+  return raw;
+}
+
+function assertEmail(val, name = "email") {
+  const raw = assertString(val, name).trim().toLowerCase();
+  if (!raw.length || raw.length > 320 || /[\p{Cc}\p{Cf}]/u.test(raw) || !EMAIL_RE.test(raw)) {
+    throw new PlenaryError(`${name} must be a valid email address`, { code: "bad-request" });
+  }
+  return raw;
 }
 
 function assertBoolean(val, name) {
@@ -857,7 +882,7 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
     }
   }
 
-  return {
+  const client = {
     baseUrl,
     wsUrl,
 
@@ -871,23 +896,36 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
 
     /**
      * POST /boards
-     * @param {{ title?: string, memberRole?: string | null, signal?: AbortSignal }} [opts]
+     * @param {{ title?: string, memberRole?: string | null, space?: string, tenant?: string, signal?: AbortSignal }} [opts]
      */
-    async createBoard({ title, memberRole, signal } = {}) {
+    async createBoard({ title, memberRole, space, tenant, signal } = {}) {
+      /** @type {Record<string, any>} */
       const body = {};
       if (title !== undefined) body.title = title;
       if (memberRole !== undefined) body.memberRole = memberRole;
+      if (space !== undefined) body.space = assertPathId(space, "space", 64);
+      if (tenant !== undefined) body.tenant = assertPathId(tenant, "tenant");
       return requestJson("POST", "/boards", { body, signal });
     },
 
     /**
      * POST /boards/:board/links
-     * @param {{ board?: string, role?: string, expiresAt?: string | number | null, signal?: AbortSignal }} [opts]
+     * @param {{ board?: string, role?: string, expiresAt?: string | number | null, passcode?: string | null, noDownload?: boolean, signal?: AbortSignal }} [opts]
      */
-    async createShareLink({ board, role = "viewer", expiresAt, signal } = {}) {
+    async createShareLink({ board, role = "viewer", expiresAt, passcode, noDownload, signal } = {}) {
       const boardId = assertBoardId(board);
+      /** @type {Record<string, any>} */
       const body = { role };
       if (expiresAt !== undefined && expiresAt !== null) body.expiresAt = expiresAt;
+      if (passcode !== undefined && passcode !== null) {
+        if (typeof passcode !== "string" || passcode.length < PASSCODE_MIN_LEN || passcode.length > PASSCODE_MAX_LEN) {
+          throw new PlenaryError(`passcode must be a string of ${PASSCODE_MIN_LEN}..${PASSCODE_MAX_LEN} characters`, { code: "bad-request" });
+        }
+        body.passcode = passcode;
+      }
+      if (noDownload !== undefined) {
+        body.noDownload = assertBoolean(noDownload, "noDownload");
+      }
       return requestJson("POST", `/boards/${encodeURIComponent(boardId)}/links`, { body, signal });
     },
 
@@ -1692,5 +1730,220 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
         };
       }, { signal });
     },
+
+    /**
+     * All-Hands Moderation (#33): set `{ locked?, mutedUsers? }` in `appState.herdr.moderation` over Protocol v1.1 WS.
+     * @param {{ board?: string, locked?: boolean, mutedUsers?: string[], signal?: AbortSignal }} [opts]
+     */
+    async setModeration({ board, locked, mutedUsers, signal } = {}) {
+      if (locked === undefined && mutedUsers === undefined) {
+        throw new PlenaryError("at least one of locked or mutedUsers is required", { code: "bad-request" });
+      }
+      if (locked !== undefined) assertBoolean(locked, "locked");
+      if (mutedUsers !== undefined) {
+        const why = moderationProblem({ locked: false, mutedUsers });
+        if (why) throw new PlenaryError(why, { code: "bad-request" });
+      }
+
+      return withBoardSession(board, async ({ replica, commitOp, board: boardId }) => {
+        const current = moderationOf(replica.streams.board.appState);
+        const next = {
+          locked: locked !== undefined ? locked : current.locked,
+          mutedUsers: mutedUsers !== undefined ? [...mutedUsers] : [...current.mutedUsers],
+        };
+        const why = moderationProblem(next);
+        if (why) throw new PlenaryError(why, { code: "bad-request" });
+        const { opId, seq } = await commitOp("board", { appState: { moderation: next } });
+        return {
+          board: boardId,
+          seq,
+          opId,
+          moderation: next,
+        };
+      }, { signal });
+    },
+
+    /**
+     * Version History (#19): list, create (captures synced board scene + label), get, or delete named snapshots.
+     * @param {{ board?: string, action?: string, label?: string, versionId?: string, id?: string, snapshot?: Record<string, any>, signal?: AbortSignal }} [opts]
+     */
+    async manageVersions({ board, action, label, versionId, id, snapshot, signal } = {}) {
+      const boardId = assertBoardId(board);
+      if (typeof action !== "string" || !VERSION_ACTIONS.has(action)) {
+        throw new PlenaryError(`action must be one of: ${[...VERSION_ACTIONS].join(", ")}`, { code: "bad-request" });
+      }
+      if (action === "list") {
+        return requestJson("GET", `/boards/${encodeURIComponent(boardId)}/versions`, { signal });
+      }
+      if (action === "create") {
+        const cleanLabel = assertString(label, "label").trim();
+        if (!cleanLabel.length || cleanLabel.length > MAX_VERSION_LABEL_CHARS) {
+          throw new PlenaryError(`label must be 1..${MAX_VERSION_LABEL_CHARS} characters`, { code: "bad-request" });
+        }
+        let snap = snapshot;
+        if (snap === undefined) {
+          const state = await client.readBoard({ board: boardId, signal });
+          snap = {
+            elements: state.elements,
+            notes: state.notes,
+            appState: state.appState,
+          };
+        } else if (!snap || typeof snap !== "object" || Array.isArray(snap)) {
+          throw new PlenaryError("snapshot must be a JSON object", { code: "bad-request" });
+        }
+        return requestJson("POST", `/boards/${encodeURIComponent(boardId)}/versions`, {
+          body: { label: cleanLabel, snapshot: snap },
+          signal,
+        });
+      }
+      const vid = assertPathId(versionId ?? id, "versionId");
+      if (action === "get") {
+        return requestJson("GET", `/boards/${encodeURIComponent(boardId)}/versions/${encodeURIComponent(vid)}`, { signal });
+      }
+      // action === "delete"
+      await requestJson("DELETE", `/boards/${encodeURIComponent(boardId)}/versions/${encodeURIComponent(vid)}`, { signal });
+      return { ok: true, board: boardId, versionId: vid, deleted: true };
+    },
+
+    /**
+     * Areas, Spaces & Board Lifecycle: list_home, create_area, create_space, trash_board, restore_board.
+     * @param {{ action?: string, name?: string, group?: string | null, general?: string | null, board?: string, from?: string, signal?: AbortSignal }} [opts]
+     */
+    async manageSpaces({ action, name, group, general, board, from, signal } = {}) {
+      if (typeof action !== "string" || !SPACE_ACTIONS.has(action)) {
+        throw new PlenaryError(`action must be one of: ${[...SPACE_ACTIONS].join(", ")}`, { code: "bad-request" });
+      }
+      if (action === "list_home") {
+        return requestJson("GET", "/home", { signal });
+      }
+      if (action === "create_area" || action === "create_space") {
+        const cleanName = assertString(name, "name").trim();
+        if (!cleanName.length || cleanName.length > 200 || cleanName.includes("\0")) {
+          throw new PlenaryError("name must be 1..200 characters", { code: "bad-request" });
+        }
+        if (general !== undefined && general !== null && (typeof general !== "string" || !GENERAL_ROLES.has(general))) {
+          throw new PlenaryError("general must be null or one of: editor, annotator, commenter, viewer", { code: "bad-request" });
+        }
+        /** @type {Record<string, any>} */
+        const body = { name: cleanName };
+        if (general !== undefined) body.general = general;
+        if (action === "create_area") {
+          return requestJson("POST", "/groups", { body, signal });
+        }
+        if (group !== undefined) {
+          body.group = group === null ? null : assertPathId(group, "group", 64);
+        }
+        return requestJson("POST", "/spaces", { body, signal });
+      }
+      const boardId = assertBoardId(board);
+      if (action === "trash_board") {
+        let fromSpace = from !== undefined && from !== null ? assertPathId(from, "from", 64) : null;
+        if (!fromSpace) {
+          const listed = await requestJson("GET", "/boards", { signal });
+          const found = Array.isArray(listed?.boards) ? listed.boards.find(b => b?.id === boardId) : null;
+          if (typeof found?.space === "string" && found.space) {
+            fromSpace = found.space;
+          }
+        }
+        if (!fromSpace) {
+          throw new PlenaryError("from (current space id) is required to trash a board", { code: "bad-request" });
+        }
+        return requestJson("POST", `/boards/${encodeURIComponent(boardId)}/trash`, {
+          body: { from: fromSpace },
+          signal,
+        });
+      }
+      // action === "restore_board"
+      return requestJson("POST", `/boards/${encodeURIComponent(boardId)}/restore`, {
+        body: {},
+        signal,
+      });
+    },
+
+    /**
+     * Members & Roles: list_members, add_member, remove_member, list_roles.
+     * @param {{ action?: string, tenant?: string, email?: string, signal?: AbortSignal }} [opts]
+     */
+    async manageOrg({ action, tenant, email, signal } = {}) {
+      if (typeof action !== "string" || !ORG_ACTIONS.has(action)) {
+        throw new PlenaryError(`action must be one of: ${[...ORG_ACTIONS].join(", ")}`, { code: "bad-request" });
+      }
+      if (action === "list_roles") {
+        return requestJson("GET", "/roles", { signal });
+      }
+      let tenantId = tenant !== undefined && tenant !== null && tenant !== "" ? assertPathId(tenant, "tenant") : null;
+      if (!tenantId) {
+        const res = await requestJson("GET", "/tenants", { signal });
+        const tenants = Array.isArray(res?.tenants) ? res.tenants : [];
+        const picked = tenants.find(t => t?.isAdmin) ?? tenants[0];
+        if (typeof picked?.id === "string" && picked.id) tenantId = picked.id;
+      }
+      if (!tenantId) {
+        throw new PlenaryError("tenant is required (no accessible tenant found)", { code: "bad-request" });
+      }
+      if (action === "list_members") {
+        return requestJson("GET", `/tenants/${encodeURIComponent(tenantId)}/members`, { signal });
+      }
+      const cleanEmail = assertEmail(email, "email");
+      if (action === "add_member") {
+        return requestJson("POST", `/tenants/${encodeURIComponent(tenantId)}/members`, {
+          body: { email: cleanEmail },
+          signal,
+        });
+      }
+      // action === "remove_member"
+      await requestJson("DELETE", `/tenants/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(cleanEmail)}`, { signal });
+      return { ok: true, tenant: tenantId, email: cleanEmail, removed: true };
+    },
+
+    /**
+     * Compliance Data Export (#34): scope "board" (GET /boards/:board/export-data) or "tenant" (GET /admin/export-data).
+     * @param {{ scope?: "board" | "tenant" | string, board?: string, tenant?: string, signal?: AbortSignal }} [opts]
+     */
+    async exportComplianceData({ scope, board, tenant, signal } = {}) {
+      if (scope !== undefined && scope !== "board" && scope !== "tenant") {
+        throw new PlenaryError("scope must be 'board' or 'tenant'", { code: "bad-request" });
+      }
+      const resolvedScope = scope ?? (board ? "board" : "tenant");
+      const tenantId = tenant !== undefined && tenant !== null && tenant !== "" ? assertPathId(tenant, "tenant") : undefined;
+      if (resolvedScope === "board") {
+        if (!board) {
+          throw new PlenaryError("board is required when scope is 'board'", { code: "bad-request" });
+        }
+        const boardId = assertBoardId(board);
+        return requestJson("GET", `/boards/${encodeURIComponent(boardId)}/export-data`, {
+          query: tenantId ? { tenant: tenantId } : undefined,
+          signal,
+        });
+      }
+      return requestJson("GET", "/admin/export-data", {
+        query: tenantId ? { tenant: tenantId } : undefined,
+        signal,
+      });
+    },
+
+    /**
+     * GDPR User Erasure (#34): POST /admin/gdpr/erase. Requires explicit `confirm: true` boolean.
+     * @param {{ userId?: string, tenant?: string, confirm?: boolean, signal?: AbortSignal }} [opts]
+     */
+    async gdprEraseUser({ userId, tenant, confirm, signal } = {}) {
+      if (confirm !== true) {
+        throw new PlenaryError(
+          "gdpr_erase_user requires explicit confirm: true to proceed with irreversible GDPR erasure",
+          { code: "confirm-required" },
+        );
+      }
+      const cleanUserId = assertString(userId, "userId").trim();
+      if (!cleanUserId.length || cleanUserId.length > 200 || /[\0\n]/.test(cleanUserId) || cleanUserId.startsWith("email:")) {
+        throw new PlenaryError("userId must be a valid non-email user identifier (1..200 chars)", { code: "bad-request" });
+      }
+      const tenantId = tenant !== undefined && tenant !== null && tenant !== "" ? assertPathId(tenant, "tenant") : undefined;
+      /** @type {Record<string, any>} */
+      const body = { userId: cleanUserId };
+      if (tenantId) body.tenant = tenantId;
+      return requestJson("POST", "/admin/gdpr/erase", { body, signal });
+    },
   };
+
+  return client;
 }

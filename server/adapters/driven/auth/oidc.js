@@ -391,6 +391,13 @@ export function oidcDiscovery({ issuerUrl, fetch, now = Date.now, allowHttpLocal
 
 const MAX_NAME = 200;
 const MAX_TOKEN_AGE_SEC = 86_400;
+/** Public consumer mail domains that must never become an org tenant domain. */
+const CONSUMER_MAIL_DOMAINS = new Set([
+  "gmail.com", "googlemail.com",
+  "outlook.com", "hotmail.com", "live.com", "msn.com",
+  "yahoo.com", "icloud.com", "me.com",
+  "proton.me", "protonmail.com",
+]);
 
 /**
  * The email, only when Google is authoritative for it (Google's "Verify the Google ID token" guide): it ends in
@@ -432,14 +439,16 @@ async function verifyJwsSignature(alg, key, sig, signed) {
  * Verify a Google ID token and turn it into an Identity. Returns null on any failure (never throws).
  * Checks: RS256 only; signature against the JWKS key named by `kid`; `iss`; `aud` = clientId (an array `aud`
  * must contain it and, if it has several, `azp` must be clientId); `exp` and `iat` within `skewSec`; `nonce`
- * equals the expected one (required, non-empty). The Workspace domain is the `hd` claim, never the email.
+ * equals the expected one (required, non-empty). The Workspace domain is the `hd` claim, never the email
+ * (unless `trustVerifiedEmail` is explicitly enabled and `hd` is absent, in which case a verified non-consumer
+ * email's domain is used).
  * @param {string} token
  * `why(cause)`, if given, hears one fixed label when the token is refused (CAUSES below); never the token or a claim.
  * @param {{ clientId: string, nonce: string, keys: ReturnType<typeof jwksCache>, now?: () => number, skewSec?: number,
- *   why?: (cause: string) => void }} o
+ *   trustVerifiedEmail?: boolean, why?: (cause: string) => void }} o
  * @returns {Promise<Identity|null>}
  */
-export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.now, skewSec = 60, why }) {
+export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.now, skewSec = 60, trustVerifiedEmail = false, why }) {
   const no = cause => { try { why?.(cause); } catch { /* a reporter never changes the verdict */ } return null; };
   if (typeof clientId !== "string" || !clientId) return no("bad_config");
   if (typeof nonce !== "string" || !nonce) return no("bad_nonce");
@@ -470,11 +479,21 @@ export async function verifyIdToken(token, { clientId, nonce, keys, now = Date.n
   if (typeof c.sub !== "string" || !c.sub || c.sub.length > 255) return no("bad_sub");
 
   const hd = typeof c.hd === "string" ? c.hd.trim().toLowerCase() : "";
+  let email = authoritativeEmail(c, hd);
+  let domain = hd || null;
+  if (trustVerifiedEmail && !hd && c.email_verified === true) {
+    const verified = normalizeEmailClaim(c.email);
+    if (verified) {
+      email = verified;
+      const emailDomain = verified.slice(verified.lastIndexOf("@") + 1);
+      if (!CONSUMER_MAIL_DOMAINS.has(emailDomain)) domain = emailDomain;
+    }
+  }
   return {
     user: "google:" + c.sub,
     name: typeof c.name === "string" ? c.name.slice(0, MAX_NAME) : null,
-    email: authoritativeEmail(c, hd),
-    domain: hd || null,
+    email,
+    domain,
   };
 }
 
@@ -580,13 +599,14 @@ export async function verifyOidcIdToken(token, { issuer, clientId, nonce, keys, 
  *   `tenant === "organizations"`). When `tenant` is a specific GUID, requires `payload.tid === tenant` and exact `iss`.
  * - `aud` / `azp`, `exp`, `iat`, optional `nbf`, `nonce`, and `oid` (preferred) or `sub`.
  * - Extracts `email` (from `email` or `preferred_username`, rejected if `email_verified === false`), `name`, `tid`,
- *   and `domain` (normalized lowercase domain of verified email for work/school tenants; `null` for MSA consumer accounts).
+ *   and `domain` (normalized lowercase domain of verified email for work/school tenants; `null` for MSA consumer accounts
+ *   unless `trustVerifiedEmail` is true and the email domain is not a public consumer mail domain).
  * @param {string} token
  * @param {{ clientId: string, tenant?: string, nonce: string, keys: ReturnType<typeof jwksCache>,
- *   now?: () => number, skewSec?: number, why?: (cause: string) => void }} o
+ *   now?: () => number, skewSec?: number, trustVerifiedEmail?: boolean, why?: (cause: string) => void }} o
  * @returns {Promise<Identity|null>}
  */
-export async function verifyMicrosoftIdToken(token, { clientId, tenant = "common", nonce, keys, now = Date.now, skewSec = 60, why }) {
+export async function verifyMicrosoftIdToken(token, { clientId, tenant = "common", nonce, keys, now = Date.now, skewSec = 60, trustVerifiedEmail = false, why }) {
   const refuse = cause => { try { why?.(cause); } catch { /* a reporter never changes the verdict */ } return null; };
   if (typeof clientId !== "string" || !clientId) return refuse("bad_config");
   const normTenant = String(tenant ?? "common").trim().toLowerCase() || "common";
@@ -632,7 +652,11 @@ export async function verifyMicrosoftIdToken(token, { clientId, tenant = "common
   const email = c.email_verified === false
     ? null
     : (normalizeEmailClaim(c.email) ?? normalizeEmailClaim(c.preferred_username));
-  const domain = email && tid !== MICROSOFT_CONSUMER_TID ? email.slice(email.lastIndexOf("@") + 1) : null;
+  const emailDomain = email ? email.slice(email.lastIndexOf("@") + 1) : null;
+  let domain = emailDomain && tid !== MICROSOFT_CONSUMER_TID ? emailDomain : null;
+  if (!domain && trustVerifiedEmail && emailDomain && !CONSUMER_MAIL_DOMAINS.has(emailDomain)) {
+    domain = emailDomain;
+  }
   const rawName = typeof c.name === "string" && c.name.trim() ? c.name.trim() : null;
 
   return {
@@ -668,12 +692,12 @@ export const OIDC_CAUSES = Object.freeze([
 ]);
 
 /**
- * @param {{ clientId: string, clientSecret: string, redirectUri: string, fetch: typeof fetch,
- *   now?: () => number, skewSec?: number, jwksCooldownMs?: number, timeoutMs?: number }} config
+ * @param {{ clientId: string, clientSecret: string, redirectUri: string, fetch: typeof globalThis.fetch,
+ *   now?: () => number, skewSec?: number, jwksCooldownMs?: number, timeoutMs?: number, trustVerifiedEmail?: boolean }} config
  * @returns {import("../../../ports/idp.js").IdP & { keys: ReturnType<typeof jwksCache>, verifyIdToken(token: string, nonce: string): Promise<Identity|null> }}
  */
 export function googleOidc(config) {
-  const { clientId, clientSecret, redirectUri, fetch, now = Date.now, skewSec = 60 } = config;
+  const { clientId, clientSecret, redirectUri, fetch, now = Date.now, skewSec = 60, trustVerifiedEmail = false } = config;
   if (!clientId || !clientSecret || !redirectUri || typeof fetch !== "function") throw new Error("oidc: incomplete config");
   const keys = jwksCache({ fetch, now, cooldownMs: config.jwksCooldownMs ?? 30_000, timeoutMs: config.timeoutMs ?? 10_000 });
 
@@ -729,10 +753,10 @@ export function googleOidc(config) {
         const e = body?.error;
         return no(TOKEN_ERRORS.includes(e) ? e : `token_http_${res.status}`);
       }
-      return verifyIdToken(body?.id_token, { clientId, nonce: expected.nonce, keys, now, skewSec, why: no });
+      return verifyIdToken(body?.id_token, { clientId, nonce: expected.nonce, keys, now, skewSec, trustVerifiedEmail, why: no });
     },
     /** Verify an ID token directly (exposed for tests and for a future token-exchange endpoint). */
-    verifyIdToken: (token, nonce) => verifyIdToken(token, { clientId, nonce, keys, now, skewSec }),
+    verifyIdToken: (token, nonce) => verifyIdToken(token, { clientId, nonce, keys, now, skewSec, trustVerifiedEmail }),
   };
 }
 
@@ -904,7 +928,7 @@ export function genericOidc(config) {
  * Microsoft Entra ID (Azure AD) v2.0 OIDC adapter: authorization code + PKCE (S256), JWKS verification,
  * and multi-tenant (`"common"`, `"organizations"`) or single-tenant (GUID) issuer validation.
  * @param {{ clientId: string, clientSecret: string, tenant?: string, redirectUri: string, fetch: typeof globalThis.fetch,
- *   now?: () => number, skewSec?: number, jwksCooldownMs?: number, timeoutMs?: number }} config
+ *   now?: () => number, skewSec?: number, jwksCooldownMs?: number, timeoutMs?: number, trustVerifiedEmail?: boolean }} config
  * @returns {import("../../../ports/idp.js").IdP & {
  *   providerId: "microsoft", displayName: "Microsoft", tenant: string,
  *   keys: ReturnType<typeof jwksCache>,
@@ -912,7 +936,7 @@ export function genericOidc(config) {
  * }}
  */
 export function microsoftOidc(config) {
-  const { clientId, clientSecret, redirectUri, fetch, now = Date.now, skewSec = 60, timeoutMs = 10_000 } = config ?? {};
+  const { clientId, clientSecret, redirectUri, fetch, now = Date.now, skewSec = 60, timeoutMs = 10_000, trustVerifiedEmail = false } = config ?? {};
   if (!clientId || !clientSecret || !redirectUri || typeof fetch !== "function") throw new Error("oidc: incomplete config");
   const endpoints = microsoftEndpoints(config.tenant);
   const keys = jwksCache({
@@ -986,11 +1010,12 @@ export function microsoftOidc(config) {
         keys,
         now,
         skewSec,
+        trustVerifiedEmail,
         why: refuse,
       });
     },
 
     verifyIdToken: (token, nonce, { why } = {}) =>
-      verifyMicrosoftIdToken(token, { clientId, tenant: endpoints.tenant, nonce, keys, now, skewSec, why }),
+      verifyMicrosoftIdToken(token, { clientId, tenant: endpoints.tenant, nonce, keys, now, skewSec, trustVerifiedEmail, why }),
   };
 }

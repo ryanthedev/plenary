@@ -274,3 +274,58 @@ test("p5-fix 2: with hd, the email counts only if its domain IS hd (case-insensi
   expect((await v(await idp.mint({ email: "x@acme.com", hd: "acme.com", email_verified: false }))).email).toBe(null);
   expect((await v(await idp.mint({ email: "gus@gmail.com", hd: "acme.com" }))).email).toBe("gus@gmail.com");
 });
+
+// ---- Opt-in verified non-Workspace email (PLENARY_TRUST_VERIFIED_EMAIL) ----
+
+test("trustVerifiedEmail: verified corporate email without hd keeps email and resolves org domain", async () => {
+  const id = await v(
+    await idp.mint({ email: " DeMarco@AlaskaAir.COM ", hd: undefined, email_verified: true }),
+    { trustVerifiedEmail: true },
+  );
+  expect(id).toMatchObject({ email: "demarco@alaskaair.com", domain: "alaskaair.com" });
+});
+
+test("trustVerifiedEmail: personal consumer mail domains keep email but domain stays null", async () => {
+  for (const addr of ["user@gmail.com", "User@GoogleMail.COM"]) {
+    const id = await v(
+      await idp.mint({ email: addr, hd: undefined, email_verified: true }),
+      { trustVerifiedEmail: true },
+    );
+    expect(id).toMatchObject({ email: addr.toLowerCase(), domain: null });
+  }
+});
+
+test("trustVerifiedEmail: unverified email still drops both email and domain", async () => {
+  const id = await v(
+    await idp.mint({ email: "demarco@alaskaair.com", hd: undefined, email_verified: false }),
+    { trustVerifiedEmail: true },
+  );
+  expect(id).toMatchObject({ email: null, domain: null });
+});
+
+test("trustVerifiedEmail: default (false) keeps strict hd-only behavior unchanged", async () => {
+  const id = await v(await idp.mint({ email: "demarco@alaskaair.com", hd: undefined, email_verified: true }));
+  expect(id).toMatchObject({ email: null, domain: null });
+});
+
+test("trustVerifiedEmail: googleOidc forwards option through finish() and verifyIdToken()", async () => {
+  const g = googleOidc({
+    clientId: CLIENT_ID,
+    clientSecret: "not-a-secret",
+    redirectUri: "http://localhost/cb",
+    fetch: idp.fetch,
+    now,
+    trustVerifiedEmail: true,
+  });
+  const s = await g.begin();
+  const tok = await idp.mint({ email: "demarco@alaskaair.com", hd: undefined, email_verified: true, nonce: s.nonce });
+  idp.codes.set("code-verified", tok);
+  expect(await g.finish({ code: "code-verified", state: s.state, expected: s })).toMatchObject({
+    email: "demarco@alaskaair.com",
+    domain: "alaskaair.com",
+  });
+  expect(await g.verifyIdToken(tok, s.nonce)).toMatchObject({
+    email: "demarco@alaskaair.com",
+    domain: "alaskaair.com",
+  });
+});

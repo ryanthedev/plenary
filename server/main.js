@@ -29,6 +29,10 @@
 //   PLENARY_MAX_CONNS_PER_USER   open sockets one user may hold (default 64). A load test that shares a few dev
 //                        tokens between thousands of clients must raise it.
 //   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET   Google sign-in; both set → /auth routes work, else they answer 503
+//   PLENARY_TRUST_VERIFIED_EMAIL   `1` or `true` opts in to trusting verified emails on non-Workspace Google accounts
+//                        (no `hd` claim) and personal Microsoft (MSA) accounts: keeps the verified email and derives
+//                        the tenant domain when it is not a public consumer mail domain (`gmail.com`, `outlook.com`,
+//                        etc.). Default off (strict `hd` / work-tenant only).
 //   OIDC_ISSUER_URL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET   Generic OIDC sign-in (Pocket ID, Authentik, Keycloak, Okta,
 //                        Auth0, Entra ID); all three set → /auth routes use OIDC discovery + PKCE (S256) with
 //                        issuer-bound tenancy. Optional: OIDC_SCOPES (default "openid email profile"),
@@ -441,11 +445,12 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const isProd = env.NODE_ENV === "production" || cluster;
   const allowHttpLocalhost = env.OIDC_ALLOW_HTTP_LOCALHOST === "1" || env.OIDC_ALLOW_HTTP_LOCALHOST === "true"
     || (!isProd && LOOPBACK_HOSTS.includes(publicHostOf(origin) ?? ""));
+  const trustVerifiedEmail = env.PLENARY_TRUST_VERIFIED_EMAIL === "1" || env.PLENARY_TRUST_VERIFIED_EMAIL === "true";
   const googleOidcAdapter = hasGoogle
-    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
+    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS, trustVerifiedEmail })
     : null;
   const microsoftOidcAdapter = hasMicrosoft
-    ? microsoftOidc({ clientId: env.MICROSOFT_CLIENT_ID, clientSecret: env.MICROSOFT_CLIENT_SECRET, tenant: env.MICROSOFT_TENANT_ID, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
+    ? microsoftOidc({ clientId: env.MICROSOFT_CLIENT_ID, clientSecret: env.MICROSOFT_CLIENT_SECRET, tenant: env.MICROSOFT_TENANT_ID, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS, trustVerifiedEmail })
     : null;
   const genericOidcAdapter = hasGenericOidc
     ? genericOidc({

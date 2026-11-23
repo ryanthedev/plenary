@@ -225,6 +225,65 @@ describe("microsoftOidc + verifyMicrosoftIdToken", () => {
     expect(causes).toEqual(["bad_iss"]);
   });
 
+  test("trustVerifiedEmail: MSA consumer tenant resolves corporate email domain but keeps consumer mail domains null", async () => {
+    const keys = jwksCache({ url: microsoftEndpoints("common").jwks, fetch: msIdp.fetch, now, algorithms: ["RS256"] });
+
+    // Corporate email on MSA consumer tenant -> resolves domain when trustVerifiedEmail: true
+    const corpMsaTok = await msIdp.mint({
+      nonce: "n-msa-corp",
+      tid: MICROSOFT_CONSUMER_TID,
+      email: "DeMarco@AlaskaAir.COM",
+    });
+    expect(await verifyMicrosoftIdToken(corpMsaTok, {
+      clientId: MS_CLIENT_ID, tenant: "common", nonce: "n-msa-corp", keys, now,
+    })).toMatchObject({ email: "demarco@alaskaair.com", domain: null, tid: MICROSOFT_CONSUMER_TID });
+    expect(await verifyMicrosoftIdToken(corpMsaTok, {
+      clientId: MS_CLIENT_ID, tenant: "common", nonce: "n-msa-corp", keys, now, trustVerifiedEmail: true,
+    })).toMatchObject({ email: "demarco@alaskaair.com", domain: "alaskaair.com", tid: MICROSOFT_CONSUMER_TID });
+
+    // Consumer mail domains (outlook.com, hotmail.com, gmail.com, etc.) stay domain: null
+    for (const addr of ["person@outlook.com", "user@hotmail.com", "user@live.com", "user@gmail.com", "user@proton.me"]) {
+      const tok = await msIdp.mint({ nonce: "n-msa-cons", tid: MICROSOFT_CONSUMER_TID, email: addr });
+      expect(await verifyMicrosoftIdToken(tok, {
+        clientId: MS_CLIENT_ID, tenant: "common", nonce: "n-msa-cons", keys, now, trustVerifiedEmail: true,
+      })).toMatchObject({ email: addr, domain: null, tid: MICROSOFT_CONSUMER_TID });
+    }
+
+    // Explicitly unverified email still drops both email and domain
+    const unverifiedTok = await msIdp.mint({
+      nonce: "n-msa-unv",
+      tid: MICROSOFT_CONSUMER_TID,
+      email: "demarco@alaskaair.com",
+      email_verified: false,
+    });
+    expect(await verifyMicrosoftIdToken(unverifiedTok, {
+      clientId: MS_CLIENT_ID, tenant: "common", nonce: "n-msa-unv", keys, now, trustVerifiedEmail: true,
+    })).toMatchObject({ email: null, domain: null, tid: MICROSOFT_CONSUMER_TID });
+
+    // microsoftOidc forwards trustVerifiedEmail through finish() and verifyIdToken()
+    const ms = microsoftOidc({
+      clientId: MS_CLIENT_ID,
+      clientSecret: MS_CLIENT_SECRET,
+      redirectUri: ORIGIN + "/auth/callback",
+      fetch: msIdp.fetch,
+      now,
+      trustVerifiedEmail: true,
+    });
+    const begun = await ms.begin();
+    const tok = await msIdp.mint({ nonce: begun.nonce, tid: MICROSOFT_CONSUMER_TID, email: "pilot@alaskaair.com" });
+    msIdp.strictCode("ms-code-trusted", tok, begun.url);
+    expect(await ms.finish({ code: "ms-code-trusted", state: begun.state, expected: begun })).toMatchObject({
+      email: "pilot@alaskaair.com",
+      domain: "alaskaair.com",
+      tid: MICROSOFT_CONSUMER_TID,
+    });
+    expect(await ms.verifyIdToken(tok, begun.nonce)).toMatchObject({
+      email: "pilot@alaskaair.com",
+      domain: "alaskaair.com",
+      tid: MICROSOFT_CONSUMER_TID,
+    });
+  });
+
   test("single-tenant GUID accepts matching tid and rejects foreign tid", async () => {
     const msSingle = microsoftOidc({
       clientId: MS_CLIENT_ID,

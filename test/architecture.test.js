@@ -74,6 +74,7 @@ const NOT_ADAPTERS = {
   "server/auth/trash.js": "core: trash and restore a board or Space, the Trash list and the board-URL notice over the Registry port and tenancy (PROTOCOL.md § Trash and restore)",
   "server/auth/offboard.js": "core: leaver offboarding: the list, per-item reassignment and the removal over the Registry port and tenancy (PROTOCOL.md § Leaver offboarding)",
   "server/auth/home.js": "core: the Home screen's lists, tree and search over the Registry port and tenancy (PROTOCOL.md § Home)",
+  "server/auth/versions.js": "core: board version history & named snapshots over the Registry port and tenancy (#19)",
 };
 /** Non-port modules a driven adapter may import. */
 const SHARED = ["server/ids.js", "server/auth/util.js"];

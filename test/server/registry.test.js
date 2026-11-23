@@ -310,4 +310,42 @@ describe("sqlite registry", () => {
       await r.close();
     }
   }, 60_000);
+
+  test("backwards-compatible additive migration: an existing SQLite registry without reg_board_versions opens seamlessly and persists versions", async () => {
+    const path = file();
+    // Create a current-format DB, then drop reg_board_versions to simulate a live pre-#19 registry.db.
+    let r = sqliteRegistry({ path, fullfsync: false });
+    const t = await r.createTenant({ domain: "acme.com", admins: ["dev:owner"] });
+    const b = await mkBoard(r, { tenant: t.id, title: "Live board", owner: "dev:owner" });
+    await r.close();
+
+    const raw = new Database(path, { strict: true });
+    raw.run("DROP TABLE reg_board_versions");
+    raw.close();
+
+    // Reopen: must NOT throw old-format; must recreate reg_board_versions and support full CRUD + survive reopen.
+    r = sqliteRegistry({ path, fullfsync: false });
+    const created = await r.createBoardVersion({
+      tenantId: t.id,
+      boardId: b.id,
+      label: "Pre-release",
+      createdBy: "dev:owner",
+      createdByName: "Owner",
+      elementCount: 2,
+      snapshotJson: JSON.stringify({ elements: [{ id: "1" }, { id: "2" }] }),
+    });
+    expect(created.label).toBe("Pre-release");
+    await r.close();
+
+    r = sqliteRegistry({ path, fullfsync: false });
+    const list = await r.listBoardVersions({ tenantId: t.id, boardId: b.id });
+    expect(list).toHaveLength(1);
+    expect(list[0].id).toBe(created.id);
+    const full = await r.getBoardVersion({ tenantId: t.id, boardId: b.id, versionId: created.id });
+    expect(full?.snapshotJson).toBe(JSON.stringify({ elements: [{ id: "1" }, { id: "2" }] }));
+    // Deleting the board cleans up its versions without FK failure.
+    expect(await r.deleteBoard(b.id)).toBe(true);
+    expect(await r.listBoardVersions({ tenantId: t.id, boardId: b.id })).toEqual([]);
+    await r.close();
+  });
 });

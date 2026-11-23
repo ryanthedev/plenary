@@ -72,7 +72,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../auth/registry-port.js";
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../auth/util.js";
 import { needSchema, migrate, assertShapes, missing } from "../pg/schema.js";
 
@@ -102,6 +102,7 @@ const REGISTRY_TABLE_DDL = {
   reg_links: "n BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, board TEXT NOT NULL REFERENCES $S.reg_boards(id), role TEXT NOT NULL, expires_at BIGINT, revoked BOOLEAN NOT NULL, by_user TEXT, created_at BIGINT NOT NULL",
   reg_link_uses: "board TEXT NOT NULL, member TEXT NOT NULL, link TEXT NOT NULL REFERENCES $S.reg_links(id), n BIGINT GENERATED ALWAYS AS IDENTITY, PRIMARY KEY (board, member, link)",
   reg_audit: "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), board TEXT, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT, detail TEXT, at BIGINT NOT NULL",
+  reg_board_versions: "id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES $S.reg_tenants(id), board_id TEXT NOT NULL REFERENCES $S.reg_boards(id) ON DELETE CASCADE, label TEXT NOT NULL, created_by TEXT NOT NULL, created_by_name TEXT, created_at BIGINT NOT NULL, element_count INTEGER NOT NULL, snapshot_json TEXT NOT NULL",
   // Board organization (PROTOCOL.md § Registry, "Organization"). Every board has exactly one reg_board_spaces row.
   reg_tenant_meta: "tenant TEXT PRIMARY KEY REFERENCES $S.reg_tenants(id), kind TEXT NOT NULL",
   reg_tenant_domains: "domain TEXT PRIMARY KEY, tenant TEXT NOT NULL REFERENCES $S.reg_tenants(id), n BIGINT GENERATED ALWAYS AS IDENTITY",
@@ -129,6 +130,7 @@ export const REGISTRY_INDEXES = {
   reg_links_board: "reg_links (board)",
   reg_audit_tenant: "reg_audit (tenant, at DESC, id DESC)",
   reg_audit_board: "reg_audit (tenant, board, at DESC, id DESC)",
+  reg_board_versions_board: "reg_board_versions (tenant_id, board_id, created_at DESC, id DESC)",
   reg_spaces_tenant: "reg_spaces (tenant)",
   reg_spaces_grp: "reg_spaces (grp, id)",
   reg_groups_tenant: "reg_groups (tenant)",
@@ -192,7 +194,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
     connection: { lock_timeout: String(lockMs), statement_timeout: String(stmtMs) } });
   let open = true;
   const T = `"${s}".reg_tenants`, A = `"${s}".reg_tenant_admins`, M = `"${s}".reg_tenant_members`, BD = `"${s}".reg_boards`, G = `"${s}".reg_grants`,
-    I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`, AU = `"${s}".reg_audit`,
+    I = `"${s}".reg_invites`, L = `"${s}".reg_links`, U = `"${s}".reg_link_uses`, AU = `"${s}".reg_audit`, BV = `"${s}".reg_board_versions`,
     TM = `"${s}".reg_tenant_meta`, TD = `"${s}".reg_tenant_domains`, GR = `"${s}".reg_groups`, SP = `"${s}".reg_spaces`, BS = `"${s}".reg_board_spaces`,
     TE = `"${s}".reg_teams`, TU = `"${s}".reg_team_members`, SG = `"${s}".reg_scope_grants`, RO = `"${s}".reg_roles`, MB = `"${s}".reg_members`,
     RC = `"${s}".reg_recents`, ST = `"${s}".reg_stars`, ID = `"${s}".reg_idempotency`, AR = `"${s}".reg_access_requests`;
@@ -211,10 +213,10 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       if (!(await missing(tx, s, ["reg_tenants", "reg_spaces"])).length) {
         const haveName = await tx.unsafe(`SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'reg_tenants' AND column_name = 'name'`, [s]);
         if (!haveName.length) await tx.unsafe(`ALTER TABLE ${T} ADD COLUMN IF NOT EXISTS name TEXT`);
-        const addTables = await missing(tx, s, ["reg_tenant_members", "reg_audit"]);
+        const addTables = await missing(tx, s, ["reg_tenant_members", "reg_audit", "reg_board_versions"]);
         if (addTables.length) {
           const all = registryTables(s);
-          await tx.unsafe(addTables.map(t => all[t]).join(";\n"));
+          await tx.unsafe(addTables.map(t => `CREATE TABLE "${s}".${t} (${all[t]})`).join(";\n"));
         }
       }
       await assertShapes(tx, s, registryTables(s));   // the old-format rule, before anything is created
@@ -364,6 +366,8 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
   const rowInvite = r => r && { id: r.id, board: r.board, email: r.email, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
   const rowLink = r => r && { id: r.id, board: r.board, role: r.role, expiresAt: num(r.expires_at), revoked: !!r.revoked, by: r.by_user, createdAt: num(r.created_at) };
   const rowAudit = r => r && { id: num(r.id), tenant: r.tenant, board: r.board, actor: r.actor, action: r.action, target: r.target, detail: r.detail == null ? null : JSON.parse(r.detail), at: num(r.at) };
+  const rowVersionMeta = r => r && { id: r.id, tenantId: r.tenant_id, boardId: r.board_id, label: r.label, createdBy: r.created_by, createdByName: r.created_by_name ?? null, createdAt: num(r.created_at), elementCount: num(r.element_count) };
+  const rowVersion = r => r && { ...rowVersionMeta(r), snapshotJson: r.snapshot_json };
   const boardExists = async (q, id) => key(id) && !!(await one(q, `SELECT 1 AS x FROM ${BD} WHERE id = $1`, [id]));
 
   /** @type {import("../auth/registry-port.js").Registry & { close(): Promise<void>, settings(): Promise<object>, readSettings?(): Promise<object>, gate?: () => { running: number, waiting: number, maxInFlight: number, maxQueued: number, queueTimeoutMs: number }, idemPrune?(t: number): Promise<void>, idemSize?(): Promise<number> }} */
@@ -693,6 +697,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         await tx.unsafe(`DELETE FROM ${RC} WHERE board = $1`, [board]);
         await tx.unsafe(`DELETE FROM ${ST} WHERE board = $1`, [board]);
         await tx.unsafe(`DELETE FROM ${AR} WHERE scope_type = 'board' AND scope_id = $1`, [board]);
+        await tx.unsafe(`DELETE FROM ${BV} WHERE board_id = $1`, [board]);
         await tx.unsafe(`DELETE FROM ${BS} WHERE board = $1`, [board]);
         await tx.unsafe(`DELETE FROM ${BD} WHERE id = $1`, [board]);
         return true;
@@ -750,6 +755,7 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
         await tx.unsafe(`DELETE FROM ${RC} WHERE board = $1`, [id]);
         await tx.unsafe(`DELETE FROM ${ST} WHERE board = $1`, [id]);
         await tx.unsafe(`DELETE FROM ${AR} WHERE scope_type = 'board' AND scope_id = $1`, [id]);
+        await tx.unsafe(`DELETE FROM ${BV} WHERE board_id = $1`, [id]);
         await tx.unsafe(`DELETE FROM ${BS} WHERE board = $1`, [id]);
         const res = await tx.unsafe(`DELETE FROM ${BD} WHERE id = $1`, [id]);
         return res.count > 0;
@@ -964,6 +970,60 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const events = (hasMore ? rows.slice(0, cap) : rows).map(rowAudit);
       const last = events[events.length - 1];
       return { events, nextBefore: hasMore ? `${last.at}:${last.id}` : null };
+    },
+
+    async createBoardVersion({ tenantId, boardId, label, createdBy, createdByName = null, elementCount = 0, snapshotJson, maxPerBoard = BOARD_VERSIONS.maxPerBoard, at }) {
+      ready();
+      if (!key(tenantId) || !key(boardId)) throw new Error("registry: no such board");
+      const cap = Number.isInteger(maxPerBoard) && maxPerBoard > 0 ? maxPerBoard : BOARD_VERSIONS.maxPerBoard;
+      const ts = Number.isFinite(at) ? Math.floor(at) : now();
+      const ec = Number.isSafeInteger(elementCount) && elementCount >= 0 ? elementCount : 0;
+      const lbl = String(label);
+      const actor = String(createdBy);
+      const actorName = createdByName == null ? null : String(createdByName);
+      const snap = String(snapshotJson);
+      if (!key(lbl) || !key(actor) || (actorName !== null && !key(actorName)) || !key(snap)) throw new Error("registry: bad version payload");
+      return write(async tx => {
+        const b = await one(tx, `SELECT tenant, trashed_at FROM ${BD} WHERE id = $1 FOR UPDATE`, [boardId]);
+        if (!b || b.tenant !== tenantId) throw new Error("registry: no such board");
+        if (b.trashed_at != null) throw new RegistryError("in-trash", "the board is in Trash");
+        const cnt = await one(tx, `SELECT count(*)::int AS n FROM ${BV} WHERE tenant_id = $1 AND board_id = $2`, [tenantId, boardId]);
+        if ((cnt?.n ?? 0) >= cap) throw new RegistryError("limit", "registry: board version limit reached");
+        const id = await fresh(tx, mint.version, BV);
+        await tx.unsafe(
+          `INSERT INTO ${BV} (id, tenant_id, board_id, label, created_by, created_by_name, created_at, element_count, snapshot_json)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [id, tenantId, boardId, lbl, actor, actorName, ts, ec, snap],
+        );
+        return { id, tenantId, boardId, label: lbl, createdBy: actor, createdByName: actorName, createdAt: ts, elementCount: ec };
+      });
+    },
+    async listBoardVersions({ tenantId, boardId, limit = BOARD_VERSIONS.maxPerBoard } = /** @type {any} */ ({})) {
+      ready();
+      if (!key(tenantId) || !key(boardId)) return [];
+      const cap = Math.min(BOARD_VERSIONS.maxPerBoard, Math.max(1, Math.floor(Number(limit) || BOARD_VERSIONS.maxPerBoard)));
+      const rows = await db.unsafe(
+        `SELECT id, tenant_id, board_id, label, created_by, created_by_name, created_at, element_count
+         FROM ${BV} WHERE tenant_id = $1 AND board_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3`,
+        [tenantId, boardId, cap],
+      );
+      return rows.map(rowVersionMeta);
+    },
+    async getBoardVersion({ tenantId, boardId, versionId } = /** @type {any} */ ({})) {
+      ready();
+      if (!key(tenantId) || !key(boardId) || !key(versionId)) return null;
+      const r = await one(
+        db,
+        `SELECT id, tenant_id, board_id, label, created_by, created_by_name, created_at, element_count, snapshot_json
+         FROM ${BV} WHERE id = $1 AND tenant_id = $2 AND board_id = $3`,
+        [versionId, tenantId, boardId],
+      );
+      return rowVersion(r);
+    },
+    async deleteBoardVersion({ tenantId, boardId, versionId } = /** @type {any} */ ({})) {
+      ready();
+      if (!key(tenantId) || !key(boardId) || !key(versionId)) return false;
+      return write(async tx => (await tx.unsafe(`DELETE FROM ${BV} WHERE id = $1 AND tenant_id = $2 AND board_id = $3`, [versionId, tenantId, boardId])).count > 0);
     },
 
     // ---- organization (PROTOCOL.md § Registry, "Organization") ----

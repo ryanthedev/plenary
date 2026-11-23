@@ -81,6 +81,7 @@ export const REGISTRY_METHODS = Object.freeze([
   "grants", "createInvite", "invite", "invites", "invitesFor", "revokeInvite",
   "createLink", "link", "links", "revokeLink", "addLinkUse", "linkUses",
   "appendAudit", "listAudit",
+  "createBoardVersion", "listBoardVersions", "getBoardVersion", "deleteBoardVersion",
   "idemGet", "markOpened", "recents", "setStarred", "starred", "starredAmong",
   "sharedBoards", "searchBoards", "spaceCandidates", "groupCandidates", "requestAccess", "accessRequest",
   "accessRequests", "closeAccessRequest", "grantHolders", "boardRows", "memberState", "ownedAlone", "reassignOwner", "removeMember", "close",
@@ -108,6 +109,7 @@ export const mint = {
   invite: () => "i-" + randomId(16),
   link: () => randomId(26),
   request: () => "ar-" + randomId(12),
+  version: () => "v-" + randomId(16),
 };
 
 /**
@@ -133,6 +135,8 @@ export const mint = {
  * @typedef {{ id: string, board: string, role: Role, expiresAt: number|null, revoked: boolean, by: string, createdAt: number }} Link
  * @typedef {{ id: number, tenant: string, board: string|null, actor: string, action: string, target: string|null, detail: any, at: number }} AuditEvent
  * @typedef {{ events: AuditEvent[], nextBefore: string|null }} AuditPage
+ * @typedef {{ id: string, tenantId: string, boardId: string, label: string, createdBy: string, createdByName: string|null, createdAt: number, elementCount: number }} BoardVersionMeta
+ * @typedef {BoardVersionMeta & { snapshotJson: string }} BoardVersion
  *
  * @typedef {{
  *   createTenant(o: { name?: string|null, domain: string|null, domains?: string[], kind?: UnitKind, admins?: string[] }): Promise<Tenant>,   // kind default "company"; `domain` + `domains` (all lower-cased, de-duplicated) are the Unit's domains; a domain has one tenant
@@ -223,6 +227,10 @@ export const mint = {
  *   linkUsesFor?(board: string, users: string[]): Promise<Map<string, string[]>>,   // OPTIONAL batch (below)
  *   appendAudit(o: { tenant: string, board?: string|null, actor: string, action: string, target?: string|null, detail?: any, at?: number }): Promise<AuditEvent>,
  *   listAudit(o: { tenant: string, board?: string|null, limit?: number, before?: string|null }): Promise<AuditPage>,
+ *   createBoardVersion(o: { tenantId: string, boardId: string, label: string, createdBy: string, createdByName?: string|null, elementCount: number, snapshotJson: string, maxPerBoard?: number, at?: number }): Promise<BoardVersionMeta>,   // atomically enforces maxPerBoard (code "limit") and board/tenant match
+ *   listBoardVersions(o: { tenantId: string, boardId: string, limit?: number }): Promise<BoardVersionMeta[]>,   // metadata only (omits snapshot_json), newest first
+ *   getBoardVersion(o: { tenantId: string, boardId: string, versionId: string }): Promise<BoardVersion|null>,
+ *   deleteBoardVersion(o: { tenantId: string, boardId: string, versionId: string }): Promise<boolean>,
  *   idemGet(idem: Idem): Promise<{ state: "none" } | { state: "done", ref: string } | { state: "mismatch" }>,   // read-only: is there a live row for (user, key), and for this fingerprint
  *   markOpened(user: string, board: string): Promise<void>,   // Home (PROTOCOL.md § Home): Recent. Upserts (user, board) at now(); keeps the user's newest RECENT_KEEP rows; rejects an unknown board
  *   recents(user: string, o?: { limit?: number }): Promise<{ board: string, at: number }[]>,   // newest first; limit default 12, at most RECENT_KEEP
@@ -276,6 +284,8 @@ export const askLimits = o => {
 /** Home (PROTOCOL.md § Home): rows kept per user in Recent, rows a starred / shared read may return, and the most boards one `boardRows` / `starredAmong` call takes. */
 /** Trash (PROTOCOL.md § Trash and restore): how long a trashed board stays restorable, the page of the Trash reads, the most a sweep handles, and the cap a Space's board count is taken to. */
 export const TRASH = Object.freeze({ ttlMs: 30 * 24 * 3600_000, page: { default: 50, max: 200 }, due: { default: 100, max: 500 }, sizeCap: 1000 });
+/** Board version history (#19): max saved versions per board, max snapshot JSON payload size (bytes), and max label length. */
+export const BOARD_VERSIONS = Object.freeze({ maxPerBoard: 50, maxSnapshotBytes: 2 * 1024 * 1024, maxLabelLength: 120 });
 /** Idempotent creates (PROTOCOL.md): a key row is kept `ttlMs`; expired rows are pruned `prune` at a time, every `every`-th keyed create. */
 export const IDEM = Object.freeze({ ttlMs: 24 * 3600_000, prune: 500, every: 64 });
 /** @typedef {{ user: string, key: string, fp: string }} Idem  The Idempotency-Key of a create: its user, the key, the SHA-256 fingerprint of the request. */

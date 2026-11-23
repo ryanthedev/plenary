@@ -41,13 +41,14 @@
 //     `identity.exp` and the same object goes on to role(identity, board) and the admin use cases unchanged.
 
 /**
- * @typedef {{ user: string, name: string|null, email: string|null, domain: string|null, emailVerified?: boolean }} Identity
+ * @typedef {{ user: string, name: string|null, email: string|null, domain: string|null, emailVerified?: boolean, tid?: string|null }} Identity
  *
  * @typedef {{ url: string, state: string, nonce: string, verifier: string }} LoginStart
  *
  * @typedef {{
  *   begin(): Promise<LoginStart>,
  *   finish(o: { code: unknown, state: unknown, expected: Partial<LoginStart>|null|undefined, why?: (cause: string) => void }): Promise<Identity|null>,
+ *   providerId?: string,
  *   displayName?: string,
  *   tenantDomain?: string,
  * }} IdP

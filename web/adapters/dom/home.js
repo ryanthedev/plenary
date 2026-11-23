@@ -201,7 +201,7 @@ function prefillNewBoardTitle(dlg, boardTitle) {
  *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
  *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"|"listTenantMembers"|"addTenantMember"|"removeTenantMember"|"adminAudit"> | null,
  *   storage?: import("../../ports/storage.js").Storage | null,
- *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string } | null }} o
+ *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string, links?: Array<{ href: string, text?: string }> } | null }} o
  * @returns {{ destroy(): void }}
  */
 export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null }) {
@@ -696,8 +696,14 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   function renderMain() {
     if (S.status === "loading" && !S.data) return replace(main, h("p.muted", {}, "Loading…"));
     if (S.status === "error") return replace(main, empty({ title: "Could not load Home.", detail: "The server did not answer. Check your connection and try again." }), mark(h("button.btn", { type: "button", onclick: () => model.load() }, "Try again"), "retry"));
-    if (S.status === "signed-out") return replace(main, empty({ title: "You are signed out.", detail: "Sign in again to see your boards." }),
-      signIn ? h("a.btn.primary", { href: signIn.href }, signIn.text ?? "Sign in") : null);
+    if (S.status === "signed-out") {
+      const signInButtons = signIn
+        ? (Array.isArray(signIn.links) && signIn.links.length
+          ? h("div.gate-links", {}, signIn.links.map((l, i) => h(i === 0 ? "a.btn.primary" : "a.btn", { href: l.href }, l.text ?? "Sign in")))
+          : h("a.btn.primary", { href: signIn.href }, signIn.text ?? "Sign in"))
+        : null;
+      return replace(main, empty({ title: "You are signed out.", detail: "Sign in again to see your boards." }), signInButtons);
+    }
     if (!S.query.trim() && panel === "members" && S.data && !S.data.guest && S.data.unit?.personal && S.data.unit?.isAdmin && org) return renderMembersPanel();
     if (!S.query.trim() && panel === "audit" && S.data && !S.data.guest && S.data.unit?.isAdmin && org && typeof org.adminAudit === "function") return renderAuditPanel();
     const m = model.main();

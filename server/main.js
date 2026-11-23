@@ -98,7 +98,7 @@ import { sqliteRegistry } from "./adapters/driven/registry/sqlite.js";
 import { tenancy as makeTenancy, roleCache } from "./core/auth/tenancy.js";
 import { offboardService } from "./core/auth/offboard.js";
 import { sessions as makeSessions } from "./adapters/driven/auth/session.js";
-import { googleOidc, genericOidc } from "./adapters/driven/auth/oidc.js";
+import { googleOidc, microsoftOidc, genericOidc } from "./adapters/driven/auth/oidc.js";
 import { httpRoutes, REQUEST_DEADLINE_MS } from "./adapters/driving/auth-http.js";
 import { homeService, recentRecorder } from "./core/auth/home.js";
 import { spaceService } from "./core/auth/spaces.js";
@@ -164,6 +164,7 @@ export function nodeConfig(env, host = osHostname()) {
   }
   checkInnerLimits(requestDeadlineMs, { ...(cluster ? { "the Postgres Registry's statement and lock limits": REGISTRY_LIMIT_MS } : { "the SQLite Registry's busy timeout": SQLITE_BUSY_MS }),
     ...(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { "Google's request timeout": OIDC_TIMEOUT_MS } : {}),
+    ...(env.MICROSOFT_CLIENT_ID && env.MICROSOFT_CLIENT_SECRET ? { "Microsoft's request timeout": OIDC_TIMEOUT_MS } : {}),
     ...(env.OIDC_ISSUER_URL && env.OIDC_CLIENT_ID && env.OIDC_CLIENT_SECRET ? { "OIDC's request timeout": OIDC_TIMEOUT_MS } : {}) });
   return { cluster, node, roles, leaseTtlMs, requestDeadlineMs };
 }
@@ -431,18 +432,21 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // Hellos read roles through a per-process cache; the gateway invalidates it on `grants` and its timed pass reads fresh (p5-load).
   const roleCached = roleCache({ registry, now: Date.now });
   const auth = authPort({ sessions, dev, tenancy: roleCached });
-  // Sign-in: generic OIDC when OIDC_ISSUER_URL + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET are set;
-  // otherwise Google OIDC when GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET are set; else /auth answers 503.
+  // Sign-in: Google, Microsoft Entra ID, and/or generic OIDC may be configured simultaneously.
   const hasGenericOidc = Boolean(env.OIDC_ISSUER_URL && env.OIDC_CLIENT_ID && env.OIDC_CLIENT_SECRET);
   const hasAnyGenericOidc = Boolean(env.OIDC_ISSUER_URL || env.OIDC_CLIENT_ID || env.OIDC_CLIENT_SECRET);
   const hasGoogle = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
-  if (hasGenericOidc && hasGoogle) {
-    throw new Error("both generic OIDC (OIDC_ISSUER_URL) and Google sign-in (GOOGLE_CLIENT_ID) are configured: pick one");
-  }
+  const hasMicrosoft = Boolean(env.MICROSOFT_CLIENT_ID && env.MICROSOFT_CLIENT_SECRET);
   const csv = v => String(v ?? "").split(",").map(s => s.trim()).filter(Boolean);
   const isProd = env.NODE_ENV === "production" || cluster;
   const allowHttpLocalhost = env.OIDC_ALLOW_HTTP_LOCALHOST === "1" || env.OIDC_ALLOW_HTTP_LOCALHOST === "true"
     || (!isProd && LOOPBACK_HOSTS.includes(publicHostOf(origin) ?? ""));
+  const googleOidcAdapter = hasGoogle
+    ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
+    : null;
+  const microsoftOidcAdapter = hasMicrosoft
+    ? microsoftOidc({ clientId: env.MICROSOFT_CLIENT_ID, clientSecret: env.MICROSOFT_CLIENT_SECRET, tenant: env.MICROSOFT_TENANT_ID, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
+    : null;
   const genericOidcAdapter = hasGenericOidc
     ? genericOidc({
       issuerUrl: env.OIDC_ISSUER_URL,
@@ -462,17 +466,22 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
       timeoutMs: OIDC_TIMEOUT_MS,
     })
     : null;
-  const oidc = genericOidcAdapter
-    ?? (hasGoogle
-      ? googleOidc({ clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET, redirectUri, fetch: fetchFn, timeoutMs: OIDC_TIMEOUT_MS })
-      : null);
-  log.info("sign-in", { google: hasGoogle, oidc: hasGenericOidc, devTokens: dev.enabled, cluster });
+  /** @type {{ id: string, label: string, idp: import("./ports/idp.js").IdP }[]} */
+  const providers = [
+    ...(googleOidcAdapter ? [{ id: "google", label: "Google", idp: googleOidcAdapter }] : []),
+    ...(microsoftOidcAdapter ? [{ id: "microsoft", label: "Microsoft", idp: microsoftOidcAdapter }] : []),
+    ...(genericOidcAdapter ? [{ id: "oidc", label: genericOidcAdapter.displayName || "SSO", idp: genericOidcAdapter }] : []),
+  ];
+  const oidc = providers[0]?.idp ?? null;
+  log.info("sign-in", { google: hasGoogle, microsoft: hasMicrosoft, oidc: hasGenericOidc, devTokens: dev.enabled, cluster });
   if (hasAnyGenericOidc && !hasGenericOidc) {
     const missing = ["OIDC_ISSUER_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"].filter(k => !env[k]);
     log.warn(`generic OIDC sign-in is half configured: ${missing.join(", ")} missing, so it stays off`);
   }
   if (!!env.GOOGLE_CLIENT_ID !== !!env.GOOGLE_CLIENT_SECRET)
     log.warn(`Google sign-in is half configured: ${env.GOOGLE_CLIENT_ID ? "GOOGLE_CLIENT_SECRET" : "GOOGLE_CLIENT_ID"} is missing, so it stays off`);
+  if (!!env.MICROSOFT_CLIENT_ID !== !!env.MICROSOFT_CLIENT_SECRET)
+    log.warn(`Microsoft sign-in is half configured: ${env.MICROSOFT_CLIENT_ID ? "MICROSOFT_CLIENT_SECRET" : "MICROSOFT_CLIENT_ID"} is missing, so it stays off`);
   // Ensure the issuer-bound tenant exists for generic OIDC so self-hosted users can sign in and create boards immediately,
   // and optionally grant Unit admin to configured `OIDC_ADMIN_USERS` (bare `sub` or full `oidc:<slug>:<sub>`).
   if (genericOidcAdapter) {
@@ -605,6 +614,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
     requestDeadlineMs,
+    autoProvisionDomainOrgs: env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS !== "0",
   };
   if (devMenu) config.devSignIn = devMenu;
   const home = homeService({ registry, tenancy });
@@ -619,7 +629,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   };
   let server;
   const snapshot = { get: (board, seq) => server?.gateway?.snapshot(board, seq) ?? null };
-  const http = httpRoutes({ registry, sessions, oidc, tenancy, home, spaces, access, offboard, now: Date.now, config, log: log.child({ component: "auth" }), snapshot, snapshotTickets, ...(dev.enabled ? { dev } : {}) });
+  const http = httpRoutes({ registry, sessions, oidc, providers, tenancy, home, spaces, access, offboard, now: Date.now, config, log: log.child({ component: "auth" }), snapshot, snapshotTickets, ...(dev.enabled ? { dev } : {}) });
   server = createServer({ auth, registry, store, bus, blobs, blobKey, snapshotTickets, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), blobUsageTtlMs: Number(reapRaw ?? 600_000), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs }, metrics, ...(prom ? { metricsEndpoint: { token: metricsToken, render: prom.render } } : {}) });
   // The purge of Trash: every node sweeps on a timer (the claim is a conditional write and every delete a no-op the second time, so two nodes are safe). The timer is the only wall-clock wait; tests drive `sweep()` on an injected clock.
@@ -630,7 +640,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const reaper = roles.gateway ? blobReaper({ store, blobs, clock: { now: Date.now }, log: log.child({ component: "blob-reaper" }), onDeleted: tenant => server.recountBlobs(tenant) }) : null;
   const reapTimer = reaper && setInterval(() => { reaper.sweep().then(r => { if (r.deleted || r.failed) log.info("blob sweep", r); }); }, Number(reapRaw ?? 600_000));
   reapTimer?.unref?.();
-  return { server, store, bus, registry, log, devBoard, sweeper, reaper, oidc, node, roles, cluster, clusterId, leaseTtlMs,
+  return { server, store, bus, registry, log, devBoard, sweeper, reaper, oidc, providers, node, roles, cluster, clusterId, leaseTtlMs,
     async stop() { clearInterval(sweepTimer); clearInterval(reapTimer); await server.stop(); await Promise.race([access.settled().then(() => spaces.settled()), new Promise(r => setTimeout(r, 2000).unref?.())]);   // let grants announcements finish (bounded)
       spaces.close();                                   // nothing more starts against the buses and stores closed below
       await bus.close(); await rawStore.close(); await rawRegistry.close(); } };

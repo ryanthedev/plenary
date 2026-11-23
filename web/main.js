@@ -16,7 +16,7 @@
 import { browserClock } from "./adapters/clock/browser.js";
 import { sessionStore } from "./adapters/storage/session.js";
 import { localStore } from "./adapters/storage/local.js";
-import { httpAuth } from "./adapters/auth/http.js";
+import { httpAuth, fetchAuthProviders } from "./adapters/auth/http.js";
 import { httpDevConfig } from "./adapters/auth/devconfig.js";
 import { wsNet, sameOriginWsUrl, browserInflate } from "./adapters/transport/ws.js";
 import { mountApp } from "./adapters/dom/app.js";
@@ -95,10 +95,16 @@ if (!signIn.token) {
   if (board) rememberBoard(tabStore, board);
   const wanted = asParam(location.search);
   const hint = menu ? (wanted ? `There is no dev user "${wanted}" on this server. ` : "") + "Dev sign-in is on: pick a user." : null;
+  const authProviders = menu ? null : await fetchAuthProviders({ fetch: fetchNow, timers: clock });
+  const providerLinks = authProviders && authProviders.length ? authProviders : [signInLink];
+  const defaultDetail = providerLinks.length > 1 || providerLinks[0]?.id === "microsoft"
+    ? "Sign in with your work account to open this board."
+    : "Sign in with your work Google account to open this board.";
   showGate({
     title: "Sign in to Plenary",
-    detail: signInNotice(/** @type {any} */ ({ ...signIn, dev: null })) ?? hint ?? "Sign in with your work Google account to open this board.",
-    link: menu ? null : signInLink, links: menu ? devLinks(menu, board ?? menu.board) : [],
+    detail: signInNotice(/** @type {any} */ ({ ...signIn, dev: null })) ?? hint ?? defaultDetail,
+    link: menu ? null : providerLinks[0],
+    links: menu ? devLinks(menu, board ?? menu.board) : providerLinks.slice(1),
   });
 } else {
   const spacesApi = httpSpaces({ fetch: fetchNow, token: signIn.token, timers: clock });

@@ -103,7 +103,7 @@ import { versionService } from "../../core/auth/versions.js";
 import { ComplianceError, exportBoardData, exportTenantData, eraseUserData } from "../../core/auth/compliance.js";
 import { createLinkRateLimiter } from "../../core/auth/share-policy.js";
 import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, verifyLinkAccess, setGrant, shareView, listBoardAudit, listTenantAudit } from "../../core/admin/boards.js";
-import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../../core/admin/tenants.js";
+import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember, provisionDomainTenant } from "../../core/admin/tenants.js";
 
 const defaultLinkRateLimiter = createLinkRateLimiter();
 
@@ -150,6 +150,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   registry: import("../../ports/registry.js").Registry,
  *   sessions: { issue(id: import("../../ports/idp.js").Identity): Promise<string>, verify(t: string): Promise<import("../../ports/idp.js").Session|null>, verifySnapshotTicket?(t: string): Promise<{ board: string, seq: number, exp: number }|null> },
  *   oidc?: import("../../ports/idp.js").IdP | null,
+ *   providers?: Array<{ id: string, label?: string, idp: import("../../ports/idp.js").IdP }> | Record<string, import("../../ports/idp.js").IdP> | null,
  *   tenancy: ReturnType<typeof import("../../core/auth/tenancy.js").tenancy>,
  *   home?: ReturnType<typeof import("../../core/auth/home.js").homeService> | null,
  *   now?: () => number,
@@ -171,7 +172,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
  *   timers?: { set(fn: () => void, ms: number): any, clear(h: any): void },
  * }} deps
  */
-export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), versions = versionService({ registry, tenancy, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, linkRateLimiter = defaultLinkRateLimiter, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+export function httpRoutes({ registry, sessions, oidc = null, providers = null, tenancy, home = null, now = Date.now, explainer = explainService({ registry, now }), spaces = spaceService({ registry, tenancy, home, now, explainer }), moves = moveService({ registry, tenancy, spaces, now }), trash = trashService({ registry, tenancy, spaces, now }), access = accessService({ registry, tenancy, now, explainer, announce: spaces.announceChange, backlog: spaces.backlog, settled: spaces.settled }), roles = rolesService({ registry, tenancy, announce: spaces.announceChange }), offboard = offboardService({ registry, tenancy, announce: spaces.announceChange }), versions = versionService({ registry, tenancy, now }), config = {}, dev = null, log = stdoutLog, testHooks = null, snapshot = null, snapshotTickets = null, linkRateLimiter = defaultLinkRateLimiter, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
   if (!registry || !sessions || !tenancy) throw new Error("http: registry, sessions and tenancy are required");
   /** `p`, or a rejection with message "timeout" after `ms` on the injected timers. */
   const bounded = (p, ms) => new Promise((res, rej) => { const t = timers.set(() => rej(new Error("timeout")), ms); p.then(v => { timers.clear(t); res(v); }, e => { timers.clear(t); rej(e); }); });
@@ -197,9 +198,33 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   const maxBody = Number.isInteger(config.maxBody) && config.maxBody > 0 ? config.maxBody : 16_384;
   const versionMaxBody = Math.max(maxBody, BOARD_VERSIONS.maxSnapshotBytes + 4096);
 
-  // ---- login cookie ----
+  // ---- providers & login cookie ----
+  /** @type {{ id: string, label: string, idp: import("../../ports/idp.js").IdP }[]} */
+  const providerList = [];
+  if (Array.isArray(providers)) {
+    for (const p of providers) {
+      if (!p?.idp || typeof p.id !== "string" || !p.id.trim()) continue;
+      const id = p.id.trim().toLowerCase();
+      if (providerList.some(x => x.id === id)) continue;
+      providerList.push({ id, label: String(p.label || p.idp.displayName || id), idp: p.idp });
+    }
+  } else if (providers && typeof providers === "object") {
+    for (const [rawId, idp] of Object.entries(providers)) {
+      if (!idp) continue;
+      const id = rawId.trim().toLowerCase();
+      if (!id || providerList.some(x => x.id === id)) continue;
+      providerList.push({ id, label: String(idp.displayName || id), idp });
+    }
+  } else if (oidc) {
+    const id = String(oidc.providerId || (oidc.displayName === "Microsoft" ? "microsoft" : oidc.displayName === "Google" ? "google" : "oidc")).toLowerCase();
+    providerList.push({ id, label: String(oidc.displayName || "Google"), idp: oidc });
+  }
+  const providerMap = new Map(providerList.map(p => [p.id, p]));
+  const hasOidc = providerList.length > 0;
+  const autoProvisionDomainOrgs = Boolean(config.autoProvisionDomainOrgs);
+
   let macKey = null;
-  if (oidc) {
+  if (hasOidc) {
     const raw = typeof config.cookieKey === "string" ? utf8(config.cookieKey) : config.cookieKey;
     if (!(raw instanceof Uint8Array) || raw.length < 32) throw new Error("http: config.cookieKey must be at least 32 bytes");
     macKey = crypto.subtle.importKey("raw", /** @type {BufferSource} */ (raw), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
@@ -208,9 +233,9 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   const clearXchg = `${EXCHANGE_COOKIE}=; ${XCHG_ATTRS}; Max-Age=0`;
   const appOrigin = new URL(postLoginUrl).origin;
 
-  async function sealLogin({ state, nonce, verifier, link }) {
+  async function sealLogin({ state, nonce, verifier, link, provider }) {
     const exp = Math.floor(now() / 1000) + LOGIN_TTL_SEC;
-    const payload = b64url(utf8(JSON.stringify({ s: state, n: nonce, v: verifier, ...(link ? { l: link } : {}), exp })));
+    const payload = b64url(utf8(JSON.stringify({ s: state, n: nonce, v: verifier, ...(link ? { l: link } : {}), ...(provider ? { p: provider } : {}), exp })));
     const mac = b64url(await crypto.subtle.sign("HMAC", await macKey, utf8("l1." + payload)));
     return `${LOGIN_COOKIE}=l1.${payload}.${mac}; ${COOKIE_ATTRS}; Max-Age=${LOGIN_TTL_SEC}`;
   }
@@ -224,7 +249,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       const c = JSON.parse(fromUtf8(unb64url(parts[1])));
       if (!c || !Number.isFinite(c.exp) || Math.floor(now() / 1000) >= c.exp) return null;
       if (![c.s, c.n, c.v].every(x => typeof x === "string" && x)) return null;
-      return { state: c.s, nonce: c.n, verifier: c.v, link: typeof c.l === "string" ? c.l : null };
+      return { state: c.s, nonce: c.n, verifier: c.v, link: typeof c.l === "string" ? c.l : null, provider: typeof c.p === "string" ? c.p : null };
     } catch { return null; }
   }
   // States already used in THIS process (defence in depth against a replayed callback; not shared across gateways,
@@ -313,7 +338,7 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
   }
 
   async function exchange(req) {
-    if (!oidc) return err(503, "sign-in-unavailable");
+    if (!hasOidc) return err(503, "sign-in-unavailable");
     // Origin first: a refusal here spends nothing (the contract's fake does the same).
     if (req.headers.get("origin") !== appOrigin) return err(403, "bad-origin");
     const b = await body(req, ["code"]);
@@ -335,21 +360,26 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
 
-  async function beginLogin(link) {
-    if (!oidc) return err(503, "sign-in-unavailable");
+  async function beginLogin(link, requestedProvider = null) {
+    if (!hasOidc) return err(503, "sign-in-unavailable");
+    const rawProvider = typeof requestedProvider === "string" ? requestedProvider.trim().toLowerCase() : "";
+    const selected = rawProvider ? (providerMap.get(rawProvider) ?? null) : providerList[0];
+    if (!selected) return err(400, "unknown-provider");
     let b;
-    try { b = await oidc.begin(); } catch { return err(503, "unavailable"); }
-    return redirect(b.url, [await sealLogin({ ...b, link })]);
+    try { b = await selected.idp.begin(); } catch { return err(503, "unavailable"); }
+    return redirect(b.url, [await sealLogin({ ...b, link, provider: selected.id })]);
   }
 
   /** One "sign-in failed" line; a broken logger never changes the answer. */
   const failed = cause => { try { log?.warn?.("sign-in failed", { cause }); } catch { /* logging is best effort */ } };
 
   async function callback(req, url) {
-    if (!oidc) return err(503, "sign-in-unavailable");
+    if (!hasOidc) return err(503, "sign-in-unavailable");
     const fail = cause => { failed(cause); return withCookie(err(400, "login-failed"), clearLogin); };
     const expected = await openLogin(req);
     if (!expected) return fail(cookie(req, LOGIN_COOKIE) === null ? "no_login_cookie" : "bad_login_cookie");
+    const selected = (expected.provider ? providerMap.get(expected.provider) : providerList[0]) ?? null;
+    if (!selected) return fail("bad_login_cookie");
     const state = url.searchParams.get("state"), code = url.searchParams.get("code");
     if (url.searchParams.has("error")) {
       const e = url.searchParams.get("error");
@@ -366,11 +396,15 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
     // Label-shaped only: 1-4 short lowercase words joined by "_", optionally "_<3 digits>" (token_http_502). A state,
     // nonce or code (32+ random chars, or mixed case) can never pass, whatever an adapter hands `why`.
     const why = c => { if (cause === null && typeof c === "string" && /^[a-z]{1,12}(?:_[a-z]{1,12}){0,3}(?:_\d{3})?$/.test(c)) cause = c; };
-    try { identity = await oidc.finish({ code, state, expected, why }); } catch { identity = null; cause ??= "idp_threw"; }
+    try { identity = await selected.idp.finish({ code, state, expected, why }); } catch { identity = null; cause ??= "idp_threw"; }
     if (!identity) return fail(cause ?? "idp_refused");
     const used = usedStates.use(expected.state);
     if (used === "replay") return fail("state_used");
     if (used === "full") { failed("replay_guard_full"); return withCookie(err(503, "unavailable"), clearLogin); }
+    if (autoProvisionDomainOrgs) {
+      try { await provisionDomainTenant({ caller: identity }, { registry, now }); }
+      catch { try { log?.warn?.("domain org auto-provision failed"); } catch {} }
+    }
     let x;
     try { x = await mintCode(identity); } catch { failed("mint_failed"); return withCookie(err(503, "unavailable"), clearLogin); }
     const frag = "#code=" + x.code;   // base64url: URL-safe as is
@@ -575,7 +609,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       }
       return users.length ? json(200, { board: devMenu.board, users }) : err(404, "not-found");
     } }]] : []),
-    ["/auth/login", { GET: () => beginLogin(null) }],
+    ["/auth/providers", { GET: () => json(200, { providers: providerList.map(p => ({ id: p.id, label: p.label })) }) }],
+    ["/auth/login", { GET: (_req, url) => beginLogin(null, url.searchParams.get("provider")) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],
     ["/auth/logout", { GET: () => redirect(postLogoutUrl, [clearLogin]) }],
@@ -952,8 +987,8 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       }],
     ] : []),
     ["/links/:id", {
-      GET: async (req, p) => {
-        if (!req.headers.has("authorization")) return beginLogin(p.id.slice(0, 128));
+      GET: async (req, p, url) => {
+        if (!req.headers.has("authorization")) return beginLogin(p.id.slice(0, 128), url.searchParams.get("provider"));
         const who = await caller(req);
         // Passcodes are never accepted in URL query strings (prevents browser history / access-log leakage).
         const passcode = req.headers.get("x-link-passcode") ?? undefined;

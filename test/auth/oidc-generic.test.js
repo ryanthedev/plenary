@@ -552,12 +552,19 @@ describe("server/main.js generic OIDC wiring", () => {
     const logs = [];
     let app;
     try {
-      // Refuses when BOTH Google and generic OIDC are configured (prevents silently locking out Google users)
-      await expect(start({
-        PORT: "0", HOST: "127.0.0.1", PLENARY_DATA_DIR: dir, COOKIE_KEY: "k".repeat(32),
+      // Allows configuring Google and generic OIDC simultaneously (multi-provider auth)
+      const dualDir = mkdtempSync(join(tmpdir(), "plenary-oidc-dual-"));
+      const dualApp = await start({
+        PORT: "0", HOST: "127.0.0.1", PLENARY_DATA_DIR: dualDir, COOKIE_KEY: "k".repeat(32),
         OIDC_ISSUER_URL: net.issuer, OIDC_CLIENT_ID: CLIENT_ID, OIDC_CLIENT_SECRET: CLIENT_SECRET,
         GOOGLE_CLIENT_ID: "g-id", GOOGLE_CLIENT_SECRET: "g-sec",
-      }, { fetch: net.fetch, write: () => {} })).rejects.toThrow("pick one");
+      }, { fetch: net.fetch, write: () => {} });
+      try {
+        expect(dualApp.providers.map(p => p.id)).toEqual(["google", "oidc"]);
+      } finally {
+        await dualApp.stop();
+        rmSync(dualDir, { recursive: true, force: true });
+      }
 
       app = await start({
         PORT: "0",

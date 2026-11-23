@@ -83,3 +83,51 @@ export function httpAuth({ fetch, base = "", timeoutMs = 10_000, timers = null }
     },
   };
 }
+
+/**
+ * Fetch the enabled OIDC sign-in providers from `GET /auth/providers`.
+ * Never rejects; returns an array of `{ id, label, href, text }` on 200 JSON, or `null` if unavailable/malformed
+ * (so callers can fall back gracefully to the default `/auth/login` link).
+ * @param {{ fetch: typeof globalThis.fetch, base?: string, timeoutMs?: number,
+ *   timers?: { set(fn: () => void, ms: number): any, clear(h: any): void } }} o
+ * @returns {Promise<Array<{ id: string, label: string, href: string, text: string }> | null>}
+ */
+export async function fetchAuthProviders({ fetch, base = "", timeoutMs = 5_000, timers = null }) {
+  if (typeof fetch !== "function") return null;
+  const set = timers ? timers.set : (fn, ms) => setTimeout(fn, ms);
+  const clear = timers ? timers.clear : h => clearTimeout(h);
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  let timer = null;
+  const timeout = new Promise(resolve => {
+    timer = set(() => { try { ctl?.abort(); } catch {} resolve(null); }, timeoutMs);
+  });
+  async function ask() {
+    const res = await fetch(`${base}/auth/providers`, {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "error",
+      signal: ctl?.signal,
+    });
+    if (res?.status !== 200) return null;
+    const raw = JSON.parse(await res.text());
+    const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.providers) ? raw.providers : null);
+    if (!list) return null;
+    const out = [];
+    const seen = new Set();
+    for (const p of list.slice(0, 16)) {
+      if (!p || typeof p.id !== "string" || !/^[a-z0-9_-]{1,32}$/i.test(p.id)) continue;
+      const id = p.id.toLowerCase();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const label = typeof p.label === "string" && p.label.trim() ? p.label.trim().slice(0, 64) : id;
+      out.push({ id, label, href: `${base}/auth/login?provider=${encodeURIComponent(id)}`, text: `Sign in with ${label}` });
+    }
+    return out;
+  }
+  try {
+    return await Promise.race([ask().catch(() => null), timeout]);
+  } finally {
+    clear(timer);
+  }
+}

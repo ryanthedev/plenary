@@ -63,7 +63,7 @@ export function teamIndex(ctx) {
 export function isUnitAdmin(tenant, identity) {
   if (!tenant || typeof identity?.user !== "string") return false;
   if (!identity.user.startsWith("email:") && tenant.admins.includes(identity.user)) return true;
-  if (!identity.user.startsWith("google:")) return false;
+  if (!identity.user.startsWith("google:") && !identity.user.startsWith("microsoft:")) return false;
   const email = normEmail(identity.email);
   return !!email && isUnitMember(tenant, identity) && tenant.admins.includes("email:" + email);
 }

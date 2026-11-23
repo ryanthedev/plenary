@@ -17,6 +17,30 @@ export const GOOGLE = {
   issuers: ["https://accounts.google.com", "accounts.google.com"],
 };
 
+/** Well-known Microsoft Entra ID tenant ID for personal Microsoft accounts (MSA: outlook.com, hotmail.com, etc.). */
+export const MICROSOFT_CONSUMER_TID = "9188040d-6c67-4c5b-b112-36a304b66dad";
+const MICROSOFT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MICROSOFT_SPECIAL_TENANTS = new Set(["common", "organizations", "consumers"]);
+
+/**
+ * Validate and normalize a Microsoft Entra ID tenant segment (`"common"`, `"organizations"`, `"consumers"`, or a GUID)
+ * and return its v2.0 OIDC endpoints.
+ * @param {string} [rawTenant]
+ */
+export function microsoftEndpoints(rawTenant = "common") {
+  const tenant = String(rawTenant ?? "common").trim().toLowerCase() || "common";
+  if (!MICROSOFT_SPECIAL_TENANTS.has(tenant) && !MICROSOFT_UUID_RE.test(tenant)) {
+    throw new Error("oidc: invalid Microsoft tenant id");
+  }
+  const base = `https://login.microsoftonline.com/${tenant}`;
+  return {
+    tenant,
+    authorize: `${base}/oauth2/v2.0/authorize`,
+    token: `${base}/oauth2/v2.0/token`,
+    jwks: `${base}/discovery/v2.0/keys`,
+  };
+}
+
 /** @typedef {import("../../../ports/idp.js").Identity} Identity */
 
 // ---- PKCE (RFC 7636) ----
@@ -546,6 +570,80 @@ export async function verifyOidcIdToken(token, { issuer, clientId, nonce, keys, 
   };
 }
 
+/**
+ * Verify a Microsoft Entra ID v2.0 ID token and turn it into an Identity. Returns null on any failure (never throws).
+ * Checks:
+ * - RS256 signature against Microsoft's JWKS key named by `kid`.
+ * - `tid` is a valid UUID.
+ * - Multi-tenant issuer validation: when `tenant` is `"common"` or `"organizations"`, verifies
+ *   `payload.iss === "https://login.microsoftonline.com/${payload.tid}/v2.0"` (and rejects MSA consumer `tid` when
+ *   `tenant === "organizations"`). When `tenant` is a specific GUID, requires `payload.tid === tenant` and exact `iss`.
+ * - `aud` / `azp`, `exp`, `iat`, optional `nbf`, `nonce`, and `oid` (preferred) or `sub`.
+ * - Extracts `email` (from `email` or `preferred_username`, rejected if `email_verified === false`), `name`, `tid`,
+ *   and `domain` (normalized lowercase domain of verified email for work/school tenants; `null` for MSA consumer accounts).
+ * @param {string} token
+ * @param {{ clientId: string, tenant?: string, nonce: string, keys: ReturnType<typeof jwksCache>,
+ *   now?: () => number, skewSec?: number, why?: (cause: string) => void }} o
+ * @returns {Promise<Identity|null>}
+ */
+export async function verifyMicrosoftIdToken(token, { clientId, tenant = "common", nonce, keys, now = Date.now, skewSec = 60, why }) {
+  const refuse = cause => { try { why?.(cause); } catch { /* a reporter never changes the verdict */ } return null; };
+  if (typeof clientId !== "string" || !clientId) return refuse("bad_config");
+  const normTenant = String(tenant ?? "common").trim().toLowerCase() || "common";
+  if (!MICROSOFT_SPECIAL_TENANTS.has(normTenant) && !MICROSOFT_UUID_RE.test(normTenant)) return refuse("bad_config");
+  if (typeof nonce !== "string" || !nonce) return refuse("bad_nonce");
+  const jwt = parseJwt(token);
+  if (!jwt) return refuse("bad_token");
+  const { header, payload: c } = jwt;
+  if (header.alg !== "RS256" || typeof header.kid !== "string" || !header.kid) return refuse("bad_alg");
+  if (header.crit !== undefined) return refuse("bad_alg");
+
+  const key = await keys.key(header.kid);
+  if (!key) return refuse("unknown_kid");
+  const ok = await verifyJwsSignature("RS256", key, jwt.sig, jwt.signed);
+  if (!ok) return refuse("bad_sig");
+
+  if (typeof c.tid !== "string" || !MICROSOFT_UUID_RE.test(c.tid)) return refuse("bad_iss");
+  const tid = c.tid.toLowerCase();
+  if (normTenant === "organizations" && tid === MICROSOFT_CONSUMER_TID) return refuse("bad_iss");
+  if (normTenant === "consumers" && tid !== MICROSOFT_CONSUMER_TID) return refuse("bad_iss");
+  if (!MICROSOFT_SPECIAL_TENANTS.has(normTenant) && tid !== normTenant) return refuse("bad_iss");
+  if (c.iss !== `https://login.microsoftonline.com/${c.tid}/v2.0`) return refuse("bad_iss");
+
+  if (typeof c.aud === "string") { if (c.aud !== clientId) return refuse("bad_aud"); }
+  else if (Array.isArray(c.aud)) {
+    if (!c.aud.includes(clientId)) return refuse("bad_aud");
+    if (c.aud.length > 1 && c.azp !== clientId) return refuse("bad_aud");
+  } else return refuse("bad_aud");
+  if (c.azp !== undefined && c.azp !== clientId) return refuse("bad_aud");
+
+  const t = Math.floor(now() / 1000);
+  if (!Number.isFinite(c.exp) || !Number.isFinite(c.iat)) return refuse("bad_time");
+  if (t > c.exp + skewSec) return refuse("expired");
+  if (c.iat > t + skewSec) return refuse("bad_time");
+  if (c.exp <= c.iat) return refuse("bad_time");
+  if (c.iat < t - MAX_TOKEN_AGE_SEC) return refuse("stale");
+  if (c.nbf !== undefined && (!Number.isFinite(c.nbf) || t + skewSec < c.nbf)) return refuse("bad_time");
+  if (c.nonce !== nonce) return refuse("bad_nonce");
+
+  const rawSub = (typeof c.oid === "string" && c.oid) ? c.oid : c.sub;
+  if (typeof rawSub !== "string" || !rawSub || rawSub.length > 255 || /[\0\r\n]/.test(rawSub)) return refuse("bad_sub");
+
+  const email = c.email_verified === false
+    ? null
+    : (normalizeEmailClaim(c.email) ?? normalizeEmailClaim(c.preferred_username));
+  const domain = email && tid !== MICROSOFT_CONSUMER_TID ? email.slice(email.lastIndexOf("@") + 1) : null;
+  const rawName = typeof c.name === "string" && c.name.trim() ? c.name.trim() : null;
+
+  return {
+    user: "microsoft:" + rawSub,
+    name: rawName ? rawName.slice(0, MAX_NAME) : null,
+    email,
+    domain,
+    tid,
+  };
+}
+
 // ---- The sign-in flow ----
 
 /** The OAuth token-endpoint error names (RFC 6749 § 5.2) a refusal may report as its cause. */
@@ -580,6 +678,7 @@ export function googleOidc(config) {
   const keys = jwksCache({ fetch, now, cooldownMs: config.jwksCooldownMs ?? 30_000, timeoutMs: config.timeoutMs ?? 10_000 });
 
   return {
+    providerId: "google",
     displayName: "Google",
     keys,
     /**
@@ -798,5 +897,100 @@ export function genericOidc(config) {
         why,
       });
     },
+  };
+}
+
+/**
+ * Microsoft Entra ID (Azure AD) v2.0 OIDC adapter: authorization code + PKCE (S256), JWKS verification,
+ * and multi-tenant (`"common"`, `"organizations"`) or single-tenant (GUID) issuer validation.
+ * @param {{ clientId: string, clientSecret: string, tenant?: string, redirectUri: string, fetch: typeof globalThis.fetch,
+ *   now?: () => number, skewSec?: number, jwksCooldownMs?: number, timeoutMs?: number }} config
+ * @returns {import("../../../ports/idp.js").IdP & {
+ *   providerId: "microsoft", displayName: "Microsoft", tenant: string,
+ *   keys: ReturnType<typeof jwksCache>,
+ *   verifyIdToken(token: string, nonce: string, o?: { why?: (cause: string) => void }): Promise<Identity|null>
+ * }}
+ */
+export function microsoftOidc(config) {
+  const { clientId, clientSecret, redirectUri, fetch, now = Date.now, skewSec = 60, timeoutMs = 10_000 } = config ?? {};
+  if (!clientId || !clientSecret || !redirectUri || typeof fetch !== "function") throw new Error("oidc: incomplete config");
+  const endpoints = microsoftEndpoints(config.tenant);
+  const keys = jwksCache({
+    url: endpoints.jwks,
+    fetch,
+    now,
+    cooldownMs: config.jwksCooldownMs ?? 30_000,
+    timeoutMs,
+    algorithms: ["RS256"],
+    noRedirect: true,
+  });
+
+  return {
+    providerId: "microsoft",
+    displayName: "Microsoft",
+    tenant: endpoints.tenant,
+    keys,
+
+    async begin() {
+      const state = randomId(32), nonce = randomId(32), verifier = newVerifier();
+      const q = new URLSearchParams({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_mode: "query",
+        scope: "openid email profile",
+        state,
+        nonce,
+        code_challenge: await challengeS256(verifier),
+        code_challenge_method: "S256",
+      });
+      return { url: `${endpoints.authorize}?${q}`, state, nonce, verifier };
+    },
+
+    async finish(o) {
+      const { code, state, expected, why } = /** @type {any} */ (o && typeof o === "object" ? o : {});
+      const refuse = cause => { try { if (typeof why === "function") why(cause); } catch { /* never changes the verdict */ } return null; };
+      const ok = v => typeof v === "string" && v.length > 0;
+      if (!expected || !ok(expected.state) || !ok(expected.nonce) || !ok(expected.verifier)) return refuse("bad_expected");
+      if (state !== expected.state) return refuse("state_mismatch");
+      if (typeof code !== "string" || !code) return refuse("no_code");
+
+      let res, text, body;
+      try {
+        res = await fetch(endpoints.token, {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(timeoutMs),
+          headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            client_id: clientId,
+            client_secret: clientSecret,
+            redirect_uri: redirectUri,
+            code_verifier: expected.verifier,
+            scope: "openid email profile",
+          }).toString(),
+        });
+        text = await res.text();
+      } catch (e) { return refuse(e?.name === "TimeoutError" ? "idp_timeout" : "idp_unreachable"); }
+      try { body = JSON.parse(text); } catch { return refuse("bad_token_response"); }
+      if (!res.ok) {
+        const e = body?.error;
+        return refuse(TOKEN_ERRORS.includes(e) ? e : `token_http_${res.status}`);
+      }
+      return verifyMicrosoftIdToken(body?.id_token, {
+        clientId,
+        tenant: endpoints.tenant,
+        nonce: expected.nonce,
+        keys,
+        now,
+        skewSec,
+        why: refuse,
+      });
+    },
+
+    verifyIdToken: (token, nonce, { why } = {}) =>
+      verifyMicrosoftIdToken(token, { clientId, tenant: endpoints.tenant, nonce, keys, now, skewSec, why }),
   };
 }

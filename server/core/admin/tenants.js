@@ -93,7 +93,7 @@ const CONTROL = /[\p{Cc}\p{Cf}]/u;
 export function normAdmin(a, domain) {
   const s = typeof a === "string" ? a.trim() : "";
   if (typeof a === "string" && CONTROL.test(a)) throw new BootstrapError(`admin name has a control character: ${shown(a)}`);
-  if (/^google:[^\s]{1,255}$/.test(s) || /^dev:[A-Za-z0-9_.@-]{1,64}$/.test(s)) return s;
+  if (/^(?:google|microsoft):[^\s]{1,255}$/.test(s) || /^dev:[A-Za-z0-9_.@-]{1,64}$/.test(s)) return s;
   const e = normEmail(s.startsWith("email:") ? s.slice(6) : s);
   if (e && EMAIL.test(e) && e.length <= 320) {
     if (domain === null && !e.endsWith("@gmail.com"))
@@ -193,10 +193,54 @@ export const MAX_PERSONAL_ORGS_PER_USER = 20;
 export const MAX_TENANT_MEMBERS = 500;
 
 const okAuthenticatedCaller = caller =>
-  Boolean(caller && typeof caller.user === "string" && (caller.user.startsWith("google:") || caller.user.startsWith("dev:")));
+  Boolean(caller && typeof caller.user === "string" && (caller.user.startsWith("google:") || caller.user.startsWith("microsoft:") || caller.user.startsWith("oidc:") || caller.user.startsWith("dev:")));
 
 async function recordAudit(registry, entry) {
   if (typeof registry.appendAudit === "function") await registry.appendAudit(entry);
+}
+
+/**
+ * Self-serve corporate domain org provisioning: when a verified Google or Microsoft user signs in on a
+ * corporate domain (e.g. `alaskaair.com`) that has no tenant yet, atomically create the domain tenant with
+ * them as initial owner/admin. If the tenant already exists (or another sign-in wins the create race), leave
+ * its existing admins untouched and return `{ tenant, created: false }`.
+ * @param {{ caller: import("../../ports/idp.js").Identity }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ * @returns {Promise<{ tenant: Tenant, created: boolean } | null>}
+ */
+export async function provisionDomainTenant({ caller }, { registry, now = Date.now }) {
+  if (!caller || typeof caller.user !== "string") return null;
+  if (!caller.user.startsWith("google:") && !caller.user.startsWith("microsoft:")) return null;
+  if (typeof caller.domain !== "string" || !caller.domain || caller.domain.startsWith("oidc:")) return null;
+  let d;
+  try { d = normDomain(caller.domain); } catch { return null; }
+  const existing = await registry.tenantByDomain(d);
+  if (existing) return { tenant: existing, created: false };
+  const vEmail = verifiedEmail(caller);
+  const admins = [caller.user];
+  if (vEmail && vEmail.endsWith("@" + d)) admins.push("email:" + vEmail);
+  let t = null;
+  let created = false;
+  try {
+    t = await registry.createTenant({ domain: d, name: d, admins });
+    created = true;
+  } catch (err) {
+    // Lost a create race with another sign-in on the same domain: never add the loser as admin.
+    t = await registry.tenantByDomain(d);
+    if (!t) throw err;
+  }
+  if (created) {
+    await recordAudit(registry, {
+      tenant: t.id,
+      board: null,
+      actor: caller.user,
+      action: "tenant.create",
+      target: t.id,
+      detail: { domain: d, autoProvisioned: true },
+      at: now(),
+    });
+  }
+  return { tenant: t, created };
 }
 
 /**
@@ -269,7 +313,7 @@ export async function listTenantMembers({ caller, tenant }, { registry }) {
   if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
   const members = await registry.tenantMembers(t.id);
   const emailAdmins = t.admins.filter(a => a.startsWith("email:")).map(a => a.slice(6));
-  const otherAdmins = t.admins.filter(a => !a.startsWith("email:") && !a.startsWith("google:"));
+  const otherAdmins = t.admins.filter(a => !a.startsWith("email:") && !a.startsWith("google:") && !a.startsWith("microsoft:"));
   const admins = [...new Set([...emailAdmins, ...otherAdmins])];
   return { members, admins };
 }

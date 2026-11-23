@@ -194,17 +194,31 @@ describe("Word-Style Two-Bar Contextual Ribbon DOM integration", () => {
       .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
     expect(arrangeLabels).toEqual(["Align", "Distribute", "Order", "Group", "Rotate"]);
 
-    // Switch to Layers tab -> Manage + Layers groups
+    // Switch to Layers tab -> dedicated vertical floating bar (sticky header, vertical Z-order list, bottom actions)
+    expect(panel.attrs["data-ribbon-layout"]).toBe("horizontal");
     find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "layers").click();
     step(20);
+    expect(panel.attrs["data-ribbon-layout"]).toBe("vertical");
     const layersSec = find(panel, e => e.attrs?.["data-sec"] === "layers" && e.attrs?.["data-ribbon-hidden"] !== "true");
-    const layersLabels = findAll(layersSec, e => e.classList?.contains?.("ribbon-group"))
-      .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
-    expect(layersLabels).toEqual(["Manage", "Layers"]);
+    expect(layersSec).toBeDefined();
+    expect(find(layersSec, e => e.classList?.contains?.("layers-bar-head"))).toBeDefined();
+    expect(find(layersSec, e => e.classList?.contains?.("layers-bar-count"))?.textContent).toBe("1");
+    expect(find(layersSec, e => e.attrs?.["data-fk"] === "layers:add")).toBeDefined();
+    expect(find(layersSec, e => e.attrs?.["data-fk"] === "layers:close")).toBeDefined();
+    const layersList = find(layersSec, e => e.classList?.contains?.("layers-bar-list") && e.attrs?.role === "list");
+    expect(layersList).toBeDefined();
+    expect(findAll(layersList, e => e.classList?.contains?.("layer-row")).length).toBe(1);
+    const layersFoot = find(layersSec, e => e.classList?.contains?.("layers-bar-foot"));
+    expect(layersFoot).toBeDefined();
+    expect(find(layersFoot, e => e.attrs?.["data-fk"] === "layers:move-up")?.disabled).toBe(true);
+    expect(find(layersFoot, e => e.attrs?.["data-fk"] === "layers:move-down")?.disabled).toBe(true);
+    expect(find(layersFoot, e => e.attrs?.["data-fk"] === "layers:move-sel")?.disabled).toBe(false);
+    expect(find(layersFoot, e => e.attrs?.["data-fk"] === "layers:delete")?.disabled).toBe(true);
 
-    // Switch to Library tab -> Library + Items groups
+    // Switch to Library tab -> seamlessly switches back to horizontal Word-style ribbon (Library + Items groups)
     find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "library").click();
     step(20);
+    expect(panel.attrs["data-ribbon-layout"]).toBe("horizontal");
     const libSec = find(panel, e => e.attrs?.["data-sec"] === "library" && e.attrs?.["data-ribbon-hidden"] !== "true");
     const libLabels = findAll(libSec, e => e.classList?.contains?.("ribbon-group"))
       .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
@@ -226,12 +240,31 @@ describe("Word-Style Two-Bar Contextual Ribbon DOM integration", () => {
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
 
-    // Clicking Layers tab in Bar 1 expands Bar 2 to Layers
+    // Clicking Layers tab in Bar 1 expands Bar 2 to Layers (vertical layout)
     const layersTab = () => find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "layers");
     layersTab().click();
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
+    expect(panel.attrs["data-ribbon-layout"]).toBe("vertical");
     expect(find(panel, e => e.attrs?.["data-sec"] === "layers" && e.attrs?.["data-ribbon-hidden"] !== "true")).toBeDefined();
+
+    // Adding a layer in the vertical bar updates the count badge and enables move-down & delete
+    find(panel, e => e.attrs?.["data-fk"] === "layers:add").click();
+    step(20);
+    expect(find(panel, e => e.classList?.contains?.("layers-bar-count"))?.textContent).toBe("2");
+    expect(find(panel, e => e.attrs?.["data-fk"] === "layers:move-down")?.disabled).toBe(false);
+    expect(find(panel, e => e.attrs?.["data-fk"] === "layers:delete")?.disabled).toBe(false);
+
+    // Clicking the close button in the vertical Layers header collapses the bar
+    find(panel, e => e.attrs?.["data-fk"] === "layers:close").click();
+    step(20);
+    expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
+
+    // Re-open Layers via tab, then test Bar 1 toggle button focus preservation
+    layersTab().click();
+    step(20);
+    expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
+    expect(panel.attrs["data-ribbon-layout"]).toBe("vertical");
 
     // Clicking the collapse toggle button in Bar 1 collapses it and preserves focus
     const toggle = () => find(topbar, e => e.attrs?.["data-ribbon-toggle"] === "1");
@@ -241,10 +274,11 @@ describe("Word-Style Two-Bar Contextual Ribbon DOM integration", () => {
     expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
     expect(page.doc.activeElement).toBe(toggle());
 
-    // Clicking the expand toggle button expands it again
+    // Clicking the expand toggle button expands it again (back to vertical Layers)
     toggle().click();
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
+    expect(panel.attrs["data-ribbon-layout"]).toBe("vertical");
   });
 
   test("contextual filtering hides irrelevant controls and 'All ⋯' escape hatch reveals them", () => {

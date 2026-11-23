@@ -881,38 +881,95 @@ export function renderPanel(root, ctx) {
             onclick: () => ctx.onResetLocalView?.(),
           }, "Show all layers"))
         : null;
-      const layerItems = ls.map(l => {
+      const buildLayerRow = (l, idx, vertical) => {
         const eff = localById?.get(l.id);
         const isSolo = Boolean(eff?.solo);
         const locallyHidden = Boolean(localView?.active && eff && !eff.effectiveVisible);
-        return h("div.list-row" + (B.activeLayer === l.id ? ".on" : "") + (locallyHidden ? ".local-hidden" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
-          h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
-          h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
-          h("button.tb.solo-btn" + (isSolo ? ".on" : ""), { type: "button", title: isSolo ? "Exit solo layer (local)" : "Solo layer (local only)", "aria-label": isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`, "aria-pressed": String(isSolo), "data-fk": `layer:${l.id}:solo`, "data-solo-layer": l.id, onclick: ev => { ev.stopPropagation(); ctx.onSoloLayer?.(l.id); } }, "S"),
-          h("span", { title: "Double-click to rename", ondblclick: ev => {
-            ev.stopPropagation(); if (dis) return;
-            const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
-              onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
-            ev.currentTarget.replaceWith(input); input.focus(); input.select();
-          } }, l.name || "Layer"),
-          h("span.n", {}, String(count(l.id))));
-      });
+        const visBtn = h("button.tb" + (!l.visible ? ".active-state" : ""), { type: "button", title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 }));
+        const lockBtn = h("button.tb" + (l.locked ? ".active-state" : ""), { type: "button", title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 }));
+        const soloBtn = h("button.tb.solo-btn" + (isSolo ? ".on" : ""), { type: "button", title: isSolo ? "Exit solo layer (local)" : "Solo layer (local only)", "aria-label": isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`, "aria-pressed": String(isSolo), "data-fk": `layer:${l.id}:solo`, "data-solo-layer": l.id, onclick: ev => { ev.stopPropagation(); ctx.onSoloLayer?.(l.id); } }, "S");
+        const nameEl = h("span" + (vertical ? ".layer-name" : ""), { title: "Double-click to rename", ondblclick: ev => {
+          ev.stopPropagation(); if (dis) return;
+          const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
+            onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
+          ev.currentTarget.replaceWith(input); input.focus(); input.select();
+        } }, l.name || "Layer");
+        const cntEl = h("span.n", {}, String(count(l.id)));
+        const rowCls = "div.list-row" + (vertical ? ".layer-row" : "") + (B.activeLayer === l.id ? ".on" : "") + (locallyHidden ? ".local-hidden" : "") + (!l.visible ? ".layer-hidden" : "");
+        const rowAttrs = { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } };
+        if (vertical) {
+          return h(rowCls, rowAttrs,
+            h("span.layer-z", { "aria-hidden": "true" }, String(ls.length - idx)),
+            nameEl,
+            cntEl,
+            h("div.layer-row-acts", {}, visBtn, lockBtn, soloBtn));
+        }
+        return h(rowCls, rowAttrs, visBtn, lockBtn, soloBtn, nameEl, cntEl);
+      };
       if (ribbonMode) {
-        return [
-          ribbonGroup("layers-actions", "Manage", [
-            ribbonRow("", "", chip([icon("plus", { size: 14 }), " New layer"], false, () => lact(e => e.addLayer()), "New layer")),
-            ribbonRow("", "",
-              chip(icon("arrowUp", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
-              chip(icon("arrowDown", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, -1)), "Move down"),
-              chip(icon("moveToLayer", { size: 14 }), false, () => S.act("board", e => e.moveToLayer(B.activeLayer)), "Move the selection to this layer"),
-              chip(icon("trash", { size: 14 }), false, () => lact(e => e.deleteLayer(B.activeLayer)), "Delete layer (its shapes move down)")),
-          ]),
-          resetBanner ? ribbonGroup("layers-filter", "Filter", [resetBanner]) : null,
-          ribbonGroup("layers-list", "Layers", [
-            h("div.ribbon-grid", { role: "list", "aria-label": "Layers" }, layerItems),
-          ], ".ribbon-group-scroll"),
-        ].filter(Boolean);
+        const activeIdx = B.doc.layers.findIndex(l => l.id === B.activeLayer);
+        const canMoveUp = !dis && activeIdx >= 0 && activeIdx < B.doc.layers.length - 1;
+        const canMoveDown = !dis && activeIdx > 0;
+        const canMoveSel = !dis && B.sel.size > 0;
+        const canDelete = !dis && B.doc.layers.length > 1;
+        const header = h("div.layers-bar-head", {},
+          h("div.layers-bar-head-left", {},
+            h("span.layers-bar-title", {}, "Layers"),
+            h("span.layers-bar-count", { "aria-label": `${ls.length} layers` }, String(ls.length))),
+          h("div.layers-bar-head-acts", {},
+            h("button.c.layers-add-btn", {
+              type: "button",
+              title: "New layer",
+              "aria-label": "New layer",
+              "data-fk": "layers:add",
+              disabled: dis,
+              onclick: () => lact(e => e.addLayer()),
+            }, icon("plus", { size: 13 }), " New layer"),
+            h("button.tb.layers-close-btn", {
+              type: "button",
+              title: "Close Layers",
+              "aria-label": "Close Layers",
+              "data-fk": "layers:close",
+              onclick: () => ctx.onToggleRibbon?.(),
+            }, icon("close", { size: 14 }))));
+        const list = h("div.layers-bar-list", { role: "list", "aria-label": "Layers" }, ls.map((l, idx) => buildLayerRow(l, idx, true)));
+        const footer = h("div.layers-bar-foot", {},
+          h("div.layers-foot-grp", {},
+            h("button.c", {
+              type: "button",
+              title: "Move layer up",
+              "aria-label": "Move layer up",
+              "data-fk": "layers:move-up",
+              disabled: !canMoveUp,
+              onclick: () => lact(e => e.moveLayer(B.activeLayer, 1)),
+            }, icon("arrowUp", { size: 14 })),
+            h("button.c", {
+              type: "button",
+              title: "Move layer down",
+              "aria-label": "Move layer down",
+              "data-fk": "layers:move-down",
+              disabled: !canMoveDown,
+              onclick: () => lact(e => e.moveLayer(B.activeLayer, -1)),
+            }, icon("arrowDown", { size: 14 })),
+            h("button.c", {
+              type: "button",
+              title: "Move selection to active layer",
+              "aria-label": "Move selection to active layer",
+              "data-fk": "layers:move-sel",
+              disabled: !canMoveSel,
+              onclick: () => S.act("board", e => e.moveToLayer(B.activeLayer)),
+            }, icon("moveToLayer", { size: 14 }))),
+          h("button.c.layers-del-btn", {
+            type: "button",
+            title: "Delete layer (its shapes move down)",
+            "aria-label": "Delete layer",
+            "data-fk": "layers:delete",
+            disabled: !canDelete,
+            onclick: () => lact(e => e.deleteLayer(B.activeLayer)),
+          }, icon("trash", { size: 14 })));
+        return [header, resetBanner, list, footer].filter(Boolean);
       }
+      const layerItems = ls.map((l, idx) => buildLayerRow(l, idx, false));
       return [
         resetBanner,
         h("div", { role: "list", "aria-label": "Layers" }, layerItems),

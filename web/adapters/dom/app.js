@@ -2199,6 +2199,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const panelEl = $("#panel");
   if (panelEl && typeof panelEl.addEventListener === "function") {
     panelEl.addEventListener("wheel", e => {
+      if (panelEl.getAttribute?.("data-ribbon-layout") === "vertical") return;
       if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
       const scroller = panelEl.querySelector?.('.sec:not([data-ribbon-hidden="true"])') ?? panelEl.querySelector?.(".sec") ?? panelEl;
       if (!scroller || typeof scroller.scrollBy !== "function") return;
@@ -3105,11 +3106,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (busy(panel)) return false;
     syncRibbonSelection();
     const expanded = isRibbonExpanded();
+    const activeTab = currentActiveTab();
     if (!expanded && ui.colorPicker && !isPhone()) {
       cancelActiveSampler();
       ui.colorPicker = null;
     }
+    const ribbonLayout = S.role !== "annotator" && expanded && activeTab === "layers" ? "vertical" : "horizontal";
     panel.setAttribute?.("data-ribbon-expanded", String(expanded));
+    panel.setAttribute?.("data-ribbon-layout", ribbonLayout);
     panel.style.width = `${lay.width}px`;
     const edge = h("div.edge", { title: "Drag to resize (180–520 px)", onpointerdown: e => {
       e.preventDefault(); const sw = ui.panel.width, sx = e.clientX;

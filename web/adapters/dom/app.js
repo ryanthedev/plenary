@@ -17,6 +17,7 @@ import { buildTemplateScene, getTemplate } from "../../../packages/core/template
 import { parseLibrary } from "../../../packages/core/library.js";
 import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
 import { isDrawio, parseDrawio, MAX_DRAWIO_BYTES } from "../../../packages/core/drawio.js";
+import { buildTableElements } from "../../../packages/core/metadata.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
 
@@ -782,6 +783,27 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         reorder: how => { S.act(stream, x => x.reorder(how)); chromeDirty = true; },
         moveToLayer: layerId => { S.act("board", x => x.moveToLayer(layerId)); chromeDirty = true; },
         toggleLock: () => { S.act(stream, x => x.toggleLock()); chromeDirty = true; },
+        fitToChildren: () => {
+          const selectedList = hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [];
+          const frames = selectedList.filter(el => el && !isLabel(el) && el.type === "frame" && ed.doc.editable(el));
+          if (frames.length !== 1) return;
+          const frameId = frames[0].id;
+          let editable = false;
+          let fitted = false;
+          let hasChildren = false;
+          const acted = S.act(stream, x => {
+            const liveFrame = x.doc.get(frameId);
+            if (!liveFrame || !x.doc.editable(liveFrame)) return;
+            editable = true;
+            hasChildren = x.doc.live().some(c => !isLabel(c) && c.frameId === frameId);
+            fitted = Boolean(x.fitContainerToChildren(frameId));
+          });
+          if (!acted || !editable) return;
+          if (fitted) toast("Fitted frame to children", 1600);
+          else if (!hasChildren) toast("Frame has no children to fit", 1800);
+          else toast("Frame already fits children", 1600);
+          chromeDirty = true;
+        },
         spliceImage: (cols, rows) => {
           const selectedList = hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [];
           const imgs = selectedList.filter(el => el && !isLabel(el) && el.type === "image");
@@ -1799,6 +1821,39 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (!S.may()) return;
     picker.click();
   }
+  function insertSwimlane() {
+    if (S.role !== "presenter" || !S.may()) return;
+    /** @type {string[]} */
+    let ids = [];
+    const acted = S.act("board", ed => {
+      ids = ed.addSwimlane({
+        title: "Swimlane",
+        lanes: ["Lane 1", "Lane 2", "Lane 3"],
+      });
+    });
+    if (acted && ids.length) {
+      toast("Inserted swimlane", 1600);
+      chromeDirty = true;
+    }
+  }
+  function insertTable() {
+    if (S.role !== "presenter" || !S.may()) return;
+    /** @type {string[]} */
+    let ids = [];
+    const acted = S.act("board", ed => {
+      const elements = buildTableElements({
+        rows: 3,
+        cols: 3,
+        layer: ed.activeLayer,
+      });
+      const center = ed.toWorld({ x: ed.size.w / 2, y: ed.size.h / 2 });
+      ids = ed.insertElements(elements, undefined, center);
+    });
+    if (acted && ids.length) {
+      toast("Inserted table", 1600);
+      chromeDirty = true;
+    }
+  }
 
   const boardModeration = () => {
     const raw = S.eds.board.doc.appState?.herdr?.moderation;
@@ -1870,6 +1925,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? boardMenuItem("export", "Export", "Export SVG / PNG / PDF", toggleExport, { kbd: "⌘⇧E" }) : null,
       role === "presenter" ? boardMenuItem("importFile", "Import .excalidraw", "Import .excalidraw", openExcalidrawImport, { disabled: !may }) : null,
       role === "presenter" ? boardMenuItem("mermaid", "Mermaid", "Insert Mermaid", () => openDialog("mermaid"), { disabled: !may }) : null,
+      role === "presenter" ? boardMenuItem("frame", "Insert swimlane", "Insert swimlane", insertSwimlane, { disabled: !may }) : null,
+      role === "presenter" ? boardMenuItem("grid", "Insert table", "Insert table", insertTable, { disabled: !may }) : null,
       role === "presenter" ? boardMenuItem("play", "Embed URL", "Embed URL…", () => openDialog("embed"), { disabled: !may }) : null,
       versions ? boardMenuItem("history", "Version history", "Version history…", () => openVersionsDialog()) : null,
     ]);
@@ -2250,7 +2307,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       el.replaceChildren();
       return;
     }
-    if (ui.sheet === "rename" && busy(el)) return false;
+    if ((ui.sheet === "rename" || ui.sheet === "panel") && busy(el)) return false;
     if (ui.sheet !== "panel") cancelActiveSampler();
     if (bd) bd.hidden = false;
     el.setAttribute?.("role", "dialog");
@@ -2273,6 +2330,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         canRenameBoard() ? h("button.tb", { "aria-label": "Rename board", onclick: e => { startBoardRename(e?.currentTarget ?? null); } }, h("span.ic", {}, icon("edit", { size: 20 })), "Rename") : null,
         S.role === "presenter" ? [
           h("button.tb", { disabled: !may, "aria-haspopup": "dialog", onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"),
+          h("button.tb", { disabled: !may, "aria-label": "Insert swimlane", title: "Insert swimlane", onclick: () => { insertSwimlane(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Swimlane"),
+          h("button.tb", { disabled: !may, "aria-label": "Insert table", title: "Insert table", onclick: () => { insertTable(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("grid", { size: 20 })), "Table"),
           h("button.tb", { disabled: !may, "aria-haspopup": "dialog", "aria-label": "Embed URL", title: "Embed / Link URL…", onclick: () => openDialog("embed") }, h("span.ic", {}, icon("play", { size: 20 })), "Embed / URL"),
           h("button.tb", { "aria-haspopup": "dialog", onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export"),
           h("button.tb", { disabled: !may, "aria-label": "Import .excalidraw", title: "Import .excalidraw / .drawio", onclick: () => { openExcalidrawImport(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("importFile", { size: 20 })), "Import"),
@@ -2620,7 +2679,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // counts, the active layer, the playback chip and the library (panel.js renderPanel).
   const panelKey = () => {
     const B = S.eds.board, ed = S.eds[S.role === "annotator" ? "notes" : S.active], bi = boardInfo(B.doc);
-    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, B.selected()[0]?.customData?.anim ?? null,
+    const selFirst = ed.selected().filter(e => !isLabel(e))[0] ?? null;
+    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, selFirst?.id ?? null, selFirst?.type ?? null, Boolean(selFirst?.locked), selFirst?.customData?.meta ?? null, B.selected()[0]?.customData?.anim ?? null,
       bi.spansSig, bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker, ui.localView, viewsOf(B.doc)]);
   };
   const hudKey = () => {

@@ -12,6 +12,16 @@ import { listNamedFrames } from "../../../packages/core/views.js";
 import { parseLibrary, mergeLibrary } from "../../../packages/core/library.js";
 import { BLEND_MODES, CLIP_SHAPES, effectsOf, normalizeEffects } from "../../../packages/core/effects.js";
 import { buildIconLibraryItems, getIconPack } from "../../../packages/core/icon-packs.js";
+import { parseLinkCardFromElement } from "../../../packages/core/link-card.js";
+import { parseEmbedFromElement } from "../../../packages/core/embed.js";
+import {
+  metaOf,
+  normalizeShapeMeta,
+  validateRunbookUrl,
+  MAX_META_OWNER_LENGTH,
+  MAX_META_SERVICE_LENGTH,
+  MAX_RUNBOOK_URL_LENGTH,
+} from "../../../packages/core/metadata.js";
 import { icon } from "./icons.js";
 import { createColorPicker } from "./color-picker.js";
 import { isPhoneTouchViewport } from "./settings-dialog.js";
@@ -206,6 +216,166 @@ export function renderPanel(root, ctx) {
             h("div.hint", { style: { margin: "8px 0 4px" } }, "Effects"),
             row("Blend", "", blendSel),
             row("Mask", "", clipSel)),
+        );
+      }
+      const selNonLabels = ed.selected().filter(e => e && !isLabel(e));
+      const singleEl = selNonLabels.length === 1 ? selNonLabels[0] : null;
+      const showMeta = Boolean(
+        singleEl &&
+        (isShape(singleEl) || singleEl.type === "frame") &&
+        !parseLinkCardFromElement(singleEl) &&
+        !parseEmbedFromElement(singleEl),
+      );
+      if (showMeta && singleEl) {
+        const curMeta = metaOf(singleEl);
+        const metaEditable = !dis && ed.doc.editable(singleEl);
+        const touchFieldStyle = touchSheet
+          ? { minHeight: "44px", fontSize: "16px", maxWidth: "100%", minWidth: "0", flex: "1 1 140px" }
+          : { width: "100%", minWidth: "0" };
+        const errEl = h("div.hint", {
+          role: "alert",
+          "data-meta-error": "1",
+          hidden: true,
+          style: { color: "var(--danger, #e03131)", marginTop: "4px" },
+        }, "");
+        const setErr = msg => {
+          errEl.textContent = msg;
+          errEl.hidden = !msg;
+        };
+        const ownerInput = /** @type {HTMLInputElement} */ (h("input.field.meta-input", {
+          type: "text",
+          "aria-label": "Owner",
+          "data-meta": "owner",
+          "data-fk": "meta:owner",
+          placeholder: "Team or owner",
+          maxLength: MAX_META_OWNER_LENGTH,
+          value: curMeta?.owner ?? "",
+          disabled: !metaEditable,
+          style: touchFieldStyle,
+        }));
+        const serviceInput = /** @type {HTMLInputElement} */ (h("input.field.meta-input", {
+          type: "text",
+          "aria-label": "Service",
+          "data-meta": "service",
+          "data-fk": "meta:service",
+          placeholder: "Service name",
+          maxLength: MAX_META_SERVICE_LENGTH,
+          value: curMeta?.service ?? "",
+          disabled: !metaEditable,
+          style: touchFieldStyle,
+        }));
+        const runbookInput = /** @type {HTMLInputElement} */ (h("input.field.meta-input", {
+          type: "url",
+          "aria-label": "Runbook URL",
+          "data-meta": "runbookUrl",
+          "data-fk": "meta:runbookUrl",
+          placeholder: "https://runbooks.example.com/...",
+          maxLength: MAX_RUNBOOK_URL_LENGTH,
+          value: curMeta?.runbookUrl ?? "",
+          disabled: !metaEditable,
+          style: touchFieldStyle,
+        }));
+        let initialOwner = curMeta?.owner ?? "";
+        let initialService = curMeta?.service ?? "";
+        let initialRunbook = curMeta?.runbookUrl ?? "";
+        const commitMeta = () => {
+          if (!metaEditable) return;
+          const ownerVal = ownerInput.value ?? "";
+          const serviceVal = serviceInput.value ?? "";
+          const runbookVal = runbookInput.value ?? "";
+          const ownerDirty = ownerVal !== initialOwner;
+          const serviceDirty = serviceVal !== initialService;
+          const runbookDirty = runbookVal !== initialRunbook;
+          if (!ownerDirty && !serviceDirty && !runbookDirty) {
+            setErr("");
+            return;
+          }
+          if (runbookDirty && runbookVal.trim() !== "" && !validateRunbookUrl(runbookVal)) {
+            setErr("Runbook URL must be a valid https:// URL");
+            return;
+          }
+          setErr("");
+          act(e => {
+            const live = e.doc.get(singleEl.id);
+            if (!live || !e.doc.editable(live)) return;
+            const liveMeta = metaOf(live);
+            const mergedRaw = {
+              ...(liveMeta?.tier ? { tier: liveMeta.tier } : {}),
+              ...(liveMeta?.tags?.length ? { tags: liveMeta.tags } : {}),
+              owner: ownerDirty ? ownerVal : (liveMeta?.owner ?? ""),
+              service: serviceDirty ? serviceVal : (liveMeta?.service ?? ""),
+              runbookUrl: runbookDirty ? runbookVal : (liveMeta?.runbookUrl ?? ""),
+            };
+            const nextMeta = normalizeShapeMeta(mergedRaw);
+            if (JSON.stringify(nextMeta ?? null) === JSON.stringify(liveMeta ?? null)) {
+              initialOwner = ownerVal;
+              initialService = serviceVal;
+              initialRunbook = runbookVal;
+              return;
+            }
+            const ok = e.transact(tx => {
+              const cur = tx.get(live.id);
+              if (!cur) return false;
+              const nextCustom = { ...(cur.customData ?? {}) };
+              if (nextMeta) nextCustom.meta = nextMeta;
+              else delete nextCustom.meta;
+              cur.customData = nextCustom;
+              return true;
+            });
+            if (ok) {
+              initialOwner = nextMeta?.owner ?? "";
+              initialService = nextMeta?.service ?? "";
+              initialRunbook = nextMeta?.runbookUrl ?? "";
+            }
+          });
+        };
+        const bindMetaInput = input => {
+          input.addEventListener("blur", () => commitMeta());
+          input.addEventListener("keydown", k => {
+            k.stopPropagation();
+            if (k.key === "Enter") {
+              k.preventDefault?.();
+              commitMeta();
+            } else if (k.key === "Escape") {
+              k.preventDefault?.();
+              const latest = metaOf(ed.doc.get(singleEl.id)) ?? curMeta;
+              ownerInput.value = latest?.owner ?? "";
+              serviceInput.value = latest?.service ?? "";
+              runbookInput.value = latest?.runbookUrl ?? "";
+              initialOwner = ownerInput.value;
+              initialService = serviceInput.value;
+              initialRunbook = runbookInput.value;
+              setErr("");
+              input.blur?.();
+            }
+          });
+        };
+        bindMetaInput(ownerInput);
+        bindMetaInput(serviceInput);
+        bindMetaInput(runbookInput);
+        const safeRunbookUrl = curMeta?.runbookUrl ? validateRunbookUrl(curMeta.runbookUrl) : null;
+        const runbookLink = safeRunbookUrl
+          ? h("div.row", { style: { marginTop: "4px" } },
+            h("span.lab", {}, ""),
+            h("span.opts", {},
+              h("a.c.meta-runbook-link", {
+                href: safeRunbookUrl,
+                target: "_blank",
+                rel: "noopener noreferrer",
+                "data-meta-link": "runbook",
+                "data-fk": "meta:open-runbook",
+                title: `Open ${safeRunbookUrl}`,
+                style: touchSheet ? { minHeight: "44px", display: "inline-flex", alignItems: "center" } : undefined,
+              }, "Open runbook ↗")))
+          : null;
+        out.push(
+          h("div.meta-sec", { "data-meta-section": "1" },
+            h("div.hint", { style: { margin: "8px 0 4px" } }, "Metadata"),
+            row("Owner", "", ownerInput),
+            row("Service", "", serviceInput),
+            row("Runbook", "", runbookInput),
+            runbookLink,
+            errEl),
         );
       }
       out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));

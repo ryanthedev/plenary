@@ -52,7 +52,7 @@ export function clampMenuPosition({ x, y, width, height, viewportWidth, viewport
  *   canAnnotate: boolean,
  *   stream: "board" | "notes",
  *   selected: any[],
- *   layers: { id: string, name?: string }[],
+ *   layers: { id: string, name?: string, locked?: boolean }[],
  *   activeLayer: string | null,
  *   actions: {
  *     cut: () => void,
@@ -66,6 +66,7 @@ export function clampMenuPosition({ x, y, width, height, viewportWidth, viewport
  *     reorder: (how: "front" | "forward" | "backward" | "back") => void,
  *     moveToLayer: (layerId: string) => void,
  *     toggleLock: () => void,
+ *     fitToChildren?: () => void,
  *     spliceImage?: (cols: number, rows: number) => void,
  *     copyLink?: () => void,
  *     addComment: () => void,
@@ -139,6 +140,14 @@ export function buildCanvasMenuItems(ctx) {
       disabled: !canWrite,
       action: actions.toggleLock,
     });
+
+    const singleFrameLayer = els.length === 1 && els[0].type === "frame" && stream === "board" && Array.isArray(layers)
+      ? layers.find(l => l.id === layerOf(els[0]))
+      : null;
+    if (els.length === 1 && els[0].type === "frame" && canWrite && !els[0].locked && !singleFrameLayer?.locked && typeof actions.fitToChildren === "function") {
+      sep();
+      items.push({ id: "fit-to-children", label: "Fit to children", icon: "fit", action: actions.fitToChildren });
+    }
 
     if (els.length === 1 && els[0].type === "image" && canWrite && !els[0].locked && typeof actions.spliceImage === "function") {
       sep();

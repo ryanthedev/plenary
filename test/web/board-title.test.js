@@ -218,7 +218,7 @@ describe("#110 Board Menu UX (Board / View / Collaborate)", () => {
     expect(groups.map(g => g.attrs["aria-label"])).toEqual(["Board", "View", "Collaborate"]);
 
     const labelsIn = g => findAll(g, e => e.attrs.role === "menuitem").map(e => e.attrs["aria-label"]);
-    expect(labelsIn(groups[0])).toEqual(["Rename board", "Export", "Import .excalidraw", "Mermaid", "Embed URL"]);
+    expect(labelsIn(groups[0])).toEqual(["Rename board", "Export", "Import .excalidraw", "Mermaid", "Insert swimlane", "Insert table", "Embed URL"]);
     expect(labelsIn(groups[1])).toEqual(["Jump to frame or view", "Light / dark", "Toggle grid", "Side panel", "Settings & keybindings"]);
     expect(labelsIn(groups[2])).toEqual(["Notes", "Comments", "Lock audience edits"]);
 
@@ -247,6 +247,8 @@ describe("#110 Board Menu UX (Board / View / Collaborate)", () => {
     expect(labels).toContain("Toggle grid");
     expect(labels).toContain("Export");
     expect(labels).toContain("Mermaid");
+    expect(labels).toContain("Insert swimlane");
+    expect(labels).toContain("Insert table");
     expect(labels).toContain("Embed URL");
   });
 });

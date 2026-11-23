@@ -100,6 +100,7 @@ import { moveService } from "./move.js";
 import { trashService } from "./trash.js";
 import { offboardService } from "./offboard.js";
 import { versionService } from "./versions.js";
+import { ComplianceError, exportBoardData, exportTenantData, eraseUserData } from "./compliance.js";
 import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, setGrant, shareView, listBoardAudit, listTenantAudit } from "../admin/boards.js";
 import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember } from "../admin/tenants.js";
 
@@ -586,6 +587,23 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       if (!tid) throw new AdminError("forbidden", "not allowed");
       return json(200, await listTenantAudit({ caller: who, tenant: tid, board, limit, before }, admin));
     } }],
+    ["/admin/export-data", { GET: async (req, url) => {
+      const who = await caller(req);
+      const askedTenant = url.searchParams.get("tenant") || null;
+      const tid = askedTenant ?? (await firstAdminTenant(who))?.id ?? null;
+      if (!tid) throw new ComplianceError("forbidden", "not allowed");
+      return json(200, await exportTenantData({ registry, tenant: tid, actor: who, now }));
+    } }],
+    ["/admin/gdpr/erase", { POST: async (req, url) => {
+      const who = await caller(req);
+      const b = await body(req, ["userId", "tenant"]);
+      const tid = (typeof b.tenant === "string" && b.tenant ? b.tenant : null)
+        ?? (url.searchParams.get("tenant") || null)
+        ?? (await firstAdminTenant(who))?.id
+        ?? null;
+      if (!tid) throw new ComplianceError("forbidden", "not allowed");
+      return json(200, await eraseUserData({ registry, tenant: tid, targetUserId: b.userId, actor: who, now }));
+    } }],
     ["/spaces", {
       GET: async (req, url) => {
         const who = await caller(req);
@@ -818,6 +836,11 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       const { limit, before } = auditQuery(url);
       return json(200, await listBoardAudit({ caller: who, board: p.board, limit, before }, admin));
     } }],
+    ["/boards/:board/export-data", { GET: async (req, p, url) => {
+      const who = await caller(req);
+      const askedTenant = url.searchParams.get("tenant") || null;
+      return json(200, await exportBoardData({ registry, tenant: askedTenant, board: p.board, actor: who, now }));
+    } }],
     ["/boards/:board/snapshot", { GET: serveSnapshot, HEAD: serveSnapshot }],
     ["/boards/:board/versions", {
       GET: async (req, p) => json(200, await versions.list(await caller(req), p.board)),
@@ -941,6 +964,12 @@ export function httpRoutes({ registry, sessions, oidc = null, tenancy, home = nu
       return null;
     } catch (e) {
       if (e instanceof Refusal) return e.res;
+      if (e instanceof ComplianceError) {
+        if (e.code === "forbidden") return err(403, "forbidden");
+        if (e.code === "not-found") return err(404, "not-found");
+        if (e.code === "bad-request") return err(400, "bad-request", { message: String(e.message).slice(0, 200) });
+        if (e.code === "last-admin" || e.code === "is-admin" || e.code === "still-owns") return err(409, e.code);
+      }
       if (e instanceof AdminError) {
         if (e.code === "forbidden") return err(403, "forbidden");
         if (e.code === "not-found") return err(404, "not-found");

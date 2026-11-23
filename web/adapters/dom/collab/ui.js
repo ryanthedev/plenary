@@ -111,7 +111,7 @@ export function mountCollab({ root, canvasOverlay = null, port, view, theme = "l
       h("span.stack", {}, shown.map(w => av(w.user, w.name ?? "Someone", ".live")), badge("desk-more", more), badge("phone-more", phoneMore)),
       // A count of VIEWERS only (view-only tabs, PROTOCOL.md `here.viewers`); people who can draw are the avatars beside it.
       h("span.watching", { title: `${watching(viewers)} view-only ${viewers === 1 ? "tab" : "tabs"} watching (people who can draw show as avatars)` },
-        h("span.eye", {}, "👁 "), h("b", {}, watching(viewers)), h("span.wtxt", {}, viewers === 1 ? " viewer" : " viewers")));
+        h("b", {}, watching(viewers)), h("span.wtxt", {}, viewers === 1 ? " viewer" : " viewers")));
   }
 
   // ── emote bar and picker ──

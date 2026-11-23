@@ -230,7 +230,7 @@ test("six-digit viewer count remains available in the mounted header", () => {
   rig.net.broadcast({ t: "here", writerCount: 0, viewers: 100000 });
   while (rig.net.step());
   const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
-  expect(watching.textContent).toBe("👁 100,000 viewers");
+  expect(watching.textContent).toBe("100,000 viewers");
   expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(2);
 });
 
@@ -243,7 +243,7 @@ test("1280px header keeps its board name rule with a six-digit viewer count and 
   while (rig.net.step());
   rig.step(2);
   const watching = find(page.byId.topbar, e => e.classList.contains("watching"));
-  expect(watching.textContent).toBe("👁 999,999 viewers");
+  expect(watching.textContent).toBe("999,999 viewers");
   expect(page.byId.topbar.all().filter(e => e.classList.contains("av")).length).toBeGreaterThanOrEqual(3);
 });
 

@@ -703,15 +703,33 @@ export function renderPanel(root, ctx) {
       const goFrame = id => { if (ctx.onJumpFrame) ctx.onJumpFrame(id); else S.goToFrame(id); ctx.onChange(); };
       const stepFrame = d => { if (ctx.onStepFrame) ctx.onStepFrame(d); else S.stepFrame(d); };
       if (ribbonMode) {
-        return [
-          ribbonGroup("frames-nav", "Navigate", [
-            ribbonRow("", "", chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => stepFrame(1), "PgDn", true)),
-            ribbonRow("", "", chip("all", false, () => S.fit(), "Fit everything (⇧1)", true)),
-          ]),
-          ribbonGroup("frames-list", "Frames", [
-            h("div.ribbon-grid", {}, fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => goFrame(f.id) }, h("span.dim", {}, String(i + 1)), " ", f.rawName || `Frame ${i + 1}`))),
-          ], ".ribbon-group-scroll"),
-        ].filter(Boolean);
+        const header = h("div.vbar-head.frames-bar-head", {},
+          h("div.vbar-head-left", {},
+            h("span.vbar-title", {}, "Frames"),
+            h("span.vbar-count.frames-bar-count", { "aria-label": `${fs.length} frames` }, String(fs.length))),
+          h("div.vbar-head-acts", {},
+            h("button.tb.vbar-close-btn", {
+              type: "button",
+              title: "Close Frames",
+              "aria-label": "Close Frames",
+              "data-fk": "frames:close",
+              onclick: () => ctx.onToggleRibbon?.(),
+            }, icon("close", { size: 14 }))));
+        const list = h("div.vbar-list.frames-bar-list", { role: "list", "aria-label": "Frames" },
+          fs.map((f, i) => h("button.list-row.vbar-row.frame-row" + (B.frameAt === f.id ? ".on" : ""), {
+            type: "button",
+            role: "listitem",
+            "data-fk": `frame:${f.id}`,
+            onclick: () => goFrame(f.id),
+          },
+            h("span.vbar-idx.dim", {}, String(i + 1)),
+            h("span.vbar-name", {}, f.rawName || `Frame ${i + 1}`))));
+        const footer = h("div.vbar-foot.frames-bar-foot", {},
+          h("div.vbar-foot-grp", {},
+            chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => stepFrame(-1), "PgUp", true, "frames:prev"),
+            chip(["next ", icon("chevronRight", { size: 14 })], false, () => stepFrame(1), "PgDn", true, "frames:next")),
+          chip("Fit all", false, () => S.fit(), "Fit everything (⇧1)", true, "frames:fit"));
+        return [header, list, footer];
       }
       return [
         ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => goFrame(f.id) }, h("span.dim", {}, String(i + 1)), " ", f.rawName || `Frame ${i + 1}`)),
@@ -1011,17 +1029,34 @@ export function renderPanel(root, ctx) {
       }, "＋ Cloud pack");
       const libNodes = items.map((it, i) => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, "data-fk": `lib:${it.id ?? i}`, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")));
       if (ribbonMode) {
-        return [
-          ribbonGroup("library-actions", "Library", [
-            ribbonRow("", "", chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)")),
-            ribbonRow("", "", k8sBtn, cloudBtn),
-          ]),
-          ribbonGroup("library-items", "Items", [
-            items.length
-              ? h("div.lib.ribbon-grid", {}, libNodes)
-              : h("div.hint", {}, "Empty. Select shapes and save them, install an icon pack, or drop a .excalidrawlib."),
-          ], ".ribbon-group-scroll"),
-        ].filter(Boolean);
+        const canSave = !dis && B.sel.size > 0;
+        const header = h("div.vbar-head.library-bar-head", {},
+          h("div.vbar-head-left", {},
+            h("span.vbar-title", {}, "Library"),
+            h("span.vbar-count.library-bar-count", { "aria-label": `${items.length} library items` }, String(items.length))),
+          h("div.vbar-head-acts", {},
+            h("button.c.vbar-add-btn", {
+              type: "button",
+              title: "Save selection to library",
+              "aria-label": "Save selection to library",
+              "data-fk": "lib:save",
+              disabled: !canSave,
+              onclick: () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); },
+            }, icon("plus", { size: 13 }), " Save"),
+            h("button.tb.vbar-close-btn", {
+              type: "button",
+              title: "Close Library",
+              "aria-label": "Close Library",
+              "data-fk": "library:close",
+              onclick: () => ctx.onToggleRibbon?.(),
+            }, icon("close", { size: 14 }))));
+        const body = h("div.vbar-list.library-bar-list", {},
+          items.length
+            ? h("div.lib.vbar-lib-grid", {}, libNodes)
+            : h("div.vbar-empty.hint", {}, "Empty. Select shapes and save them, install an icon pack below, or drop a .excalidrawlib."));
+        const footer = h("div.vbar-foot.library-bar-foot", {},
+          h("div.vbar-pack-row", {}, k8sBtn, cloudBtn));
+        return [header, body, footer];
       }
       return [
         h("div.lib", {}, libNodes),

@@ -3111,7 +3111,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       cancelActiveSampler();
       ui.colorPicker = null;
     }
-    const ribbonLayout = S.role !== "annotator" && expanded && activeTab === "layers" ? "vertical" : "horizontal";
+    const VERTICAL_RIBBON_TABS = new Set(["layers", "frames", "library"]);
+    const ribbonLayout = S.role !== "annotator" && expanded && VERTICAL_RIBBON_TABS.has(activeTab) ? "vertical" : "horizontal";
     panel.setAttribute?.("data-ribbon-expanded", String(expanded));
     panel.setAttribute?.("data-ribbon-layout", ribbonLayout);
     panel.style.width = `${lay.width}px`;

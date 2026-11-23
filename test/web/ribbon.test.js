@@ -215,14 +215,45 @@ describe("Word-Style Two-Bar Contextual Ribbon DOM integration", () => {
     expect(find(layersFoot, e => e.attrs?.["data-fk"] === "layers:move-sel")?.disabled).toBe(false);
     expect(find(layersFoot, e => e.attrs?.["data-fk"] === "layers:delete")?.disabled).toBe(true);
 
-    // Switch to Library tab -> seamlessly switches back to horizontal Word-style ribbon (Library + Items groups)
+    // Switch to Library tab -> dedicated vertical floating bar (sticky header, items/empty body, icon pack footer)
     find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "library").click();
     step(20);
-    expect(panel.attrs["data-ribbon-layout"]).toBe("horizontal");
+    expect(panel.attrs["data-ribbon-layout"]).toBe("vertical");
     const libSec = find(panel, e => e.attrs?.["data-sec"] === "library" && e.attrs?.["data-ribbon-hidden"] !== "true");
-    const libLabels = findAll(libSec, e => e.classList?.contains?.("ribbon-group"))
-      .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
-    expect(libLabels).toEqual(["Library", "Items"]);
+    expect(libSec).toBeDefined();
+    expect(find(libSec, e => e.classList?.contains?.("library-bar-head"))).toBeDefined();
+    expect(find(libSec, e => e.classList?.contains?.("library-bar-count"))?.textContent).toBe("0");
+    expect(find(libSec, e => e.attrs?.["data-fk"] === "lib:save")).toBeDefined();
+    expect(find(libSec, e => e.attrs?.["data-fk"] === "library:close")).toBeDefined();
+    expect(find(libSec, e => e.classList?.contains?.("library-bar-list"))).toBeDefined();
+    expect(find(libSec, e => e.classList?.contains?.("library-bar-foot"))).toBeDefined();
+    expect(find(libSec, e => e.attrs?.["data-fk"] === "lib:pack:kubernetes")).toBeDefined();
+    expect(find(libSec, e => e.attrs?.["data-fk"] === "lib:pack:cloud")).toBeDefined();
+
+    // Draw a frame and switch to Frames tab -> dedicated vertical floating bar
+    drawShape(S, "frame", 360, 100);
+    step(20);
+    find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "frames").click();
+    step(20);
+    expect(panel.attrs["data-ribbon-layout"]).toBe("vertical");
+    const framesSec = find(panel, e => e.attrs?.["data-sec"] === "frames" && e.attrs?.["data-ribbon-hidden"] !== "true");
+    expect(framesSec).toBeDefined();
+    expect(find(framesSec, e => e.classList?.contains?.("frames-bar-head"))).toBeDefined();
+    expect(find(framesSec, e => e.classList?.contains?.("frames-bar-count"))?.textContent).toBe("1");
+    expect(find(framesSec, e => e.attrs?.["data-fk"] === "frames:close")).toBeDefined();
+    const framesList = find(framesSec, e => e.classList?.contains?.("frames-bar-list") && e.attrs?.role === "list");
+    expect(framesList).toBeDefined();
+    expect(findAll(framesList, e => e.classList?.contains?.("frame-row")).length).toBe(1);
+    const framesFoot = find(framesSec, e => e.classList?.contains?.("frames-bar-foot"));
+    expect(framesFoot).toBeDefined();
+    expect(find(framesFoot, e => e.attrs?.["data-fk"] === "frames:prev")).toBeDefined();
+    expect(find(framesFoot, e => e.attrs?.["data-fk"] === "frames:next")).toBeDefined();
+    expect(find(framesFoot, e => e.attrs?.["data-fk"] === "frames:fit")).toBeDefined();
+
+    // Switching back to Properties returns seamlessly to horizontal Word-style ribbon
+    find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "properties").click();
+    step(20);
+    expect(panel.attrs["data-ribbon-layout"]).toBe("horizontal");
   });
 
   test("escape hatches: clicking active expanded tab collapses, clicking another tab expands, and toggle button works", () => {

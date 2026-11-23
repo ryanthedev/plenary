@@ -25,6 +25,7 @@ test("header ellipsis rules cover 1024, 1279, and 1280 pixel desktop widths", ()
   expect(css).not.toMatch(/font-size:\s*7\.5px|letter-spacing:\s*-\.03em/);
   expect(css).toMatch(/\.dock \.tb\s*\{[^}]*font-size:\s*8\.75px/s);
   expect(css).toMatch(/@media\s*\(min-width:\s*600px\)\s*and\s*\(max-width:\s*1023px\)[\s\S]*?\.dock \.tb\s*\{[^}]*font-size:\s*10px/s);
+  expect(css).toMatch(/\.panel\s*\{[^}]*position:\s*absolute[^}]*top:\s*0[^}]*left:\s*0[^}]*right:\s*0/s);
 });
 
 test("canvas page has a page heading", () => {

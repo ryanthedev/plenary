@@ -316,4 +316,141 @@ describe("timeline DOM adapter", () => {
     updateTimelineInPlace(tl, B, B.duration());
     expect(tl.text.textContent).toBe("00:00.6 / 00:00.8");
   });
+
+  test("#13B: expanded multi-swimlane NLE drawer supports clip drag, edge resize, lane reorder, +Animate, +Cue, Next Cue, Cascade, Align, and needle sweep", () => {
+    let now = 0;
+    const B = new Editor({
+      scene: {
+        elements: [
+          { id: "r1", type: "rectangle", x: 0, y: 0, width: 100, height: 60, customData: { anim: { preset: "fade", start: 0, duration: 600, order: 0 } } },
+          { id: "r2", type: "rectangle", x: 150, y: 0, width: 100, height: 60, customData: { anim: { preset: "draw", start: 400, duration: 600, order: 1 } } },
+          { id: "r3", type: "ellipse", x: 300, y: 0, width: 80, height: 80 },
+        ],
+      },
+      clock: () => now,
+    });
+    B.select(["r1"]);
+    const root = new StubNode("footer");
+    const tl = { fill: null, head: null, needle: null, text: null, track: null, sig: "" };
+    let changes = 0;
+    const render = () => {
+      buildTimeline(root, {
+        board: B,
+        dur: B.duration(),
+        marks: [0, 400],
+        spans: timelineSpans(B.doc.live()),
+        tl,
+        h,
+        replace,
+        expanded: true,
+        compactOnly: false,
+        showAuthoring: true,
+        onToggleExpand: () => {},
+        onChange: () => { changes++; render(); },
+      });
+    };
+    render();
+
+    // Renders NLE drawer, ruler ticks, 2 swimlane rows, Clip Inspector, and full-height needle
+    expect(root.attrs["data-expanded"]).toBe("true");
+    expect(root.all().some(n => n.attrs["data-nle"] === "1")).toBe(true);
+    expect(root.all().filter(n => n.className.includes("tl-lane-row")).length).toBe(2);
+    expect(root.all().some(n => n.attrs["data-clip-inspector"] === "r1")).toBe(true);
+    expect(tl.needle).toBeTruthy();
+
+    // 60fps in-place needle update with 0 DOM rebuilds
+    const needle0 = tl.needle;
+    B.seekTo(500, { explicit: true });
+    updateTimelineInPlace(tl, B, B.duration());
+    expect(tl.needle).toBe(needle0);
+    expect(tl.needle.style.left).toBe("50%");
+
+    // Clip body drag: drag r1 right by 40px on 200px lane (40/200 * 1000ms = +200ms)
+    const clip1 = root.all().find(n => n.attrs["data-clip-id"] === "r1" && n.className.includes("tl-clip"));
+    clip1.fire("pointerdown", { button: 0, pointerId: 1, clientX: 10 });
+    clip1.fire("pointermove", { pointerId: 1, clientX: 50, altKey: true });
+    clip1.fire("pointerup", { pointerId: 1, clientX: 50 });
+    expect(B.doc.get("r1").customData.anim.start).toBe(200);
+
+    // Pointer cancel restores clip position and does NOT commit timing change
+    const clip1b = root.all().find(n => n.attrs["data-clip-id"] === "r1" && n.className.includes("tl-clip"));
+    const beforeLeft = clip1b.style.left;
+    clip1b.fire("pointerdown", { button: 0, pointerId: 9, clientX: 10 });
+    clip1b.fire("pointermove", { pointerId: 9, clientX: 90, altKey: true });
+    clip1b.fire("pointercancel", { pointerId: 9, clientX: 90 });
+    expect(B.doc.get("r1").customData.anim.start).toBe(200);
+    expect(clip1b.style.left).toBe(beforeLeft);
+
+    // Clip right-handle resize: drag r1 right handle +40px (+200ms -> duration 800ms)
+    const rightH = root.all().find(n => n.attrs["data-clip-handle"] === "right" && n.attrs["data-clip-id"] === "r1");
+    rightH.fire("pointerdown", { button: 0, pointerId: 2, clientX: 100 });
+    rightH.fire("pointermove", { pointerId: 2, clientX: 140, altKey: true });
+    rightH.fire("pointerup", { pointerId: 2, clientX: 140 });
+    expect(B.doc.get("r1").customData.anim.duration).toBe(800);
+
+    // Clip left-handle resize: drag r1 left handle +20px (+100ms -> start 300, duration 700, end pinned at 1000)
+    const leftH = root.all().find(n => n.attrs["data-clip-handle"] === "left" && n.attrs["data-clip-id"] === "r1");
+    leftH.fire("pointerdown", { button: 0, pointerId: 3, clientX: 60 });
+    leftH.fire("pointermove", { pointerId: 3, clientX: 80, altKey: true });
+    leftH.fire("pointerup", { pointerId: 3, clientX: 80 });
+    expect(B.doc.get("r1").customData.anim.start).toBe(300);
+    expect(B.doc.get("r1").customData.anim.duration).toBe(700);
+
+    // Lane reorder: move r2 up
+    const moveUp2 = root.all().find(n => n.attrs["data-track-move"] === "up" && n.attrs["data-track-id"] === "r2");
+    moveUp2.fire("click");
+    const laneIds = root.all().filter(n => n.className.includes("tl-lane-row")).map(n => n.attrs["data-track-id"]);
+    expect(laneIds).toEqual(["r2", "r1"]);
+
+    // + Animate adds selected non-animated shape r3
+    B.select(["r3"]);
+    render();
+    const addAnimBtn = root.all().find(n => n.attrs["data-action"] === "add-animate");
+    addAnimBtn.fire("click");
+    expect(B.doc.get("r3").customData.anim?.preset).toBe("fade");
+    expect(root.all().filter(n => n.className.includes("tl-lane-row")).length).toBe(3);
+
+    // Cascade sequences all lanes back-to-back
+    const cascadeBtn = root.all().find(n => n.attrs["data-action"] === "cascade");
+    cascadeBtn.fire("click");
+    expect(B.doc.get("r2").customData.anim.start).toBe(0);
+    expect(B.doc.get("r1").customData.anim.start).toBeGreaterThan(0);
+
+    // Align aligns all lanes to current playhead (300ms)
+    B.seekTo(300, { explicit: true });
+    const alignBtn = root.all().find(n => n.attrs["data-action"] === "align");
+    alignBtn.fire("click");
+    expect(B.doc.get("r1").customData.anim.start).toBe(300);
+    expect(B.doc.get("r2").customData.anim.start).toBe(300);
+    expect(B.doc.get("r3").customData.anim.start).toBe(300);
+
+    // + Cue drops a ◆ cue marker at playhead (300ms) and reveals Next Cue button
+    const addCueBtn = root.all().find(n => n.attrs["data-action"] === "add-cue");
+    addCueBtn.fire("click");
+    expect(root.all().filter(n => n.className.includes("tl-cue-marker")).length).toBe(1);
+    const nextCueBtn = root.all().find(n => n.attrs["data-action"] === "next-cue");
+    expect(nextCueBtn).toBeDefined();
+    B.seekTo(0, { explicit: true });
+    nextCueBtn.fire("click");
+    expect(B.play?.stopAt).toBe(300);
+
+    // Phone compactOnly fallback collapses NLE drawer
+    buildTimeline(root, {
+      board: B,
+      dur: B.duration(),
+      marks: [300],
+      spans: timelineSpans(B.doc.live()),
+      tl,
+      h,
+      replace,
+      expanded: true,
+      compactOnly: true,
+      onToggleExpand: () => {},
+      onChange: () => {},
+    });
+    expect(root.attrs["data-expanded"]).toBe("false");
+    expect(root.all().some(n => n.attrs["data-nle"] === "1")).toBe(false);
+    expect(root.all().some(n => n.attrs["data-action"] === "toggle-tracks")).toBe(false);
+    expect(changes).toBeGreaterThan(0);
+  });
 });

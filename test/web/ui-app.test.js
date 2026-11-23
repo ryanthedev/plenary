@@ -59,7 +59,7 @@ test("C-2/C-8: 60 frames of wheel panning and 100 incoming ops rebuild topbar, p
   drawRect(bo, 100, 100); step(2);
   app.ui.drawer = "notes"; app.setPanel({ type: "noop" }); step(2);
   expect(page.byId.drawer.hidden).toBe(false);
-  expect(page.byId.timeline.hidden).toBe(false);
+  expect(page.byId.timeline.hidden).toBe(true);
   expect(page.byId.panel.hidden).toBe(false);
   step(20);                                           // let the throttle window pass
   let c0 = counts(), r0 = { ...app.ui.rebuilds };
@@ -756,6 +756,8 @@ test("K4 panel: a remote frame rename shows in the frames list; a remote preset 
   drawRect(bo, 600, 600); step(20);
   const id = bo.eds.board.doc.live().find(e => e.type === "rectangle").id;
   bo.act("board", e => { e.select([id]); e.animate("fade"); }); step(20);
+  const animTab = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs?.["data-mode"] === "animate");
+  animTab.click(); step(20);
   S.act("board", e => e.select([id])); step(20);
   const on = p => find(page.byId.panel, e => e.tagName === "BUTTON" && e.textContent === p)?.className ?? "";
   expect(on("fade")).toContain("on");

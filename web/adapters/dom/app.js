@@ -30,7 +30,7 @@ import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
 import { icon } from "./icons.js";
 import { buildTimeline, updateTimelineInPlace, prefersReducedMotion } from "./timeline.js";
-import { timelineSpans } from "../../../packages/core/anim.js";
+import { timelineSpans, timelineTracks, cuesOf } from "../../../packages/core/anim.js";
 import { cancelActiveSampler } from "./color-picker.js";
 import { pillPopover } from "./explain.js";
 import { openShare } from "./share.js";
@@ -117,6 +117,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const ui = {
     theme: initialTheme,
     settings: userSettings,
+    workspaceMode: /** @type {"draw" | "animate" | "present"} */ ("draw"),
+    timelineExpanded: false,
     panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
     localView: { soloLayerId: null, activeViewId: null },
     renamingBoard: false,
@@ -124,6 +126,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     embed: { url: "", error: "" },
     export: { format: "svg", scale: 2, page: "board", frameId: null },
   };
+  const syncWorkspaceModeAttr = mode => {
+    document.body?.setAttribute?.("data-workspace-mode", mode);
+    document.documentElement?.setAttribute?.("data-workspace-mode", mode);
+  };
+  syncWorkspaceModeAttr(ui.workspaceMode);
   let currentBoardTitle = typeof boardTitle === "string" ? boardTitle.replace(CONTROL_BIDI_RE, "").trim() : null;
   let serverCanRename = null;
   const displayBoardTitle = () => formatBoardTitle(board, currentBoardTitle);
@@ -1075,6 +1082,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       return;
     }
     if (hasOpenDialog() || isEditable(t) || inDialog(t) || isSlider(t)) return;   // inputs, dialogs, sliders keep their keys
+    if (e.key === "Escape" && ui.workspaceMode === "present" && !ui.sheet && !ui.moreOpen && !viewsMenu.isOpen() && !settingsDialog.isOpen() && !versionsDialog?.isOpen()) {
+      e.preventDefault(); e.stopPropagation?.();
+      setWorkspaceMode("draw");
+      return;
+    }
     if (isInteractive(t) && (e.key === "Enter" || e.key === " " || e.code === "Space")) return;   // let focused buttons/links activate
     if (e.key === " " || e.code === "Space") space = true;
     const k = k0, m = m0;
@@ -1478,15 +1490,20 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const frames = listNamedFrames(B.doc);
     const marks = [...new Set(live.map(e => e.customData?.anim?.start).filter(Number.isFinite))];
     const spans = timelineSpans(live);
+    const tracks = timelineTracks(B.doc);
+    const cues = cuesOf(B.doc);
     const spansSig = JSON.stringify(spans.map(s => [s.id, s.preset, s.start, s.duration, s.easing, s.loop]));
-    return { frames, framesSig: JSON.stringify(frames.map(f => [f.id, f.name ?? ""])), marks, spans, spansSig, dur: B.duration(), counts: JSON.stringify(counts) };
+    const tracksSig = JSON.stringify(tracks.map(t => [t.id, t.label, t.preset, t.start, t.duration, t.easing, t.loop, t.order]));
+    const cuesSig = JSON.stringify(cues.map(c => [c.id, c.at, c.label]));
+    const maxCueAt = cues.length ? cues[cues.length - 1].at : 0;
+    return { frames, framesSig: JSON.stringify(frames.map(f => [f.id, f.name ?? ""])), marks, spans, spansSig, tracks, tracksSig, cues, cuesSig, dur: Math.max(B.duration(), maxCueAt), counts: JSON.stringify(counts) };
   });
   const notesCount = () => notesInfo(S.eds.notes.doc).notes.length;
   // Updated in place every frame (cheap compares), never by a rebuild: the zoom % and the connection pill.
   const zoomPct = h("span.pct");
-  const tl = { fill: null, head: null, text: null, track: null, sig: "" };
+  const tl = { fill: null, head: null, needle: null, text: null, track: null, sig: "" };
   function timelineInPlace() {
-    if (!tl.fill || S.role !== "presenter") return;
+    if ((!tl.fill && !tl.needle) || S.role !== "presenter") return;
     const B = S.eds.board, { dur } = boardInfo(B.doc);
     updateTimelineInPlace(tl, B, dur);
   }
@@ -1873,6 +1890,30 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     toast(next ? "Audience edits locked" : "Audience edits unlocked", 2000);
   };
 
+  /**
+   * Switch presenter workspace mode: Draw (default), Animate (movie timeline), or Present (distraction-free).
+   * @param {"draw" | "animate" | "present"} mode
+   */
+  function setWorkspaceMode(mode) {
+    if (S.role !== "presenter" || S.effective !== "presenter") return false;
+    if (mode !== "draw" && mode !== "animate" && mode !== "present") return false;
+    if (ui.workspaceMode === mode) return true;
+    ui.workspaceMode = mode;
+    syncWorkspaceModeAttr(mode);
+    if (mode === "animate") {
+      ui.timelineExpanded = !isNarrowPhone();
+    } else if (mode === "draw") {
+      ui.timelineExpanded = false;
+    } else if (mode === "present") {
+      dismissOverlays();
+      ui.drawer = null;
+      cancelActiveSampler();
+    }
+    chromeDirty = true;
+    dirty = true;
+    return true;
+  }
+
   function topbar() {
     const role = S.role, tools = toolsFor(role), may = S.may();
     const { locked: audienceLocked } = boardModeration();
@@ -2040,6 +2081,26 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       title: "Jump to frame or view (⌘J)",
       onclick: e => openViewsMenu(e?.currentTarget ?? null),
     }, icon("frame", { size: 14 }), h("span.views-pill-lab", {}, viewsPillLabel), h("kbd.views-pill-kbd", {}, "⌘J"));
+    const modeSwitcher = role === "presenter"
+      ? h("div.island.mode-switcher", {
+          role: "tablist",
+          "aria-label": "Workspace mode",
+          "data-workspace-mode": ui.workspaceMode,
+        },
+        [
+          ["draw", "Draw", "edit", "Draw mode — sketch and edit shapes"],
+          ["animate", "Animate", "play", "Animate mode — multi-swimlane movie timeline"],
+          ["present", "Present", "fit", "Present mode — distraction-free live walkthrough"],
+        ].map(([id, label, ic, tip]) => h("button.mode-tab" + (ui.workspaceMode === id ? ".on" : ""), {
+          type: "button",
+          role: "tab",
+          "aria-selected": String(ui.workspaceMode === id),
+          "data-mode": id,
+          title: tip,
+          onclick: () => setWorkspaceMode(/** @type {"draw" | "animate" | "present"} */ (id)),
+        }, icon(ic, { size: 13 }), h("span.mode-tab-lab", {}, label))))
+      : null;
+    const showToolRail = role !== "presenter" || ui.workspaceMode === "draw";
     return [
       h("div.island.top-left", {},
         brandHref
@@ -2049,11 +2110,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         audienceLocked ? h("span.board-locked-badge", { role: "status", "data-audience-locked": "1", title: "Audience edits are locked by presenter" }, icon("lock", { size: 12 }), " Locked") : null,
         moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null,
         viewsPill),
-      h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
-        role !== "viewer" ? [h("span.sep"),
-          h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", "aria-pressed": String(S.toolLock()), disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
-          h("button.tb", { title: "Undo (⌘Z)", "aria-label": "Undo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.undo()); } }, h("span.ic", {}, icon("undo", { size: 17 }))),
-          h("button.tb", { title: "Redo (⌘⇧Z)", "aria-label": "Redo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.redo()); } }, h("span.ic", {}, icon("redo", { size: 17 })))] : null),
+      modeSwitcher,
+      showToolRail
+        ? h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
+            role !== "viewer" ? [h("span.sep"),
+              h("button.tb" + (S.toolLock() ? ".on" : ""), { title: "Keep the tool after drawing (Q)", "aria-label": "Lock tool", "aria-pressed": String(S.toolLock()), disabled: !may, onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 17 })), h("span.k", {}, "Q")),
+              h("button.tb", { title: "Undo (⌘Z)", "aria-label": "Undo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.undo()); } }, h("span.ic", {}, icon("undo", { size: 17 }))),
+              h("button.tb", { title: "Redo (⌘⇧Z)", "aria-label": "Redo", disabled: !may, onclick: () => { S.act(activeStream(), e => e.redo()); } }, h("span.ic", {}, icon("redo", { size: 17 })))] : null)
+        : null,
       h("span.spacer"),
       actions,
     ];
@@ -2061,7 +2125,89 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
 
   function hud() {
-    const B = S.eds.board, fs = boardInfo(B.doc).frames, i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
+    const B = S.eds.board, bi = boardInfo(B.doc), fs = bi.frames, i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
+    if (S.role === "presenter" && ui.workspaceMode === "present") {
+      const hasAnimOrCues = bi.tracks.length > 0 || bi.cues.length > 0;
+      const savedViews = viewsOf(B.doc);
+      const laserOn = S.tool === "laser";
+      const { locked: audienceLocked } = boardModeration();
+      const stepPrev = () => {
+        if (hasAnimOrCues && (B.time() ?? 0) > 0) {
+          B.stepToPrevCue({ explicit: true });
+          dirty = true;
+          chromeDirty = true;
+          return;
+        }
+        if (fs.length > 0) stepBoardFrame(-1);
+        else if (savedViews.length > 0) stepView(-1);
+        else if (hasAnimOrCues) { B.stepToPrevCue({ explicit: true }); dirty = true; chromeDirty = true; }
+      };
+      const stepNext = () => {
+        if (hasAnimOrCues) {
+          B.playToNextCue({ explicit: true });
+          dirty = true;
+          chromeDirty = true;
+          return;
+        }
+        if (fs.length > 0) stepBoardFrame(1);
+        else if (savedViews.length > 0) stepView(1);
+      };
+      const presenterBar = h("div.island.presenter-bar", { role: "toolbar", "aria-label": "Presenter controls", "data-presenter-bar": "1" },
+        h("button.btn.ghost", {
+          type: "button",
+          "data-present-action": "prev",
+          "aria-label": "Previous cue or frame",
+          title: hasAnimOrCues ? "Previous cue" : "Previous frame",
+          onclick: stepPrev,
+        }, icon("chevronLeft", { size: 15 }), " Prev"),
+        h("button.btn.primary", {
+          type: "button",
+          "data-present-action": "next",
+          "aria-label": hasAnimOrCues ? "Next cue" : "Next frame",
+          title: hasAnimOrCues ? "Play to next cue" : "Next frame or view",
+          onclick: stepNext,
+        }, hasAnimOrCues ? "Next Cue " : "Next Frame ", icon("chevronRight", { size: 15 })),
+        h("span.sep"),
+        h("button.btn.ghost", {
+          type: "button",
+          "data-present-action": "views",
+          "data-views-open": "1",
+          "aria-haspopup": "dialog",
+          "aria-expanded": String(viewsMenu.isOpen()),
+          "aria-label": "Views",
+          title: "Jump to frame or view (⌘J)",
+          onclick: e => openViewsMenu(e?.currentTarget ?? null),
+        }, icon("frame", { size: 15 }), " Views"),
+        h("button.btn.ghost" + (laserOn ? ".on" : ""), {
+          type: "button",
+          "data-present-action": "laser",
+          "aria-label": "Laser pointer",
+          "aria-pressed": String(laserOn),
+          title: "Toggle laser pointer",
+          onclick: () => { S.setTool(laserOn ? "select" : "laser"); chromeDirty = true; },
+        }, icon("laser", { size: 15 }), " Laser"),
+        h("button.btn.ghost" + (audienceLocked ? ".on" : ""), {
+          type: "button",
+          "data-present-action": "lock-audience",
+          "aria-label": audienceLocked ? "Unlock audience edits" : "Lock audience edits",
+          "aria-pressed": String(audienceLocked),
+          disabled: !may,
+          title: audienceLocked ? "Unlock audience edits" : "Lock audience edits",
+          onclick: toggleAudienceLock,
+        }, icon(audienceLocked ? "lock" : "unlock", { size: 15 }), audienceLocked ? " Locked" : " Lock Audience"),
+        h("span.sep"),
+        h("button.btn.ghost.present-exit", {
+          type: "button",
+          "data-present-action": "exit",
+          "aria-label": "Exit Present",
+          title: "Exit Present mode (Esc)",
+          onclick: () => setWorkspaceMode("draw"),
+        }, icon("close", { size: 14 }), " Exit Present"));
+      replace($("#hudBL"), []);
+      replace($("#hudBC"), presenterBar);
+      replace($("#hudBR"), []);
+      return;
+    }
     const { canUndo, canRedo } = undoRedoState();
     const ed = activeEditor();
     const sel = ed ? ed.selected().filter(e => !isLabel(e)) : [];
@@ -2175,18 +2321,61 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (collab) {
       if (collab.parts.emotes.parentNode !== $("#hudBC")) replace($("#hudBC"), collab.parts.emotes);
       if (collab.parts.emoteButton.parentNode !== $("#hudBR")) replace($("#hudBR"), collab.parts.emoteButton);
+    } else {
+      replace($("#hudBC"), []);
+      replace($("#hudBR"), []);
     }
   }
 
   function timeline() {
     const el = $("#timeline"), B = S.eds.board;
-    el.hidden = S.role !== "presenter";
-    if (el.hidden) return;
+    const { dur, marks, spans, tracks, cues } = boardInfo(B.doc);
+    const hasAnimOrCues = tracks.length > 0 || cues.length > 0;
+    const showTimeline = S.role === "presenter" && (ui.workspaceMode === "animate" || (ui.workspaceMode === "draw" && hasAnimOrCues));
+    el.hidden = !showTimeline;
+    if (el.hidden) {
+      tl.fill = null;
+      tl.head = null;
+      tl.needle = null;
+      return;
+    }
     const reduced = prefersReducedMotion();
     B.setReducedMotion(reduced);
-    const { dur, marks, spans } = boardInfo(B.doc);
+    const expanded = ui.workspaceMode === "animate" ? ui.timelineExpanded : false;
     buildTimeline(el, {
-      board: B, dur, marks, spans, tl, h, replace, reducedMotion: reduced,
+      board: B,
+      dur,
+      marks,
+      spans,
+      tracks,
+      cues,
+      tl,
+      h,
+      replace,
+      reducedMotion: reduced,
+      expanded,
+      compactOnly: isNarrowPhone(),
+      showAuthoring: ui.workspaceMode === "animate",
+      canEdit: S.may(),
+      act: fn => S.act("board", fn),
+      actSettings: fn => S.act("board", fn, { settings: true }),
+      onToggleExpand: next => {
+        if (ui.workspaceMode === "draw" && next) {
+          setWorkspaceMode("animate");
+          return;
+        }
+        ui.timelineExpanded = Boolean(next);
+        chromeDirty = true;
+      },
+      onFocusElement: id => {
+        const target = B.doc.get(id);
+        if (target) {
+          S.eds.notes.cancelCamera();
+          B.fit([target], 80);
+          S.syncView("board");
+          dirty = true;
+        }
+      },
       onChange: () => { chromeDirty = true; },
       onSeek: () => { timelineInPlace(); dirty = true; },
     });
@@ -2234,7 +2423,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
 
   const T = id => toolsFor("presenter").find(t => t.id === id);
   function dock() {
+    const dockEl = $("#dock");
     const may = S.may(), role = S.role;
+    dockEl.hidden = role === "presenter" && ui.workspaceMode !== "draw";
+    if (dockEl.hidden) { replace(dockEl, []); return; }
     const btn = (icName, label, on, onclick, disabled = false, ariaLabel = label, extra = {}) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel, ...(label === "More" ? { "data-dock-more": "1" } : {}), ...extra }, h("span.ic", {}, icon(icName, { size: 20 })), label);
     const sheetBtn = (icName, label, id) => btn(icName, label, ui.sheet === id, e => setSheet(ui.sheet === id ? null : id, { opener: e?.currentTarget }), false, label, { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === id) });
     const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) });
@@ -2242,7 +2434,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
     else items = [btn("chevronLeft", "Prev", false, () => stepBoardFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => stepBoardFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
-    replace($("#dock"), items);
+    replace(dockEl, items);
   }
   const SHEET_DISMISS_PX = 72, SHEET_FLICK_VY = 0.55;
   const SHEET_LABELS = { tools: "More tools", panel: "Style and properties", notes: "Notes", comments: "Comments", actions: "Selection actions", rename: "Rename board" };
@@ -2414,7 +2606,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
   }
   const panelNodes = (inSheet = false) => renderPanel(null, {
-    session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel,
+    session: S, state: ui.panel, h, inSheet, workspaceMode: ui.workspaceMode, library: ui.library, setLibrary, setState: setPanel,
     prefs, canvas, clock, colorPicker: ui.colorPicker, colorPickerState: ui.colorPickerState,
     setColorPicker: prop => { cancelActiveSampler(); ui.colorPicker = prop; chromeDirty = true; },
     localView: resolvedLocalView(),
@@ -2670,7 +2862,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, isPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, ui.workspaceMode, ui.timelineExpanded, isPhone(), isNarrowPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -2724,10 +2916,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return root;
   };
   const parts = {
-    topbar: { key: () => `${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${boardModeration().locked ? "1" : "0"}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}`, build: buildTopbar },
-    panel: { key: () => (S.role === "viewer" || !ui.panel.open ? "" : panelKey()), build: buildPanel },
-    drawer: { key: () => (ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
-    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" ? "" : JSON.stringify([bi.marks, bi.spansSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t]); }, build: timeline },
+    topbar: { key: () => `${ui.workspaceMode}:${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${boardModeration().locked ? "1" : "0"}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}`, build: buildTopbar },
+    panel: { key: () => (S.role === "viewer" || ui.workspaceMode === "present" || !ui.panel.open ? "" : `${ui.workspaceMode}:${panelKey()}`), build: buildPanel },
+    drawer: { key: () => (ui.workspaceMode === "present" ? "" : ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
+    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" || ui.workspaceMode === "present" ? "" : JSON.stringify([ui.workspaceMode, ui.timelineExpanded, isNarrowPhone(), bi.marks, bi.spansSig, bi.tracksSig, bi.cuesSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t, ui.workspaceMode === "animate" ? [...B.sel].join(",") : ""]); }, build: timeline },
     hud: { key: hudKey, build: hud },
     overlays: { key: () => JSON.stringify([S.status, trashShown(), S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },
@@ -2751,7 +2943,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const keys = {};
   function buildPanel() {
     const panel = $("#panel"), lay = panelLayout(ui.panel, $(".main").getBoundingClientRect().width);
-    panel.hidden = S.role === "viewer" || !lay.show;
+    panel.hidden = S.role === "viewer" || ui.workspaceMode === "present" || !lay.show;
     if (panel.hidden) return true;
     if (busy(panel)) return false;
     panel.style.width = `${lay.width}px`;
@@ -2768,8 +2960,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   function buildDrawer() {
     const drawer = $("#drawer");
-    drawer.hidden = !ui.drawer;
-    if (!ui.drawer) return true;
+    drawer.hidden = !ui.drawer || ui.workspaceMode === "present";
+    if (drawer.hidden) return true;
     if (busy(drawer)) {
       // Typing in the compose box: refresh only the rows (a note just added must show), and leave the box (its text, its focus) alone.
       if (ui.drawer !== "notes" || !notesRefs.list || !drawer.contains(notesRefs.list)) return false;
@@ -2783,6 +2975,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   let pendingFocus = null;
   const chromeRoots = () => ["#topbar", "#panel", "#drawer", "#timeline", "#hudBL", "#hudBC", "#hudBR", "#dock", "#sheet", "#dialogs", "#overlays"].map(sel => $(sel)).filter(Boolean);
   function chrome() {
+    if ((S.role !== "presenter" || S.effective !== "presenter") && ui.workspaceMode !== "draw") {
+      ui.workspaceMode = "draw";
+      ui.timelineExpanded = false;
+      syncWorkspaceModeAttr("draw");
+      chromeDirty = true;
+    }
     inPlace();
     document.body.classList.toggle("stale", S.status !== "live");
     $("#veil").hidden = S.online;

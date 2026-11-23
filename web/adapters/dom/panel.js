@@ -51,9 +51,10 @@ export function propsModel(ed) {
 }
 
 /** Sections with something to say (core's panelSections `available`). */
-export function availableFor(session) {
+export function availableFor(session, workspaceMode = null) {
   const b = session.eds.board;
   return id => {
+    if (id === "animate" && workspaceMode === "draw") return false;
     if (id === "arrange") return b.sel.size > 0 || session.eds.notes.sel.size > 0;
     if (id === "frames") return listNamedFrames(b.doc).length > 0;
     return true;
@@ -617,14 +618,9 @@ export function renderPanel(root, ctx) {
   }
   const tabs = state.mode === "tabs" || ctx.inSheet;
   const st = tabs ? { ...state, mode: "tabs" } : state;
-  const secs = panelSections(st, availableFor(S));
+  const secs = panelSections(st, availableFor(S, ctx.workspaceMode ?? null));
   const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${listNamedFrames(B.doc).length}`, library: `· ${(ctx.library ?? []).length}` };
   const out = [];
-  if (!ctx.inSheet) out.push(h("div.panel-head", {},
-    h("button.tb" + (state.mode === "stack" ? ".on" : ""), { title: "Stack", "aria-label": "Stack layout", "aria-pressed": String(state.mode === "stack"), onclick: () => ctx.setState({ type: "mode", mode: "stack" }) }, icon("stack", { size: 15 })),
-    h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", "aria-label": "Tabs layout", "aria-pressed": String(state.mode === "tabs"), onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, icon("tabs", { size: 15 })),
-    h("button.tb", { title: "Fold all / unfold all", "aria-label": "Fold or unfold all", onclick: () => ctx.setState({ type: "foldAll", folded: state.folded.length < 6 }) }, icon("fold", { size: 15 })),
-    h("button.tb", { title: "Reset the panel layout", "aria-label": "Reset panel layout", onclick: () => ctx.setState({ type: "reset" }) }, icon("settings", { size: 15 }))));
   if (tabs) out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" }, secs.map(s => h("button" + (s.active ? ".on" : ""), {
     type: "button",
     role: "tab",

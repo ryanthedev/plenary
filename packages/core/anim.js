@@ -195,10 +195,21 @@ export function animState(el, t) {
   }
   const p = getPreset(anim.preset);
   if (!p) return null;
-  const start = anim.start ?? 0, dur = Math.max(1, anim.duration ?? 600);
-  let k = (t - start) / dur;
+  const start = anim.start ?? 0, dur = Math.max(1, anim.duration ?? p.duration ?? 600);
   const loop = anim.loop ?? p.loop ?? false;
-  if (loop) k = k < 0 ? 0 : k % 1;
+  let k;
+  if (t <= start) {
+    k = 0;
+  } else if (t >= start + dur) {
+    k = 1;
+  } else if (loop) {
+    // Repeat whole cycles inside [start, start + dur] at the preset's natural cadence
+    // so the clip bar on the timeline is the true active window and ends cleanly at rest.
+    const cycles = Math.max(1, Math.round(dur / Math.max(1, p.duration ?? dur)));
+    k = (((t - start) / dur) * cycles) % 1;
+  } else {
+    k = (t - start) / dur;
+  }
   k = clamp01(k);
   const e = ease(anim.easing ?? p.easing ?? "ease-out", k, "ease-out");
   if (p.fn) return clampState({ ...REST, ...p.fn(e, k) });

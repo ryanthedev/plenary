@@ -164,7 +164,7 @@ describe("animState across entrance, emphasis, path, and exit presets", () => {
     expect(animState(makeEl({ preset: "flip-in", start: 0, duration: 400 }), 0).scaleX).toBeLessThan(0.2);
   });
 
-  test("emphasis presets: at rest before start, active mid-cycle, loop by default, respect loop:false", () => {
+  test("emphasis presets: at rest before start, repeat whole cycles inside clip window when looping, stop cleanly at clip end, and respect loop:false", () => {
     for (const preset of emphasisPresets) {
       const el = makeEl({ preset, start: 100, duration: 800 });
       const before = animState(el, 0);
@@ -175,22 +175,38 @@ describe("animState across entrance, emphasis, path, and exit presets", () => {
       expect(before.rotate).toBeCloseTo(0, 6);
       expect(before.glow).toBeCloseTo(0, 6);
 
-      // Looping: t = start + 1.5 * dur matches t = start + 0.5 * dur
-      const mid1 = animState(el, 100 + 400);
-      const mid2 = animState(el, 100 + 1200);
-      expect(mid2.scale).toBeCloseTo(mid1.scale, 6);
-      expect(mid2.dy).toBeCloseTo(mid1.dy, 6);
-      expect(mid2.glow).toBeCloseTo(mid1.glow, 6);
+      // Bounded to clip window: stops cleanly at rest once t >= start + duration
+      const after = animState(el, 100 + 800 + 250);
+      expect(after.opacity).toBe(1);
+      expect(after.scale).toBeCloseTo(1, 6);
+      expect(after.dx).toBeCloseTo(0, 6);
+      expect(after.dy).toBeCloseTo(0, 6);
+      expect(after.rotate).toBeCloseTo(0, 6);
+      expect(after.glow).toBeCloseTo(0, 6);
     }
+
+    // Stretching a looping emphasis clip repeats whole cycles at the preset's cadence inside [start, start + dur]
+    const multiPulse = makeEl({ preset: "pulse", start: 100, duration: 1800 }); // 3 x 600ms cycles
+    const c1 = animState(multiPulse, 100 + 300);  // mid cycle 1
+    const c2 = animState(multiPulse, 100 + 900);  // mid cycle 2
+    const c3 = animState(multiPulse, 100 + 1500); // mid cycle 3
+    expect(c1.scale).toBeGreaterThan(1.05);
+    expect(c2.scale).toBeCloseTo(c1.scale, 6);
+    expect(c3.scale).toBeCloseTo(c1.scale, 6);
+    expect(animState(multiPulse, 100 + 1800).scale).toBeCloseTo(1, 6);
+    expect(animState(multiPulse, 100 + 2400).scale).toBeCloseTo(1, 6);
+
     expect(animState(makeEl({ preset: "pulse", start: 0, duration: 800 }), 400).scale).toBeGreaterThan(1.05);
     expect(Math.abs(animState(makeEl({ preset: "wiggle", start: 0, duration: 800 }), 100).rotate)).toBeGreaterThan(0.05);
     expect(Math.abs(animState(makeEl({ preset: "shake", start: 0, duration: 600 }), 50).dx)).toBeGreaterThan(2);
     expect(animState(makeEl({ preset: "float", start: 0, duration: 1000 }), 500).dy).toBeLessThan(-5);
     expect(animState(makeEl({ preset: "highlight", start: 0, duration: 1000 }), 500).glow).toBeGreaterThan(0.8);
 
-    // Explicit loop: false settles after end
-    const noLoop = makeEl({ preset: "pulse", start: 0, duration: 400, loop: false });
-    expect(animState(noLoop, 600).scale).toBeCloseTo(1, 6);
+    // Explicit loop: false stretches a single cycle across the entire duration and settles after end
+    const noLoop = makeEl({ preset: "pulse", start: 0, duration: 1800, loop: false });
+    expect(animState(noLoop, 900).scale).toBeGreaterThan(1.05);
+    expect(animState(noLoop, 1800).scale).toBeCloseTo(1, 6);
+    expect(animState(noLoop, 2200).scale).toBeCloseTo(1, 6);
   });
 
   test("path-draw preset progresses cleanly from 0 to 1", () => {

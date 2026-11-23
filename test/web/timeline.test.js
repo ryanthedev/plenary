@@ -158,7 +158,7 @@ describe("timeline DOM adapter", () => {
     expect(changes).toBeGreaterThan(0);
   });
 
-  test("Animate panel renders grouped preset categories and timing controls for selected animated shape", () => {
+  test("Animate panel renders slim Clip Inspector with grouped preset dropdown, easing, timing, loop, and empty hint", () => {
     const B = new Editor({
       scene: {
         elements: [
@@ -166,7 +166,6 @@ describe("timeline DOM adapter", () => {
         ],
       },
     });
-    B.select(["r1"]);
     const session = {
       role: "presenter",
       active: "board",
@@ -174,25 +173,53 @@ describe("timeline DOM adapter", () => {
       eds: { board: B, notes: new Editor() },
       act: (_stream, fn) => fn(B),
     };
-    const root = new StubNode("aside");
-    const out = renderPanel(root, {
-      session,
-      state: defaultPanel(),
-      setState: () => {},
-      h,
-      onChange: () => {},
-    });
-    replace(root, out);
-    const all = root.all();
-    const groups = all.filter(n => n.className === "anim-group");
-    expect(groups.map(g => g.attrs["data-category"])).toEqual(PRESET_CATEGORIES.map(c => c.id));
+    const render = () => {
+      const root = new StubNode("aside");
+      const out = renderPanel(root, {
+        session,
+        state: defaultPanel(),
+        setState: () => {},
+        h,
+        onChange: () => {},
+      });
+      replace(root, out);
+      return root.all();
+    };
 
-    const easingSel = all.find(n => n.className === "anim-sel");
+    // Nothing selected -> compact 1-line hint, no transport or step list
+    const emptyAll = render();
+    expect(emptyAll.some(n => n.attrs["data-anim-empty"] === "1")).toBe(true);
+    expect(emptyAll.some(n => n.className === "anim-steps")).toBe(false);
+
+    // Animated shape selected -> grouped preset select, clear button, easing, delay/dur, loop
+    B.select(["r1"]);
+    const all = render();
+    const presetSel = all.find(n => n.attrs["data-anim-field"] === "preset");
+    expect(presetSel).toBeDefined();
+    const optgroups = presetSel.children.filter(n => n.tagName === "OPTGROUP");
+    expect(optgroups.map(g => g.attrs["data-category"])).toEqual(PRESET_CATEGORIES.map(c => c.id));
+    expect(all.some(n => n.attrs["data-anim-field"] === "clear")).toBe(true);
+    expect(all.some(n => n.attrs["data-anim-field"] === "start")).toBe(true);
+    expect(all.some(n => n.attrs["data-anim-field"] === "duration")).toBe(true);
+    expect(all.some(n => n.className === "anim-steps")).toBe(false);
+
+    // Change preset via dropdown
+    presetSel.value = "pulse";
+    presetSel.fire("change");
+    expect(B.doc.get("r1").customData.anim.preset).toBe("pulse");
+
+    // Change easing via dropdown
+    const easingSel = all.find(n => n.attrs["data-anim-field"] === "easing");
     expect(easingSel).toBeDefined();
     expect(easingSel.children.length).toBe(EASING_NAMES.length);
     easingSel.value = "bounce";
     easingSel.fire("change");
     expect(B.doc.get("r1").customData.anim.easing).toBe("bounce");
+
+    // Clear animation via × button
+    const clearBtn = all.find(n => n.attrs["data-anim-field"] === "clear");
+    clearBtn.fire("click");
+    expect(B.doc.get("r1").customData?.anim).toBeUndefined();
   });
 
   test("H1/H2/M4/L1: track keyboard scrubbing stops propagation, keeps focus, and pointerdown on span selects without capture", () => {

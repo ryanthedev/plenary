@@ -5,7 +5,7 @@
 
 import { STROKES, FILLS, WIDTHS, STYLES } from "../../../packages/core/editor.js";
 import { panelSections, applyPanel } from "../../../packages/core/panel.js";
-import { getPreset, EASING_META, canonicalEasing, presetsByCategory, timelineSpans, formatTime } from "../../../packages/core/anim.js";
+import { PRESETS, getPreset, EASING_META, canonicalEasing, presetsByCategory } from "../../../packages/core/anim.js";
 import { FONT_FAMILY, fontClass } from "../../../packages/core/style.js";
 import { isShape, isLabel, layerOf } from "../../../packages/core/model.js";
 import { listNamedFrames } from "../../../packages/core/views.js";
@@ -462,8 +462,11 @@ export function renderPanel(root, ctx) {
       ];
     },
     animate: () => {
-      const selEl = B.selected().filter(e => !isLabel(e))[0];
-      const anim = selEl?.customData?.anim ?? null;
+      const selEl = B.selected().filter(e => !isLabel(e))[0] ?? null;
+      if (!selEl) {
+        return [h("div.hint", { "data-anim-empty": "1" }, "Select a shape or clip on the timeline to edit its effect and timing.")];
+      }
+      const anim = selEl.customData?.anim ?? null;
       const cur = anim?.preset ?? null;
       const curMeta = cur ? getPreset(cur) : null;
       const curEasing = canonicalEasing(anim?.easing ?? curMeta?.easing ?? "ease-out");
@@ -471,22 +474,62 @@ export function renderPanel(root, ctx) {
       const curDur = anim?.duration ?? curMeta?.duration ?? 600;
       const curLoop = anim ? (anim.loop ?? curMeta?.loop ?? false) : false;
       const groups = presetsByCategory();
-      const spans = timelineSpans(B.doc.live());
+
+      const presetNodes = [
+        h("option", { value: "", selected: !cur }, "None"),
+        ...groups.map(g =>
+          h("optgroup", { label: g.label, "data-category": g.id },
+            g.presets.map(p => h("option", { value: p.id, selected: cur === p.id }, p.label)))),
+      ];
+      if (cur && cur !== "keyframes" && Object.hasOwn(PRESETS, cur) && PRESETS[cur].legacy) {
+        presetNodes.splice(1, 0, h("option", { value: cur, selected: true }, PRESETS[cur].label));
+      }
+      if (cur === "keyframes") {
+        presetNodes.splice(1, 0, h("option", { value: "keyframes", selected: true }, "Keyframes"));
+      }
+
+      const presetSel = h("select.anim-sel", {
+        "aria-label": "Animation effect",
+        "data-anim-field": "preset",
+        "data-fk": "anim:preset",
+        disabled: dis,
+        value: cur ?? "",
+        style: touchSelectStyle,
+        onchange: e => {
+          const val = e.currentTarget.value;
+          if (!val) S.act("board", ed => ed.clearAnimation());
+          else S.act("board", ed => ed.animate(val));
+        },
+        onkeydown: k => k.stopPropagation(),
+      }, presetNodes);
+
+      const clearBtn = cur
+        ? h("button.c.anim-clear", {
+          type: "button",
+          title: "Remove animation",
+          "aria-label": "Remove animation",
+          "data-anim-field": "clear",
+          "data-fk": "anim:clear",
+          disabled: dis,
+          style: touchBtnStyle,
+          onclick: () => S.act("board", ed => ed.clearAnimation()),
+        }, "×")
+        : null;
 
       const out = [
-        ...groups.map(g => h("div.anim-group", { "data-category": g.id },
-          h("div.anim-cat", {}, g.label),
-          h("span.opts", {}, g.presets.map(p => chip(p.id, cur === p.id, () => S.act("board", e => e.animate(p.id)), `${g.label}: ${p.label} (${p.duration} ms, ${p.easing})`))))),
-        h("div.row", { style: { marginTop: "4px" } }, h("span.opts", {},
-          chip("none", !cur && !!selEl, () => S.act("board", e => e.clearAnimation()), "Clear animation"))),
+        row("Effect", "", h("div.anim-effect-row", {}, presetSel, clearBtn)),
       ];
 
       if (anim && !anim.keys) {
         const easingSel = h("select.anim-sel", {
           "aria-label": "Easing curve",
+          "data-anim-field": "easing",
+          "data-fk": "anim:easing",
           disabled: dis,
           value: curEasing,
+          style: touchSelectStyle,
           onchange: e => S.act("board", ed => ed.updateAnimation({ easing: e.currentTarget.value })),
+          onkeydown: k => k.stopPropagation(),
         }, EASING_META.map(ea => h("option", { value: ea.id, selected: curEasing === ea.id }, ea.label)));
 
         const numField = (label, val, step, min, prop) => h("label.anim-num", {},
@@ -496,6 +539,8 @@ export function renderPanel(root, ctx) {
             min: String(min),
             step: String(step),
             value: String(val),
+            "data-anim-field": prop,
+            "data-fk": `anim:${prop}`,
             disabled: dis,
             onchange: e => S.act("board", ed => ed.updateAnimation({ [prop]: Number(e.currentTarget.value) })),
             onkeydown: k => k.stopPropagation(),
@@ -506,25 +551,12 @@ export function renderPanel(root, ctx) {
           h("div.anim-fields", {},
             numField("Delay ms", curStart, 50, 0, "start"),
             numField("Dur ms", curDur, 50, 50, "duration")),
-          row("Repeat", "", chip(curLoop ? "Loop on" : "Loop off", curLoop, () => S.act("board", ed => ed.updateAnimation({ loop: !curLoop })), "Toggle per-element loop")),
+          row("Repeat", "", chip(curLoop ? "Loop on" : "Loop off", curLoop, () => S.act("board", ed => ed.updateAnimation({ loop: !curLoop })), "Repeat inside clip duration (off = single cycle)", false, "anim:loop")),
         );
+      } else if (anim?.keys) {
+        out.push(h("div.hint", {}, "Keyframed clip — adjust timing on the timeline."));
       }
 
-      out.push(
-        h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
-          chip([icon(B.play ? "pause" : "play", { size: 14 }), B.play ? " pause" : " play"], !!B.play, () => { B.playToggle(); ctx.onChange(); }, "⇧Space", true),
-          chip([icon("skipBack", { size: 13 }), " restart"], false, () => { B.restartPlay(); ctx.onChange(); }, "Restart playback", true),
-          chip([icon("stop", { size: 13 }), " stop"], false, () => { B.stopPlay(); ctx.onChange(); }, "Stop (Esc)", true))),
-      );
-
-      if (spans.length) {
-        out.push(h("div.anim-steps", {},
-          spans.slice(0, 20).map((sp, i) => h("button.list-row" + (B.sel.has(sp.id) ? ".on" : ""), {
-            onclick: () => { B.select([sp.id]); B.seekTo(sp.start); ctx.onChange(); },
-          }, h("span.dim", {}, String(i + 1)), " ", sp.label, h("span.n", {}, formatTime(sp.start))))));
-      } else {
-        out.push(h("div.hint", {}, "Select shapes, pick an effect: they join the timeline in order (start + 150 ms stagger)."));
-      }
       return out;
     },
     layers: () => {

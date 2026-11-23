@@ -745,7 +745,7 @@ test("K3 main.js: the token goes only into createSession and the HTTP ports; sig
   expect(code).toMatch(/const back = takeReturnBoard\(tabStore, \{ outcome: signIn\.outcome, board: asked \}\);/);
 });
 
-test("K4 panel: a remote frame rename shows in the frames list; a remote preset change on my selection flips the chip", () => {
+test("K4 panel: a remote frame rename shows in the frames list; a remote preset change on my selection updates the preset selector", () => {
   rig = setup(); const { S, bo, step, app } = rig;
   drawFrame(bo, 100, 100); step(20);
   const fid = bo.eds.board.frames()[0].id;
@@ -759,12 +759,10 @@ test("K4 panel: a remote frame rename shows in the frames list; a remote preset 
   const animTab = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs?.["data-mode"] === "animate");
   animTab.click(); step(20);
   S.act("board", e => e.select([id])); step(20);
-  const on = p => find(page.byId.panel, e => e.tagName === "BUTTON" && e.textContent === p)?.className ?? "";
-  expect(on("fade")).toContain("on");
-  const other = ["zoom", "slide", "pop", "rise", "wipe"].find(p => find(page.byId.panel, e => e.tagName === "BUTTON" && e.textContent === p));
-  bo.act("board", e => { e.select([id]); e.animate(other); }); step(20);
-  expect(on(other)).toContain("on");
-  expect(on("fade")).not.toContain("on");
+  const presetVal = () => find(page.byId.panel, e => e.attrs?.["data-anim-field"] === "preset")?.value ?? "";
+  expect(presetVal()).toBe("fade");
+  bo.act("board", e => { e.select([id]); e.animate("pop"); }); step(20);
+  expect(presetVal()).toBe("pop");
 });
 
 test("K5 timeline: a remote change that moves a mark but not the duration redraws the marks", () => {

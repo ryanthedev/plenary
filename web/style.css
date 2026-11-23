@@ -489,6 +489,22 @@ body .phone-only { display: none !important; }
   .sheet .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 12px; }
   .sheet .tool-grid .tb { height: 64px; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-subtle); color: var(--fg); gap: 4px; font-size: 11px; }
   .sheet .tool-grid .tb.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .mobile-sheet-header { padding: 2px 16px 8px; }
+  .mobile-sheet-title { margin: 0; font-size: 14px; font-weight: 600; color: var(--fg); }
+  .mobile-action-list { display: flex; flex-direction: column; gap: 4px; padding: 0 12px 12px; }
+  .sheet .sheet-action-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 44px; min-width: 44px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-subtle); color: var(--fg); font-size: 14px; font-weight: 500; text-align: left; cursor: pointer; touch-action: manipulation; }
+  .sheet .sheet-action-row:active { background: var(--surface-hover); }
+  .sheet .sheet-action-row.danger { color: var(--bad, #e03131); border-color: color-mix(in srgb, var(--bad, #e03131) 30%, var(--border)); }
+  .sheet .sheet-action-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-rename-body { padding: 4px 16px 12px; }
+  .mobile-rename-input { width: 100%; min-height: 44px; padding: 10px 12px; font-size: 16px; border-radius: 10px; }
+  .mobile-rename-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 0 16px 14px; }
+  .mobile-rename-actions .btn { min-height: 44px; min-width: 44px; border-radius: 12px; font-size: 14px; font-weight: 600; }
+  .phone-stepper-pill { max-width: min(260px, calc(100vw - 92px)); gap: 2px; }
+  .phone-stepper-pill .tb { min-width: 44px; min-height: 44px; flex-shrink: 0; }
+  .phone-stepper-pill .phone-stepper-label { min-height: 44px; min-width: 44px; padding: 0 8px; font-size: 12.5px; font-weight: 600; color: var(--fg); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .phone-show-all-pill { background: var(--accent-soft); border-color: var(--accent-soft-border); padding: 2px !important; }
+  .phone-show-all-pill .phone-show-all { min-height: 44px; min-width: 44px; padding: 0 10px; font-size: 12px; font-weight: 600; color: var(--accent); background: var(--surface); border-color: var(--accent-soft-border); border-radius: 11px; white-space: nowrap; }
   .pop:not(.collab-pop) { left: calc(8px + env(safe-area-inset-left)) !important; right: calc(8px + env(safe-area-inset-right)); width: auto; top: auto !important; bottom: calc(76px + env(safe-area-inset-bottom)); }
   .dialog-veil { place-items: end stretch; padding: 0; }
   .dialog { width: 100%; border-radius: 20px 20px 0 0; padding-bottom: env(safe-area-inset-bottom); }
@@ -522,6 +538,28 @@ body .phone-only { display: none !important; }
   .hud-br { max-width: 56px; }
   .phone-sel-pill { bottom: calc(134px + env(safe-area-inset-bottom)); }
   .sheet .tool-grid { gap: 6px; padding: 10px 12px 12px; }
+  .views-veil, .versions-veil, .settings-veil { place-items: end stretch; padding: 0; }
+  .views-dialog, .views-modal,
+  .versions-dialog, .versions-modal,
+  .settings-dialog, .settings-modal {
+    width: 100%;
+    max-width: 100%;
+    max-height: 100vh;
+    max-height: min(100dvh, var(--vv-height, 100dvh));
+    border-radius: 20px 20px 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .views-dialog input, .views-modal input, .views-search, .views-save-input,
+  .versions-dialog input, .versions-modal input, .versions-input,
+  .settings-dialog input, .settings-modal input, .settings-dialog select, .settings-modal select,
+  .settings-search, .settings-fb-select {
+    font-size: max(16px, 1rem);
+    min-height: 44px;
+  }
+  .views-row-btn, .views-del-btn, .versions-del, .settings-tab, .settings-kb-btn, .settings-kb-reset {
+    min-height: 44px;
+    min-width: 44px;
+  }
 }
 
 @media (max-width: 380px) {

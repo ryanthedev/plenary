@@ -42,6 +42,7 @@ import { createVideoOverlay } from "./video-overlay.js";
 import { createEmbedOverlay } from "./embed-overlay.js";
 import { consumePendingTemplate } from "./home.js";
 import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
+import { createLongPressTracker, buildMobileSelectionActions, renderSelectionActionSheet, renderRenameBoardSheet } from "./mobile-sheets.js";
 import { createViewsMenu } from "./views-menu.js";
 import { createSettingsDialog } from "./settings-dialog.js";
 import { createVersionsDialog } from "./versions-dialog.js";
@@ -158,7 +159,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached (still trying)", busy: "the server is busy (still trying)", limit: "too many uploads at once (still trying)" };
   net.onFail?.(({ code, retrying }) => toast(`The picture ${retrying ? "is not saved for others yet" : "was not saved for others"}: ${WHY[code] ?? code}`, 6000));
 
-  const isPhone = () => matchMedia("(max-width: 640px)").matches || matchMedia("(max-width: 1023px)").matches;
+  const isNarrowPhone = () => matchMedia("(max-width: 640px)").matches;
+  const isPhone = () => isNarrowPhone() || matchMedia("(max-width: 1023px)").matches;
   const isCoarse = () => matchMedia("(pointer: coarse)").matches;
   const INK_KEYBOARD_PAD_PX = 24;
   let lastPointerTouch = false;
@@ -612,6 +614,105 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     S.paste(undefined, worldPoint);
     chromeDirty = true;
   }
+  function copyElementDeepLink(selectedList, fallbackEl = null) {
+    const els = (selectedList ?? []).filter(el => el && !isLabel(el));
+    const primary = els[0] ?? fallbackEl;
+    if (!primary) return;
+    const isFrame = els.length <= 1 && primary.type === "frame";
+    const loc = globalThis.location;
+    const url = buildDeepLink({
+      origin: loc?.origin ?? "",
+      pathname: loc?.pathname ?? "/",
+      search: loc?.search ?? "",
+      kind: isFrame ? "frame" : "el",
+      id: primary.id,
+    });
+    if (!url) return;
+    const clip = globalThis.navigator?.clipboard;
+    const label = isFrame ? "Copied link to frame" : "Copied link to selection";
+    if (typeof clip?.writeText === "function") {
+      Promise.resolve(clip.writeText(url))
+        .then(() => toast(label))
+        .catch(() => toast("Couldn't copy link"));
+    } else {
+      toast("Clipboard unavailable");
+    }
+  }
+  function canWriteSelection(stream, els) {
+    if (!S.may() || !S.canWriteStream(stream)) return false;
+    if (stream === "board") return true;
+    if (S.effective === "presenter") return true;
+    return els.length > 0 && els.every(el => S.isMine(el.id));
+  }
+  let actionSheetCtx = null;
+  function resolveActionSheetSelection() {
+    const stream = actionSheetCtx?.stream ?? (activeStream() === "notes" ? "notes" : "board");
+    const ed = S.eds[stream];
+    const selected = actionSheetCtx?.selectedIds?.length
+      ? actionSheetCtx.selectedIds.map(id => ed.doc.get(id)).filter(e => e && !e.isDeleted && !isLabel(e))
+      : (ed ? ed.selected().filter(e => e && !isLabel(e)) : []);
+    const hitEl = actionSheetCtx?.hitId ? (ed.doc.get(actionSheetCtx.hitId) ?? selected[0] ?? null) : (selected[0] ?? null);
+    return { stream, ed, selected, hitEl };
+  }
+  function openSelectionActionSheet({ stream = null, selected = null, hitEl = null, point = null, opener = null } = {}) {
+    const targetStream = stream ?? (activeStream() === "notes" ? "notes" : "board");
+    const ed = S.eds[targetStream];
+    const rawList = selected ?? (ed ? ed.selected() : []);
+    const els = rawList.filter(el => el && !isLabel(el));
+    if (!els.length) return false;
+    const canWrite = canWriteSelection(targetStream, els);
+    const items = buildMobileSelectionActions({
+      canWrite,
+      canComment: Boolean(collab),
+      selected: els,
+      actions: {
+        duplicate: () => {}, del: () => {}, copyLink: () => {}, group: () => {}, ungroup: () => {},
+        reorder: () => {}, toggleLock: () => {}, tidy: () => {}, spliceImage: () => {}, addComment: () => {},
+      },
+    });
+    if (!items.length) return false;
+    actionSheetCtx = {
+      stream: targetStream,
+      selectedIds: els.map(e => e.id),
+      hitId: (hitEl ?? els[0])?.id ?? null,
+      point: point ?? null,
+    };
+    setSheet("actions", { opener });
+    return true;
+  }
+  function hitElementAt(p) {
+    const w = worldAt(p);
+    const n = S.eds.notes, b = S.eds.board;
+    const hitN = hitTest(n.doc, w, n.tol()), hitB = hitN ? null : hitTest(b.doc, w, b.tol());
+    const rawHit = hitN ?? hitB;
+    const hitStream = hitN ? /** @type {const} */ ("notes") : hitB ? /** @type {const} */ ("board") : null;
+    if (!rawHit || !hitStream) return null;
+    const ed = S.eds[hitStream];
+    const hitEl = isLabel(rawHit) && rawHit.containerId ? (ed.doc.get(rawHit.containerId) ?? rawHit) : rawHit;
+    return { hitEl, hitStream, ed };
+  }
+  const longPress = createLongPressTracker({
+    clock,
+    onLongPress: ({ point, pointerId }) => {
+      if (!isPhone()) return;
+      const hit = hitElementAt(point);
+      if (!hit) return;
+      const { hitEl, hitStream, ed } = hit;
+      S.pointerCancel(point, { pointerId, pointerType: "touch", button: "left" });
+      const canSelectHit = hitStream === "board"
+        ? S.role === "presenter"
+        : (S.effective === "presenter" || (S.effective !== "viewer" && S.isMine(hitEl.id)));
+      if (canSelectHit && !ed.sel.has(hitEl.id)) {
+        const other = S.eds[hitStream === "board" ? "notes" : "board"];
+        other.select([]);
+        if (S.role === "presenter") S.active = hitStream;
+        ed.select(ed.withGroup(hitEl));
+      }
+      const selectedList = ed.sel.has(hitEl.id) ? ed.selected() : [hitEl];
+      openSelectionActionSheet({ stream: hitStream, selected: selectedList, hitEl, point, opener: canvas });
+      chromeDirty = true;
+    },
+  });
   canvas.addEventListener("contextmenu", e => {
     e.preventDefault();
     dismissOverlays();
@@ -689,28 +790,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         },
         copyLink: () => {
           const selectedList = hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [];
-          const els = selectedList.filter(el => el && !isLabel(el));
-          const primary = els[0] ?? hitEl;
-          if (!primary) return;
-          const isFrame = els.length <= 1 && primary.type === "frame";
-          const loc = globalThis.location;
-          const url = buildDeepLink({
-            origin: loc?.origin ?? "",
-            pathname: loc?.pathname ?? "/",
-            search: loc?.search ?? "",
-            kind: isFrame ? "frame" : "el",
-            id: primary.id,
-          });
-          if (!url) return;
-          const clip = globalThis.navigator?.clipboard;
-          const label = isFrame ? "Copied link to frame" : "Copied link to selection";
-          if (typeof clip?.writeText === "function") {
-            Promise.resolve(clip.writeText(url))
-              .then(() => toast(label))
-              .catch(() => toast("Couldn't copy link"));
-          } else {
-            toast("Clipboard unavailable");
-          }
+          copyElementDeepLink(selectedList, hitEl);
         },
         addComment: () => startComment(p),
         selectAll: () => { S.key("a", { cmd: true }); chromeDirty = true; },
@@ -883,6 +963,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       }
     }
     S.pointerDown(p, pmods(e));
+    longPress.onPointerDown(e, p);
     if (collab && S.tool === "laser" && e.button === 0 && S.ed.pointers.size <= 1) collab.laser(worldAt(p));
   });
   canvas.addEventListener("pointermove", e => {
@@ -891,6 +972,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (coalesced && coalesced.length > 0) {
       for (const ce of coalesced) {
         const cp = at(ce);
+        longPress.onPointerMove(ce, cp);
         S.pointerMove(cp, pmods(ce, e));
         if (collab && S.tool === "laser" && S.gesture && (ce.buttons & 1) && S.ed.pointers.size <= 1) collab.laser(worldAt(cp));
       }
@@ -898,6 +980,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       return;
     }
     const p = at(e);
+    longPress.onPointerMove(e, p);
     S.pointerMove(p, pmods(e));
     if (collab && S.ed.pointers.size <= 1) {
       const w = worldAt(p);
@@ -906,10 +989,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
   });
   canvas.addEventListener("pointerup", e => {
+    longPress.onPointerUp(e);
     S.pointerUp(at(e), pmods(e)); chromeDirty = true;
     collabTick();
   });
   canvas.addEventListener("pointercancel", e => {
+    longPress.onPointerCancel(e);
     S.pointerCancel(at(e), pmods(e)); chromeDirty = true;
     collabTick();
   });
@@ -1426,7 +1511,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     chromeDirty = true;
     collab?.setTheme(t);
   };
-  let activeShare = null, dialogTrap = null, dialogOpener = null, sheetTrap = null, sheetOpener = null, sheetBackdropEl = null, dialogRebuilding = false, sheetHistoryPushed = false;
+  let activeShare = null, dialogTrap = null, dialogOpener = null, sheetTrap = null, sheetTrapKind = null, sheetOpener = null, sheetBackdropEl = null, dialogRebuilding = false, sheetHistoryPushed = false;
   function pushSheetHistory(name) {
     const hist = globalThis.history;
     if (!hist || typeof hist.pushState !== "function") return;
@@ -1531,9 +1616,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (why.isOpen()) why.close(false);
     if (!keepSheet && ui.sheet) {
       ui.sheet = null;
+      actionSheetCtx = null;
       popSheetHistory();
       sheetTrap?.deactivate({ restoreFocus: false });
       sheetTrap = null;
+      sheetTrapKind = null;
       sheetOpener = null;
       const bd = ensureSheetBackdrop();
       if (bd) bd.hidden = true;
@@ -1552,14 +1639,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (next) {
       dismissOverlays({ keepSheet: true });
       if (!ui.sheet) sheetOpener = captureOpener(opener);
+      if (next !== "actions") actionSheetCtx = null;
       ui.sheet = next;
       pushSheetHistory(next);
     } else {
       ui.sheet = null;
+      actionSheetCtx = null;
       popSheetHistory({ fromPopstate });
       const prevOpener = sheetOpener;
       sheetOpener = null;
-      if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; }
+      if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; sheetTrapKind = null; }
       const bd = ensureSheetBackdrop();
       if (bd) bd.hidden = true;
       if (restore) restoreOpener(prevOpener, visibleControl(["[data-dock-more]", ".overflow-btn"]) ?? canvas);
@@ -1657,8 +1746,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
 
   const canRenameBoard = () => Boolean(doRenameBoard) && S.role === "presenter" && S.may() && serverCanRename !== false;
-  function startBoardRename() {
+  function startBoardRename(opener = null) {
     if (!canRenameBoard()) return false;
+    if (isNarrowPhone()) {
+      setSheet("rename", { opener });
+      return true;
+    }
     dismissOverlays();
     ui.renamingBoard = true;
     chromeDirty = true;
@@ -1844,7 +1937,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         type: "button",
         title: `${titleText} — click to rename`,
         "aria-label": `Rename board: ${titleText}`,
-        onclick: () => startBoardRename(),
+        onclick: e => startBoardRename(e?.currentTarget ?? null),
       }, titleText, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]);
     } else {
       titleNode = h("span.board-name", { title: titleText }, titleText, net.kind === "ws" ? null : [" ", h("small", {}, "· dev room")]);
@@ -1897,18 +1990,23 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           }, `${selCard.providerName} ${selCard.shortKey} ↗`))
       : null;
     const selPill = isPhone() && S.role !== "viewer" && may && sel.length > 0
-      ? h("div.grp.phone-only.phone-sel-pill", { "aria-label": "Selected shape actions" },
+      ? h("div.grp.phone-only.phone-sel-pill", {
+          "aria-label": "Selected shape actions",
+          onclick: e => { if (e.target === e.currentTarget) openSelectionActionSheet({ opener: e.currentTarget }); },
+        },
           h("button.tb", { title: "Color & Style", "aria-label": "Color", "aria-haspopup": "dialog", "data-action": "color", onclick: e => { ui.colorPicker = "strokeColor"; setSheet("panel", { opener: e?.currentTarget }); } },
             h("span.sel-swatch-dot", { style: { background: safeColor(selColor) } })),
           h("button.tb", { title: "Duplicate", "aria-label": "Duplicate", "data-action": "duplicate", onclick: () => { S.act(activeStream(), e => e.cloneSelection(20, 20)); chromeDirty = true; } },
             h("span.ic", {}, icon("duplicate", { size: 18 }))),
           h("button.tb.danger", { title: "Delete", "aria-label": "Delete", "data-action": "delete", onclick: () => { S.act(activeStream(), e => e.deleteIds([...e.sel])); chromeDirty = true; } },
-            h("span.ic", {}, icon("trash", { size: 18 }))))
+            h("span.ic", {}, icon("trash", { size: 18 }))),
+          h("button.tb", { title: "More actions", "aria-label": "More actions", "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "actions"), "data-action": "actions", onclick: e => { openSelectionActionSheet({ opener: e?.currentTarget }); } },
+            h("span.ic", {}, icon("more", { size: 18 }))))
       : null;
     const local = resolvedLocalView();
     const savedViews = viewsOf(B.doc);
     const soloLayer = local.soloLayerId ? B.doc.layers.find(l => l.id === local.soloLayerId) : null;
-    const localFilterPill = local.active
+    const localFilterPill = !isPhone() && local.active
       ? h("div.grp.local-filter-pill", { role: "status", "aria-label": "Local layer filter active" },
         h("span.local-filter-text", {}, local.mode === "solo" ? `Solo: ${soloLayer?.name || "Layer"}` : `View: ${local.activeViewName || "Filtered"}`),
         h("button.btn.ghost", {
@@ -1924,12 +2022,54 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.btn.ghost.views-step-label", { type: "button", title: "Jump to frame or view (⌘J)", "aria-label": "Open views navigator", onclick: e => openViewsMenu(e?.currentTarget ?? null) }, local.activeViewName || `Views (${savedViews.length})`),
         h("button.tb", { type: "button", title: "Next view (])", "aria-label": "Next view", "data-step-view": "1", onclick: () => stepView(1) }, icon("chevronRight", { size: 15 })))
       : null;
+    const stepViewsMode = Boolean(local.activeViewId) || (fs.length === 0 && savedViews.length > 0);
+    const viewIdx = stepViewsMode ? savedViews.findIndex(v => v.id === local.activeViewId) : -1;
+    const phoneStepperLabel = stepViewsMode
+      ? (viewIdx >= 0 ? `${viewIdx + 1} / ${savedViews.length} · ${local.activeViewName || savedViews[viewIdx].name}` : `Views (${savedViews.length})`)
+      : (fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}${fs[i]?.name ? ` · ${fs[i].name}` : ""}` : "");
+    const phoneStepperPill = isPhone() && (fs.length > 0 || savedViews.length > 0)
+      ? h("div.grp.phone-only.phone-stepper-pill", { "aria-label": stepViewsMode ? "Views stepper" : "Frames stepper" },
+        h("button.tb", {
+          type: "button",
+          title: stepViewsMode ? "Previous view" : "Previous frame",
+          "aria-label": stepViewsMode ? "Previous view" : "Previous frame",
+          "data-stepper": "prev",
+          onclick: () => { if (stepViewsMode) stepView(-1); else stepBoardFrame(-1); },
+        }, icon("chevronLeft", { size: 16 })),
+        h("button.btn.ghost.phone-stepper-label", {
+          type: "button",
+          "data-action": "open-views",
+          "aria-haspopup": "dialog",
+          "aria-label": "Open frames and views",
+          title: "Open frames and views",
+          onclick: e => openViewsMenu(e?.currentTarget ?? null),
+        }, phoneStepperLabel),
+        h("button.tb", {
+          type: "button",
+          title: stepViewsMode ? "Next view" : "Next frame",
+          "aria-label": stepViewsMode ? "Next view" : "Next frame",
+          "data-stepper": "next",
+          onclick: () => { if (stepViewsMode) stepView(1); else stepBoardFrame(1); },
+        }, icon("chevronRight", { size: 16 })))
+      : null;
+    const phoneShowAllPill = isPhone() && local.active
+      ? h("div.grp.phone-only.phone-show-all-pill", { role: "status", "aria-label": "Local layer filter active" },
+        h("button.btn.ghost.phone-show-all", {
+          type: "button",
+          "data-action": "reset-local-layers",
+          "aria-label": "Show all layers",
+          title: "Clear local layer filter and show all board layers",
+          onclick: () => resetLocalView(),
+        }, "Show all"))
+      : null;
     const bl = [
       localFilterPill,
       openCardPill,
       selPill,
       viewsStepPill,
-      h("div.grp" + (S.role === "viewer" ? ".desk-only" : ""), {}, h("button.tb", { title: "Previous frame (PgUp)", "aria-label": "Previous frame", onclick: () => stepBoardFrame(-1) }, icon("chevronLeft", { size: 16 })), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", "aria-label": "Next frame", onclick: () => stepBoardFrame(1) }, icon("chevronRight", { size: 16 }))),
+      phoneStepperPill,
+      phoneShowAllPill,
+      h("div.grp.desk-only", {}, h("button.tb", { title: "Previous frame (PgUp)", "aria-label": "Previous frame", onclick: () => stepBoardFrame(-1) }, icon("chevronLeft", { size: 16 })), h("span.pct", {}, fs.length ? `${i < 0 ? "–" : i + 1} / ${fs.length}` : "0 / 0"), h("button.tb", { title: "Next frame (PgDn)", "aria-label": "Next frame", onclick: () => stepBoardFrame(1) }, icon("chevronRight", { size: 16 }))),
       h("div.grp.desk-only", {},
         S.role !== "viewer" ? [
           h("button.tb", { title: "Undo", "aria-label": "Undo", disabled: !canUndo, onclick: () => S.act(activeStream(), e => e.undo()) }, icon("undo", { size: 16 })),
@@ -2018,7 +2158,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     replace($("#dock"), items);
   }
   const SHEET_DISMISS_PX = 72, SHEET_FLICK_VY = 0.55;
-  const SHEET_LABELS = { tools: "More tools", panel: "Style and properties", notes: "Notes", comments: "Comments" };
+  const SHEET_LABELS = { tools: "More tools", panel: "Style and properties", notes: "Notes", comments: "Comments", actions: "Selection actions", rename: "Rename board" };
   function sheetHandle(el) {
     let drag = null, suppressClick = false;
     const reset = () => { drag = null; el.classList.remove("dragging"); el.style.transform = ""; };
@@ -2074,12 +2214,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (!ui.sheet || !isPhone()) {
       if (isPhone()) cancelActiveSampler();
       if (sheetHistoryPushed) popSheetHistory();
-      if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; }
+      if (sheetTrap) { sheetTrap.deactivate({ restoreFocus: false }); sheetTrap = null; sheetTrapKind = null; }
       if (bd) bd.hidden = true;
       el.hidden = true;
       el.replaceChildren();
       return;
     }
+    if (ui.sheet === "rename" && busy(el)) return false;
     if (ui.sheet !== "panel") cancelActiveSampler();
     if (bd) bd.hidden = false;
     el.setAttribute?.("role", "dialog");
@@ -2088,6 +2229,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (el.getAttribute?.("tabindex") === null) el.setAttribute?.("tabindex", "-1");
     el.hidden = false;
     let body;
+    let initialFocus = null;
     if (ui.sheet === "tools") {
       // Every write here passes S.setTool / S.may: read-only greys and refuses it (p6-mockv round 2, MEDIUM).
       const may = S.may();
@@ -2098,12 +2240,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         : null;
       const gridOn = Boolean(S.eds.board.grid);
       body = h("div.scroll", {}, quickActions, h("div.tool-grid", {}, toolsFor(S.role).map(t => h("button.tb" + (S.tool === t.id ? ".on" : ""), { disabled: t.id !== "hand" && !may, "data-tool": t.id, "aria-label": t.name, "aria-pressed": String(S.tool === t.id), onclick: () => { if (t.id === "image") openPicker(); S.setTool(t.id); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon(t.id, { size: 20 })), t.name)),
-        canRenameBoard() ? h("button.tb", { "aria-label": "Rename board", onclick: () => { setSheet(null, { restore: false }); startBoardRename(); } }, h("span.ic", {}, icon("edit", { size: 20 })), "Rename") : null,
+        canRenameBoard() ? h("button.tb", { "aria-label": "Rename board", onclick: e => { startBoardRename(e?.currentTarget ?? null); } }, h("span.ic", {}, icon("edit", { size: 20 })), "Rename") : null,
         S.role === "presenter" ? [
           h("button.tb", { disabled: !may, "aria-haspopup": "dialog", onclick: () => openDialog("mermaid") }, h("span.ic", {}, icon("mermaid", { size: 20 })), "Mermaid"),
-          h("button.tb", { disabled: !may, "aria-haspopup": "dialog", "aria-label": "Embed URL", onclick: () => openDialog("embed") }, h("span.ic", {}, icon("play", { size: 20 })), "Embed"),
+          h("button.tb", { disabled: !may, "aria-haspopup": "dialog", "aria-label": "Embed URL", title: "Embed / Link URL…", onclick: () => openDialog("embed") }, h("span.ic", {}, icon("play", { size: 20 })), "Embed / URL"),
           h("button.tb", { "aria-haspopup": "dialog", onclick: () => openDialog("export") }, h("span.ic", {}, icon("export", { size: 20 })), "Export"),
-          h("button.tb", { disabled: !may, "aria-label": "Import .excalidraw", onclick: () => { openExcalidrawImport(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("importFile", { size: 20 })), "Import"),
+          h("button.tb", { disabled: !may, "aria-label": "Import .excalidraw", title: "Import .excalidraw / .drawio", onclick: () => { openExcalidrawImport(); setSheet(null, { restore: false }); } }, h("span.ic", {}, icon("importFile", { size: 20 })), "Import"),
           h("button.tb" + (gridOn ? ".on" : ""), { disabled: !may, "aria-label": "Toggle grid", "aria-pressed": String(gridOn), onclick: () => { S.act("board", e => e.setAppState({ grid: e.grid ? 0 : 20 }), { settings: true }); chromeDirty = true; } }, h("span.ic", {}, icon("grid", { size: 20 })), "Grid"),
         ] : null,
         share && S.canShare
@@ -2114,12 +2256,72 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Settings & keybindings", onclick: () => { setSheet(null, { restore: false }); openSettingsDialog(); } }, h("span.ic", {}, icon("settings", { size: 20 })), "Settings"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
-        h("button.tb", { "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
+        h("button.tb", { "aria-label": "Toggle color theme", title: "Light / dark", "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
+    } else if (ui.sheet === "actions") {
+      const { stream: targetStream, selected, hitEl } = resolveActionSheetSelection();
+      const canWrite = canWriteSelection(targetStream, selected);
+      const commentPoint = actionSheetCtx?.point
+        ?? (hitEl ? S.eds.board.toScreen({ x: hitEl.x + (hitEl.width ?? 0) / 2, y: hitEl.y + (hitEl.height ?? 0) / 2 }) : { x: S.eds.board.size.w / 2, y: S.eds.board.size.h / 2 });
+      const items = buildMobileSelectionActions({
+        canWrite,
+        canComment: Boolean(collab),
+        selected,
+        actions: {
+          duplicate: () => { S.act(targetStream, x => x.cloneSelection(20, 20)); chromeDirty = true; },
+          del: () => { S.act(targetStream, x => x.deleteIds([...x.sel])); chromeDirty = true; },
+          copyLink: () => copyElementDeepLink(selected, hitEl),
+          group: () => { S.act(targetStream, x => x.group()); chromeDirty = true; },
+          ungroup: () => { S.act(targetStream, x => x.ungroup()); chromeDirty = true; },
+          reorder: how => { S.act(targetStream, x => x.reorder(how)); chromeDirty = true; },
+          toggleLock: () => { S.act(targetStream, x => x.toggleLock()); chromeDirty = true; },
+          tidy: () => { S.act(targetStream, x => x.tidySelection()); chromeDirty = true; },
+          spliceImage: (cols, rows) => {
+            const imgs = selected.filter(el => el && !isLabel(el) && el.type === "image" && !el.locked);
+            if (imgs.length !== 1) return;
+            S.act(targetStream, x => x.spliceImage(imgs[0].id, { cols, rows }));
+            chromeDirty = true;
+          },
+          addComment: () => startComment(commentPoint),
+        },
+      });
+      if (!items.length) {
+        setSheet(null, { restore: false });
+        return;
+      }
+      body = renderSelectionActionSheet({
+        items,
+        count: selected.length,
+        onRun: item => {
+          setSheet(null, { restore: false });
+          item.action?.();
+        },
+      });
+    } else if (ui.sheet === "rename") {
+      if (!canRenameBoard()) {
+        setSheet(null, { restore: false });
+        return;
+      }
+      const renameSheet = renderRenameBoardSheet({
+        initialValue: currentBoardTitle || (isRawBoardId(board) ? "" : board),
+        onSave: value => {
+          commitBoardRename(value);
+          setSheet(null);
+        },
+        onCancel: () => setSheet(null),
+      });
+      body = renameSheet.root;
+      initialFocus = renameSheet.input;
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
     else body = [h("div.tabs", { style: { justifyContent: "center" } }, drawerTabs("sheet")), h("div.scroll", {}, drawerBody(ui.sheet))];
     replace(el, sheetHandle(el), body);
+    if (sheetTrap && sheetTrapKind !== ui.sheet) {
+      sheetTrap.deactivate({ restoreFocus: false });
+      sheetTrap = null;
+      sheetTrapKind = null;
+    }
     if (!sheetTrap) {
-      sheetTrap = trapFocus(el, { onEscape: () => setSheet(null), returnFocusTo: sheetOpener?.el ?? null });
+      sheetTrapKind = ui.sheet;
+      sheetTrap = trapFocus(el, { onEscape: () => setSheet(null), returnFocusTo: sheetOpener?.el ?? null, initialFocus });
     }
   }
   const panelNodes = (inSheet = false) => renderPanel(null, {
@@ -2439,7 +2641,21 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     hud: { key: hudKey, build: hud },
     overlays: { key: () => JSON.stringify([S.status, trashShown(), S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },
-    sheet: { key: () => (!ui.sheet || !isPhone() ? "" : ui.sheet === "panel" ? panelKey() : ui.sheet === "tools" ? "" : notesRowsKey()), build: sheetView },
+    sheet: {
+      key: () => {
+        if (!ui.sheet || !isPhone()) return "";
+        if (ui.sheet === "panel") return panelKey();
+        if (ui.sheet === "tools") return `${S.eds.board.grid}|${canRenameBoard()}`;
+        if (ui.sheet === "rename") return `rename:${currentBoardTitle ?? ""}`;
+        if (ui.sheet === "actions") {
+          const { stream: st, selected } = resolveActionSheetSelection();
+          const ids = selected.map(e => `${e.id}:${e.locked ? 1 : 0}:${(e.groupIds ?? []).length}:${e.type}`);
+          return `actions:${st}:${canWriteSelection(st, selected) ? 1 : 0}:${ids.join(",")}`;
+        }
+        return notesRowsKey();
+      },
+      build: sheetView,
+    },
     dialogs: { key: () => (ui.dialog === "export" ? `${S.eds.board.doc.rev}|${JSON.stringify(ui.export)}` : ui.dialog === "embed" ? `embed|${ui.embed.error}` : `${ui.mermaid.elbow}`), build: dialogs },
   };
   const keys = {};
@@ -2591,6 +2807,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     // Either clock: mono may not advance through a laptop's sleep on every platform; a false positive costs one reconnect.
     if (was && since(was) > RESUME_PROBE_MS && !(heard && since(heard) <= HEARD_MS)) probe();
   });
+  matchMedia("(max-width: 640px)").addEventListener("change", () => { chromeDirty = true; });
   matchMedia("(max-width: 1023px)").addEventListener("change", () => { chromeDirty = true; });
   matchMedia("(min-width: 1024px) and (max-width: 1279px)").addEventListener("change", e => {
     if (!e.matches && ui.moreOpen) { ui.moreOpen = false; chromeDirty = true; }

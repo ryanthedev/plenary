@@ -7,7 +7,7 @@
 import { captureFocus, restoreFocus } from "./focus.js";
 import { trapFocus, hasActiveOverlay } from "./a11y.js";
 import { Editor } from "../../../packages/core/editor.js";
-import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
+import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth, panelSections } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
 import { isLabel, layerOf, BASE_LAYER } from "../../../packages/core/model.js";
 import { listNamedFrames, viewsOf, addView, deleteView, resolveLocalLayers, captureCurrentView, stepViewIndex } from "../../../packages/core/views.js";
@@ -24,7 +24,8 @@ import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, should
 /** The resume probe's jitter window (ms) for a page role (uiRole: presenter | annotator | viewer; null = not known yet). */
 export const PROBE_JITTER_MS = Object.freeze({ presenter: 2000, other: 15_000 });
 export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.presenter : PROBE_JITTER_MS.other);
-import { renderPanel, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
+import { renderPanel, availableFor, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
+import { shouldExpandRibbon } from "../../core/ribbon.js";
 import { exportSvg, exportExcalidraw, paintPng, loadPictures, buildPrintHtml } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
@@ -120,6 +121,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     workspaceMode: /** @type {"draw" | "animate" | "present"} */ ("draw"),
     timelineExpanded: false,
     panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
+    ribbon: { pinnedOpen: false, manualCollapsed: false, showAll: false, lastSelSig: "" },
     localView: { soloLayerId: null, activeViewId: null },
     renamingBoard: false,
     mermaid: { src: "flowchart LR\n  A[Idea] --> B[Spec]\n  B --> C{Review?}\n  C -->|yes| D[Build]\n  C -->|no| B\n  D --> E[Ship]", elbow: true },
@@ -195,7 +197,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   let closeMoreMenu = null;
   let closeMoreMenuNow = () => {};
-  document.addEventListener("click", e => closeMoreMenu?.(e));
+  document.addEventListener("click", e => {
+    closeMoreMenu?.(e);
+    if (ui.colorPicker && !isPhone()) {
+      const inside = matchUp(e.target, x => hasClass(x, "color-popover") || Boolean(attrOf(x, "data-color-popover")));
+      if (!inside) { cancelActiveSampler(); ui.colorPicker = null; chromeDirty = true; }
+    }
+  });
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
@@ -974,6 +982,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     lastPointerTouch = e.pointerType === "touch";
     canvas.focus(); canvas.setPointerCapture?.(e.pointerId); e.preventDefault();
     if (ui.sheet) setSheet(null, { restore: false });
+    if (ui.colorPicker && !isPhone()) { cancelActiveSampler(); ui.colorPicker = null; chromeDirty = true; }
     clicks = Math.max(e.detail || 0, countClick(e));
     if (S.tool === "image") { openPicker(); return; }
     const p = at(e);
@@ -1082,6 +1091,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       return;
     }
     if (hasOpenDialog() || isEditable(t) || inDialog(t) || isSlider(t)) return;   // inputs, dialogs, sliders keep their keys
+    if (e.key === "Escape" && ui.colorPicker && !isPhone()) {
+      e.preventDefault(); e.stopPropagation?.();
+      cancelActiveSampler();
+      ui.colorPicker = null;
+      chromeDirty = true;
+      return;
+    }
     if (e.key === "Escape" && ui.workspaceMode === "present" && !ui.sheet && !ui.moreOpen && !viewsMenu.isOpen() && !settingsDialog.isOpen() && !versionsDialog?.isOpen()) {
       e.preventDefault(); e.stopPropagation?.();
       setWorkspaceMode("draw");
@@ -1654,6 +1670,10 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     versionsDialog?.close({ restoreFocus: false });
     if (ui.moreOpen) closeMoreMenuNow();
     if (why.isOpen()) why.close(false);
+    if (!keepSheet && !isPhone() && ui.colorPicker) {
+      cancelActiveSampler();
+      ui.colorPicker = null;
+    }
     if (!keepSheet && ui.sheet) {
       ui.sheet = null;
       actionSheetCtx = null;
@@ -2129,7 +2149,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (panelEl && typeof panelEl.addEventListener === "function") {
     panelEl.addEventListener("wheel", e => {
       if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
-      const scroller = panelEl.querySelector?.(".sec") ?? panelEl;
+      const scroller = panelEl.querySelector?.('.sec:not([data-ribbon-hidden="true"])') ?? panelEl.querySelector?.(".sec") ?? panelEl;
       if (!scroller || typeof scroller.scrollBy !== "function") return;
       e.preventDefault?.();
       scroller.scrollBy({ left: e.deltaY, behavior: "smooth" });
@@ -2617,10 +2637,72 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       sheetTrap = trapFocus(el, { onEscape: () => setSheet(null), returnFocusTo: sheetOpener?.el ?? null, initialFocus });
     }
   }
+  const selectionInfo = () => {
+    const ed = S.eds[S.role === "annotator" ? "notes" : S.active];
+    const sel = ed ? ed.selected().filter(e => e && !isLabel(e)) : [];
+    return { count: sel.length, sig: sel.map(e => `${e.id}:${e.type}`).sort().join(",") };
+  };
+  const syncRibbonSelection = () => {
+    const { sig } = selectionInfo();
+    if (sig !== ui.ribbon.lastSelSig) {
+      ui.ribbon.lastSelSig = sig;
+      ui.ribbon.manualCollapsed = false;
+    }
+  };
+  const currentActiveTab = () => {
+    const secs = panelSections(ui.panel, availableFor(S, ui.workspaceMode));
+    if (ui.panel.mode === "tabs") return secs.find(s => s.active)?.id ?? secs[0]?.id ?? "properties";
+    return secs.some(s => s.id === ui.panel.tab) ? ui.panel.tab : (secs[0]?.id ?? "properties");
+  };
+  const isRibbonExpanded = () => {
+    if (S.role === "annotator") return true;
+    const { count } = selectionInfo();
+    return shouldExpandRibbon({
+      selectionCount: count,
+      pinnedOpen: ui.ribbon.pinnedOpen,
+      manualCollapsed: ui.ribbon.manualCollapsed,
+      activeTab: currentActiveTab(),
+    });
+  };
+  const onRibbonTab = (id, activeTabId) => {
+    const expanded = isRibbonExpanded();
+    if (expanded && id === activeTabId) {
+      ui.ribbon.pinnedOpen = false;
+      ui.ribbon.manualCollapsed = true;
+      if (ui.colorPicker) { cancelActiveSampler(); ui.colorPicker = null; }
+      chromeDirty = true;
+      return;
+    }
+    ui.ribbon.pinnedOpen = true;
+    ui.ribbon.manualCollapsed = false;
+    if (ui.colorPicker) { cancelActiveSampler(); ui.colorPicker = null; }
+    setPanel({ type: "tab", id });
+  };
+  const onToggleRibbon = () => {
+    const expanded = isRibbonExpanded();
+    if (expanded) {
+      ui.ribbon.pinnedOpen = false;
+      ui.ribbon.manualCollapsed = true;
+      if (ui.colorPicker) { cancelActiveSampler(); ui.colorPicker = null; }
+    } else {
+      ui.ribbon.pinnedOpen = true;
+      ui.ribbon.manualCollapsed = false;
+    }
+    chromeDirty = true;
+  };
+  const onToggleRibbonAll = () => {
+    ui.ribbon.showAll = !ui.ribbon.showAll;
+    chromeDirty = true;
+  };
   const panelNodes = (inSheet = false) => renderPanel(null, {
     session: S, state: ui.panel, h, inSheet, workspaceMode: ui.workspaceMode, library: ui.library, setLibrary, setState: setPanel,
     prefs, canvas, clock, colorPicker: ui.colorPicker, colorPickerState: ui.colorPickerState,
     setColorPicker: prop => { cancelActiveSampler(); ui.colorPicker = prop; chromeDirty = true; },
+    ribbonExpanded: inSheet ? true : isRibbonExpanded(),
+    ribbonShowAll: ui.ribbon.showAll,
+    onRibbonTab,
+    onToggleRibbon,
+    onToggleRibbonAll,
     localView: resolvedLocalView(),
     onSoloLayer: toggleSoloLayer,
     onResetLocalView: resetLocalView,
@@ -2874,7 +2956,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, ui.workspaceMode, ui.timelineExpanded, isPhone(), isNarrowPhone(), JSON.stringify(ui.panel), ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, ui.workspaceMode, ui.timelineExpanded, isPhone(), isNarrowPhone(), JSON.stringify(ui.panel), ui.ribbon.pinnedOpen, ui.ribbon.manualCollapsed, ui.ribbon.showAll, ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -2883,9 +2965,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // counts, the active layer, the playback chip and the library (panel.js renderPanel).
   const panelKey = () => {
     const B = S.eds.board, ed = S.eds[S.role === "annotator" ? "notes" : S.active], bi = boardInfo(B.doc);
-    const selFirst = ed.selected().filter(e => !isLabel(e))[0] ?? null;
-    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, selFirst?.id ?? null, selFirst?.type ?? null, Boolean(selFirst?.locked), selFirst?.customData?.meta ?? null, B.selected()[0]?.customData?.anim ?? null,
-      bi.spansSig, bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker, ui.localView, viewsOf(B.doc)]);
+    const selList = ed.selected().filter(e => !isLabel(e));
+    const selFirst = selList[0] ?? null;
+    const selSig = selList.map(e => `${e.id}:${e.type}`).sort().join(",");
+    return JSON.stringify([propsModel(ed), B.sel.size > 0, S.eds.notes.sel.size > 0, selSig, selFirst?.id ?? null, selFirst?.type ?? null, Boolean(selFirst?.locked), selFirst?.customData?.meta ?? null, B.selected()[0]?.customData?.anim ?? null,
+      bi.spansSig, bi.framesSig, B.frameAt, !!B.play, B.doc.layers, bi.counts, B.activeLayer, ui.colorPicker, ui.ribbon.pinnedOpen, ui.ribbon.manualCollapsed, ui.ribbon.showAll, ui.localView, viewsOf(B.doc)]);
   };
   const hudKey = () => {
     const { canUndo, canRedo } = undoRedoState();
@@ -2958,6 +3042,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     panel.hidden = S.role === "viewer" || ui.workspaceMode === "present" || !lay.show;
     if (panel.hidden) return true;
     if (busy(panel)) return false;
+    syncRibbonSelection();
+    const expanded = isRibbonExpanded();
+    if (!expanded && ui.colorPicker && !isPhone()) {
+      cancelActiveSampler();
+      ui.colorPicker = null;
+    }
+    panel.setAttribute?.("data-ribbon-expanded", String(expanded));
     panel.style.width = `${lay.width}px`;
     const edge = h("div.edge", { title: "Drag to resize (180–520 px)", onpointerdown: e => {
       e.preventDefault(); const sw = ui.panel.width, sx = e.clientX;

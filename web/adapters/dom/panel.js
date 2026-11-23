@@ -25,6 +25,7 @@ import {
 import { icon } from "./icons.js";
 import { createColorPicker } from "./color-picker.js";
 import { isPhoneTouchViewport } from "./settings-dialog.js";
+import { ALL_PROP_KEYS, contextualPropKeys } from "../../core/ribbon.js";
 
 export const HEADS = [["none", null, null], ["→", null, "arrow"], ["↔", "arrow", "arrow"], ["▶", null, "triangle"], ["▷", null, "triangle_outline"], ["●", null, "dot"], ["◆", null, "diamond"], ["⊣", null, "bar"]];
 export const OPACITIES = [100, 75, 50, 25];
@@ -138,11 +139,85 @@ export function renderPanel(root, ctx) {
   const style = patch => act(e => e.setStyle(patch));
   const row = (lab, key, ...opts) => h("div.row", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {}, h("span.lab", {}, lab, key ? h("i", {}, key) : null), h("span.opts", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {}, ...opts));
 
+  const ribbonMode = !ctx.inSheet && !notesOnly;
+  const ribbonExpanded = ctx.ribbonExpanded !== undefined ? Boolean(ctx.ribbonExpanded) : true;
+  const ribbonShowAll = Boolean(ctx.ribbonShowAll);
+  /** @type {any} */
+  let activeColorPopover = null;
+
   function properties() {
     const out = [];
+    const selNonLabels = ed.selected().filter(e => e && !isLabel(e));
+    const selTypes = selNonLabels.map(e => e.type);
+    const allowed = ribbonMode
+      ? new Set(contextualPropKeys({ selectionTypes: selTypes, tool: S.tool, showAll: ribbonShowAll }))
+      : null;
+    const hasHiddenProps = ribbonMode
+      ? contextualPropKeys({ selectionTypes: selTypes, tool: S.tool, showAll: false }).length < ALL_PROP_KEYS.length
+      : false;
     for (const [lab, key, prop, opts] of STYLE_ROWS) {
       if (notesOnly && !NOTE_ROWS.has(prop)) continue;
+      if (allowed && !allowed.has(prop)) continue;
       const isColor = prop === "strokeColor" || prop === "backgroundColor";
+      if (isColor && ribbonMode) {
+        const curVal = m[prop];
+        const isNone = !curVal || curVal === "transparent";
+        const popOpen = ctx.colorPicker === prop;
+        out.push(
+          h("button.c.color-pill" + (popOpen ? ".on" : ""), {
+            type: "button",
+            title: `${lab} color (${isNone ? "none" : curVal})`,
+            "aria-label": `${lab} color`,
+            "aria-haspopup": "dialog",
+            "aria-expanded": String(popOpen),
+            "data-color-popover": prop,
+            "data-fk": `color-popover:${prop}`,
+            disabled: dis,
+            onclick: ev => {
+              ev?.stopPropagation?.();
+              ctx.setColorPicker?.(popOpen ? null : prop);
+            },
+          },
+            h("span.color-pill-lab", {}, lab),
+            h("span.sw.color-pill-dot" + (isNone ? ".none" : ""), {
+              "aria-hidden": "true",
+              style: isNone ? {} : { background: curVal },
+            }),
+            h("span.color-pill-caret", { "aria-hidden": "true" }, "▾")),
+        );
+        if (popOpen) {
+          const swatches = opts.map(([, val]) => {
+            const on = m[prop] === val;
+            return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), {
+              type: "button",
+              title: val === "transparent" ? "No fill" : val,
+              "aria-label": val,
+              disabled: dis,
+              "data-fk": `chip:${prop}:${val}`,
+              style: val === "transparent" ? {} : { background: val },
+              onclick: () => style({ [prop]: val }),
+            });
+          });
+          activeColorPopover = h("div.color-popover", {
+            role: "dialog",
+            "aria-label": `${lab} color picker`,
+            "data-color-popover-panel": prop,
+            onclick: ev => ev?.stopPropagation?.(),
+          },
+            h("div.color-popover-swatches", {}, swatches),
+            createColorPicker({
+              value: m[prop] && m[prop] !== "transparent" ? m[prop] : "#3b48e8",
+              disabled: dis,
+              prefs: ctx.prefs ?? null,
+              canvas: ctx.canvas ?? null,
+              pickerState: ctx.colorPickerState ?? null,
+              onChange: hex => style({ [prop]: hex }),
+              onClose: () => ctx.setColorPicker?.(null),
+              h,
+            }));
+        }
+        continue;
+      }
       const ctrls = opts.map(([t, val]) => {
         if (isColor) {
           const on = m[prop] === val;
@@ -178,7 +253,7 @@ export function renderPanel(root, ctx) {
       }
     }
     if (!notesOnly) {
-      if (m.count >= 1) {
+      if (m.count >= 1 && (!allowed || allowed.has("effects"))) {
         const applyEffects = patch => act(e => {
           const els = e.selected().filter(x => !isLabel(x) && e.doc.editable(x));
           if (!els.length) return;
@@ -219,9 +294,9 @@ export function renderPanel(root, ctx) {
             row("Mask", "", clipSel)),
         );
       }
-      const selNonLabels = ed.selected().filter(e => e && !isLabel(e));
       const singleEl = selNonLabels.length === 1 ? selNonLabels[0] : null;
       const showMeta = Boolean(
+        (!allowed || allowed.has("meta")) &&
         singleEl &&
         (isShape(singleEl) || singleEl.type === "frame") &&
         !parseLinkCardFromElement(singleEl) &&
@@ -379,10 +454,34 @@ export function renderPanel(root, ctx) {
             errEl),
         );
       }
-      out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));
-      out.push(row("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
-      out.push(row("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))));
-      out.push(row("Bends", "", chip("+ bend", false, () => act(e => e.addBend())), chip("straighten", false, () => act(e => e.straighten()))));
+      const showArrow = !allowed || allowed.has("arrow");
+      const showHeads = !allowed || allowed.has("heads");
+      const showBends = !allowed || allowed.has("bends");
+      if (showArrow || showHeads || showBends) {
+        if (!ribbonMode) {
+          out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));
+        }
+        if (showArrow) {
+          out.push(row("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
+        }
+        if (showHeads) {
+          out.push(row("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))));
+        }
+        if (showBends) {
+          out.push(row("Bends", "", chip("+ bend", false, () => act(e => e.addBend())), chip("straighten", false, () => act(e => e.straighten()))));
+        }
+      }
+      if (ribbonMode && (hasHiddenProps || ribbonShowAll)) {
+        out.push(h("button.c.ribbon-all-btn" + (ribbonShowAll ? ".on" : ""), {
+          type: "button",
+          title: ribbonShowAll ? "Return to contextual properties" : "Show all properties",
+          "aria-label": ribbonShowAll ? "Contextual properties" : "Show all properties",
+          "aria-pressed": String(ribbonShowAll),
+          "data-ribbon-all": "1",
+          "data-fk": "ribbon:show-all",
+          onclick: () => ctx.onToggleRibbonAll?.(),
+        }, ribbonShowAll ? "Contextual" : "All ⋯"));
+      }
     }
     return out;
   }
@@ -653,24 +752,51 @@ export function renderPanel(root, ctx) {
   const secs = panelSections(st, availableFor(S, ctx.workspaceMode ?? null));
   const sub = { properties: m.count ? `· ${m.count} selected` : "· next shape", frames: `· ${listNamedFrames(B.doc).length}`, library: `· ${(ctx.library ?? []).length}` };
   const out = [];
-  const activeTabId = tabs ? secs.find(s => s.active)?.id : (state.tab || secs[0]?.id);
-  out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" }, secs.map(s => {
-    const isSel = tabs ? Boolean(s.active) : s.id === activeTabId;
-    return h("button" + (isSel ? ".on" : ""), {
-      type: "button",
-      role: "tab",
-      "aria-selected": String(isSel),
-      "aria-label": s.title,
-      "data-fk": `panel-tab:${s.id}`,
-      style: touchBtnStyle,
-      onclick: () => ctx.setState({ type: "tab", id: s.id }),
-    }, s.title);
-  })));
+  const activeTabId = tabs
+    ? (secs.find(s => s.active)?.id ?? secs[0]?.id)
+    : (secs.some(s => s.id === state.tab) ? state.tab : secs[0]?.id);
+  const toggleBtn = ribbonMode
+    ? h("button.tb.ribbon-toggle", {
+        type: "button",
+        title: ribbonExpanded ? "Collapse ribbon" : "Expand ribbon",
+        "aria-label": ribbonExpanded ? "Collapse ribbon" : "Expand ribbon",
+        "aria-expanded": String(ribbonExpanded),
+        "data-ribbon-toggle": "1",
+        "data-fk": "ribbon:toggle",
+        onclick: () => ctx.onToggleRibbon?.(),
+      }, ribbonExpanded ? "⌃" : "⌄")
+    : null;
+  out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" },
+    secs.map(s => {
+      const isSel = s.id === activeTabId;
+      const isOnTab = isSel && (ctx.inSheet || ribbonExpanded);
+      return h("button" + (isOnTab ? ".on" : ""), {
+        type: "button",
+        role: "tab",
+        "aria-selected": String(isSel),
+        "aria-label": s.title,
+        "data-tab": s.id,
+        "data-fk": `panel-tab:${s.id}`,
+        style: touchBtnStyle,
+        onclick: () => {
+          if (ribbonMode && ctx.onRibbonTab) ctx.onRibbonTab(s.id, activeTabId);
+          else ctx.setState({ type: "tab", id: s.id });
+        },
+      }, s.title);
+    }),
+    toggleBtn));
   for (const s of secs) {
     if (!s.active) continue;
-    out.push(h("div.sec" + (s.folded ? ".folded" : ""), { "data-sec": s.id },
+    const ribbonHidden = ribbonMode && s.id !== activeTabId;
+    out.push(h("div.sec" + (s.folded ? ".folded" : ""), {
+      "data-sec": s.id,
+      ...(ribbonHidden ? { "data-ribbon-hidden": "true" } : {}),
+    },
       h("h4", { onclick: () => !tabs && ctx.setState({ type: "fold", id: s.id }) }, s.title, sub[s.id] ? h("span", {}, sub[s.id]) : null),
       s.folded ? null : bodies[s.id]()));
+  }
+  if (activeColorPopover && ribbonExpanded && activeTabId === "properties") {
+    out.push(activeColorPopover);
   }
   return out;
 }

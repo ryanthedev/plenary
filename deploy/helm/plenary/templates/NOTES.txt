@@ -1,0 +1,30 @@
+Plenary has been deployed in {{ .Values.mode | upper }} mode!
+
+1. Check rollout status and health:
+   kubectl --namespace {{ .Release.Namespace }} rollout status deployment/{{ include "plenary.fullname" . }}
+
+2. Access Plenary:
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else }}
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "plenary.fullname" . }} 8080:{{ .Values.service.port }}
+   curl -s http://127.0.0.1:8080/health
+{{- end }}
+
+{{- if eq .Values.mode "single" }}
+
+Single-Node Notes:
+- Data (SQLite plenary.db, registry.db, and local blobs) is stored on PVC {{ include "plenary.pvcName" . }} at /data.
+- Deployment strategy is Recreate (1 replica) to prevent concurrent SQLite writers.
+- Set COOKIE_KEY (>= 32 bytes) in a Kubernetes Secret so user sessions survive pod restarts.
+{{- else }}
+
+Enterprise HA Notes:
+- Running {{ include "plenary.replicaCount" . }} replicas with RollingUpdate strategy and shared Postgres + NATS + S3.
+- Ensure NATS is configured with max_payload >= 2MB.
+- Ensure every replica receives the exact same COOKIE_KEY and PLENARY_LEASE_TTL_MS.
+{{- end }}

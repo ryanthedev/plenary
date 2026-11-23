@@ -1,0 +1,222 @@
+{{- include "plenary.validateValues" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "plenary.fullname" . }}
+  labels:
+    {{- include "plenary.labels" . | nindent 4 }}
+spec:
+  replicas: {{ include "plenary.replicaCount" . }}
+  strategy:
+    {{- if eq .Values.mode "single" }}
+    type: Recreate
+    {{- else }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "plenary.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.secrets.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "plenary.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "plenary.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: NODE_ENV
+              value: "production"
+            - name: PLENARY_DATA_DIR
+              value: "/data"
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- if .Values.config.publicUrl }}
+            - name: PUBLIC_URL
+              value: {{ .Values.config.publicUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.postLoginUrl }}
+            - name: POST_LOGIN_URL
+              value: {{ .Values.config.postLoginUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.boardUrl }}
+            - name: BOARD_URL
+              value: {{ .Values.config.boardUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.requestDeadlineMs }}
+            - name: PLENARY_REQUEST_DEADLINE_MS
+              value: {{ .Values.config.requestDeadlineMs | quote }}
+            {{- end }}
+            {{- if .Values.config.maxConnsPerUser }}
+            - name: PLENARY_MAX_CONNS_PER_USER
+              value: {{ .Values.config.maxConnsPerUser | quote }}
+            {{- end }}
+            {{- if .Values.config.trashSweepMs }}
+            - name: PLENARY_TRASH_SWEEP_MS
+              value: {{ .Values.config.trashSweepMs | quote }}
+            {{- end }}
+            {{- if .Values.config.blobReapMs }}
+            - name: PLENARY_BLOB_REAP_MS
+              value: {{ .Values.config.blobReapMs | quote }}
+            {{- end }}
+            {{- if .Values.config.blobQuotaBytes }}
+            - name: PLENARY_BLOB_QUOTA_BYTES
+              value: {{ .Values.config.blobQuotaBytes | quote }}
+            {{- end }}
+            {{- if eq .Values.mode "ha" }}
+            - name: PLENARY_ROLES
+              value: {{ .Values.config.roles | default "gateway,host" | quote }}
+            - name: PLENARY_LEASE_TTL_MS
+              value: {{ .Values.config.leaseTtlMs | default "10000" | quote }}
+            {{- if .Values.config.blobsMode }}
+            - name: PLENARY_BLOBS
+              value: {{ .Values.config.blobsMode | quote }}
+            {{- end }}
+            {{- if .Values.config.s3.endpoint }}
+            - name: S3_ENDPOINT
+              value: {{ .Values.config.s3.endpoint | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.config.s3.bucket | quote }}
+            - name: S3_REGION
+              value: {{ .Values.config.s3.region | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.config.oidc.issuerUrl }}
+            - name: OIDC_ISSUER_URL
+              value: {{ .Values.config.oidc.issuerUrl | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.redirectUri }}
+            - name: OIDC_REDIRECT_URI
+              value: {{ .Values.config.oidc.redirectUri | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.scopes }}
+            - name: OIDC_SCOPES
+              value: {{ .Values.config.oidc.scopes | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.displayName }}
+            - name: OIDC_DISPLAY_NAME
+              value: {{ .Values.config.oidc.displayName | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.tenantSlug }}
+            - name: OIDC_TENANT_SLUG
+              value: {{ .Values.config.oidc.tenantSlug | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.tenantDomain }}
+            - name: OIDC_TENANT_DOMAIN
+              value: {{ .Values.config.oidc.tenantDomain | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.emailDomains }}
+            - name: OIDC_EMAIL_DOMAINS
+              value: {{ .Values.config.oidc.emailDomains | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.allowedGroups }}
+            - name: OIDC_ALLOWED_GROUPS
+              value: {{ .Values.config.oidc.allowedGroups | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.groupsClaim }}
+            - name: OIDC_GROUPS_CLAIM
+              value: {{ .Values.config.oidc.groupsClaim | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.adminUsers }}
+            - name: OIDC_ADMIN_USERS
+              value: {{ .Values.config.oidc.adminUsers | quote }}
+            {{- end }}
+            {{- if .Values.config.oidc.allowUnverifiedEmail }}
+            - name: OIDC_ALLOW_UNVERIFIED_EMAIL
+              value: "1"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "plenary.secretName" . }}
+                optional: {{ eq .Values.mode "single" }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if and (eq .Values.mode "single") .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "plenary.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

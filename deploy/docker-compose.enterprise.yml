@@ -1,0 +1,190 @@
+# Plenary 1-Command Enterprise Self-Host Stack
+# Services: Plenary + Postgres 17 + NATS (2 MB max_payload) + Caddy Automatic HTTPS
+#
+# Quick Start:
+#   1. Create `deploy/.env` (git-ignored; Compose reads `.env` beside this file):
+#
+#        # Required
+#        PLENARY_DOMAIN=plenary.example.com
+#        PUBLIC_URL=https://plenary.example.com
+#        OIDC_REDIRECT_URI=https://plenary.example.com/auth/callback
+#        POSTGRES_PASSWORD=<letters-and-digits-only>        # e.g. openssl rand -hex 24
+#        COOKIE_KEY=<at-least-32-bytes>                     # e.g. openssl rand -hex 32
+#
+#        # Authentication — choose ONE (mutually exclusive):
+#        # Option A: Generic OIDC (Okta, Keycloak, Authentik, Pocket ID, Auth0, Entra ID)
+#        OIDC_ISSUER_URL=https://auth.example.com
+#        OIDC_CLIENT_ID=<client-id>
+#        OIDC_CLIENT_SECRET=<client-secret>
+#        # Optional OIDC tuning: OIDC_DISPLAY_NAME, OIDC_TENANT_DOMAIN, OIDC_EMAIL_DOMAINS,
+#        #                       OIDC_ALLOWED_GROUPS, OIDC_GROUPS_CLAIM, OIDC_ADMIN_USERS
+#
+#        # Option B: Google Workspace SSO (leave OIDC_ISSUER_URL unset)
+#        # GOOGLE_CLIENT_ID=<google-client-id>
+#        # GOOGLE_CLIENT_SECRET=<google-client-secret>
+#
+#        # Blob storage — choose ONE (mutually exclusive):
+#        # Option A (single gateway, local volume):
+#        PLENARY_BLOBS=local-disk
+#        # Option B (external S3-compatible store — leave PLENARY_BLOBS unset):
+#        # S3_ENDPOINT=https://s3.example.com
+#        # S3_BUCKET=plenary
+#        # S3_REGION=us-east-1
+#        # S3_ACCESS_KEY_ID=<key>
+#        # S3_SECRET_ACCESS_KEY=<secret>
+#
+#        # Optional: Prometheus metrics endpoint (GET /metrics with Bearer token)
+#        # PLENARY_METRICS_TOKEN=<openssl rand -hex 32>
+#
+#   2. Launch (builds from local repo by default; set PLENARY_IMAGE=<registry/plenary:tag> to pull prebuilt):
+#        docker compose -f deploy/docker-compose.enterprise.yml up -d --build
+#
+#   3. Verify:
+#        curl -fsS https://plenary.example.com/health
+
+name: plenary-enterprise
+
+services:
+  plenary:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ${PLENARY_IMAGE:-plenary:dev}
+    user: "1000:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      NODE_ENV: production
+      PLENARY_DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PUBLIC_URL: ${PUBLIC_URL:-https://${PLENARY_DOMAIN:?set PLENARY_DOMAIN in deploy/.env}}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-https://${PLENARY_DOMAIN:?set PLENARY_DOMAIN in deploy/.env}/auth/callback}
+
+      # Cluster Store (Postgres 17) + Bus (NATS core, 2 MB max_payload)
+      DATABASE_URL: postgres://plenary:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (letters and digits) in deploy/.env}@postgres:5432/plenary
+      NATS_URL: nats://nats:4222
+      PLENARY_NODE_ID: ${PLENARY_NODE_ID:-plenary-1}
+      PLENARY_ROLES: ${PLENARY_ROLES:-gateway,host}
+      PLENARY_LEASE_TTL_MS: ${PLENARY_LEASE_TTL_MS:-10000}
+      PLENARY_REQUEST_DEADLINE_MS: ${PLENARY_REQUEST_DEADLINE_MS:-8000}
+      PLENARY_MAX_CONNS_PER_USER: ${PLENARY_MAX_CONNS_PER_USER:-64}
+
+      # Signing keys (COOKIE_KEY required in cluster mode; >= 32 bytes)
+      COOKIE_KEY: ${COOKIE_KEY:?set COOKIE_KEY (>= 32 bytes, openssl rand -hex 32) in deploy/.env}
+      SESSION_KEY:
+
+      # Blobs: pass-through so either PLENARY_BLOBS=local-disk OR S3_* can be selected in deploy/.env without conflict.
+      PLENARY_BLOBS:
+      S3_ENDPOINT:
+      S3_BUCKET:
+      S3_REGION:
+      S3_ACCESS_KEY_ID:
+      S3_SECRET_ACCESS_KEY:
+      S3_SESSION_TOKEN:
+      PLENARY_BLOB_QUOTA_BYTES:
+      PLENARY_BLOB_REAP_MS:
+      PLENARY_TRASH_SWEEP_MS:
+
+      # Generic OIDC (passed through only when set in deploy/.env or shell)
+      OIDC_ISSUER_URL:
+      OIDC_CLIENT_ID:
+      OIDC_CLIENT_SECRET:
+      OIDC_SCOPES:
+      OIDC_DISPLAY_NAME:
+      OIDC_TENANT_SLUG:
+      OIDC_TENANT_DOMAIN:
+      OIDC_EMAIL_DOMAINS:
+      OIDC_ALLOWED_GROUPS:
+      OIDC_GROUPS_CLAIM:
+      OIDC_ADMIN_USERS:
+      OIDC_ALLOW_UNVERIFIED_EMAIL:
+
+      # Google Workspace SSO (mutually exclusive with OIDC_ISSUER_URL)
+      GOOGLE_CLIENT_ID:
+      GOOGLE_CLIENT_SECRET:
+
+      # Optional Prometheus metrics (GET /metrics)
+      PLENARY_METRICS_TOKEN:
+    volumes:
+      - plenary-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8080/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: plenary
+      POSTGRES_DB: plenary
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (letters and digits) in deploy/.env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "plenary", "-d", "plenary"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.15.3-alpine
+    command: ["nats-server", "--config", "/etc/nats/plenary.conf"]
+    volumes:
+      - ./cluster/nats.conf:/etc/nats/plenary.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.11.9-alpine
+    # Automatic HTTPS via Let's Encrypt for PLENARY_DOMAIN, proxying HTTP + WebSockets to plenary:8080.
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - ${PLENARY_DOMAIN:?set PLENARY_DOMAIN in deploy/.env}
+      - --to
+      - http://plenary:8080
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      plenary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  plenary-data:
+  postgres-data:
+  caddy-data:
+  caddy-config:

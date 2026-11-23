@@ -229,3 +229,61 @@ test("#117: clip rect uses pure save/beginPath/rect/clip/restore (WKWebView-safe
   const rots = rctx.calls.filter(call => call[0] === "rotate").map(call => call[1]);
   expect(rots).toEqual([0.5, -0.5]);
 });
+
+test("#117 Phase 2: blendMode scopes globalCompositeOperation inside save/restore with zero ctx.filter and no leak", () => {
+  const ctx = fakeCtx();
+  paint(ctx, [
+    { t: "path", cmds: [["M", 0, 0], ["L", 50, 0], ["L", 50, 50]], fill: "#ff0000", opacity: 1, blendMode: "multiply" },
+    { t: "path", cmds: [["M", 10, 10], ["L", 60, 10], ["L", 60, 60]], fill: "#00ff00", opacity: 1, blendMode: "normal" },
+    { t: "path", cmds: [["M", 20, 20], ["L", 70, 20], ["L", 70, 70]], fill: "#0000ff", opacity: 1, blendMode: "evil; filter:blur(5px)" },
+  ], view);
+  const c = ctx.calls;
+  const gcoCalls = c.filter(call => call[0] === "=globalCompositeOperation");
+  expect(gcoCalls).toEqual([["=globalCompositeOperation", "multiply"]]);
+  expect(c.some(call => call[0] === "=filter")).toBe(false);
+  const n = names(ctx);
+  const gcoIdx = n.indexOf("=globalCompositeOperation");
+  const firstFill = n.indexOf("fill");
+  const saveBefore = n.lastIndexOf("save", gcoIdx);
+  const restoreAfter = n.indexOf("restore", firstFill);
+  expect(saveBefore).toBeGreaterThan(-1);
+  expect(saveBefore).toBeLessThan(gcoIdx);
+  expect(restoreAfter).toBeGreaterThan(firstFill);
+  expect(restoreAfter).toBeLessThan(n.indexOf("fill", firstFill + 1));
+});
+
+test("#117 Phase 2: clipShape traces vector mask via save/clip/restore, respects rotation and composes with wipe clip", () => {
+  const img = { naturalWidth: 100, naturalHeight: 100 };
+  const ctx = fakeCtx();
+  paint(ctx, [{
+    t: "image",
+    fileId: "f1",
+    x: 10, y: 20, w: 100, h: 80,
+    angle: 0.4, cx: 60, cy: 60, opacity: 1,
+    blendMode: "screen",
+    clip: { x: 10, y: 20, w: 50, h: 80 },
+    clipShape: { shape: "ellipse", x: 10, y: 20, w: 100, h: 80, angle: 0.4, cx: 60, cy: 60 },
+  }], { ...view, image: () => img });
+  const c = ctx.calls;
+  const n = names(ctx);
+  expect(c).toContainEqual(["=globalCompositeOperation", "screen"]);
+  expect(n.filter(x => x === "clip").length).toBe(2); // wipe clip + shape clip
+  expect(c.filter(call => call[0] === "quadraticCurveTo").length).toBe(16); // ellipse mask
+  expect(c.filter(call => call[0] === "rotate").map(call => call[1])).toEqual([0.4, -0.4, 0.4]); // mask rot, unrot, image rot
+  expect(n.filter(x => x === "save").length).toBe(n.filter(x => x === "restore").length);
+  expect(n.indexOf("drawImage")).toBeGreaterThan(n.lastIndexOf("clip"));
+  expect(c.some(call => call[0] === "=filter")).toBe(false);
+
+  // Shorthand string clipShape on an image item also works
+  const sctx = fakeCtx();
+  paint(sctx, [{
+    t: "image",
+    fileId: "f1",
+    x: 0, y: 0, w: 80, h: 60,
+    angle: 0, cx: 40, cy: 30, opacity: 1,
+    clipShape: "diamond",
+  }], { ...view, image: () => img });
+  expect(sctx.calls).toContainEqual(["moveTo", 40, 0]);
+  expect(sctx.calls).toContainEqual(["lineTo", 80, 30]);
+  expect(names(sctx)).toContain("clip");
+});

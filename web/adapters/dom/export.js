@@ -8,6 +8,7 @@
 import { exportScene, paintedBox, boardTheme, LIGHT, DARK, exportToExcalidraw } from "../../../packages/core/export.js";
 import { paintElement, project } from "../../../packages/core/render.js";
 import { bounds } from "../../../packages/core/geometry.js";
+import { toSvgBlendMode, clipPathCommands } from "../../../packages/core/effects.js";
 import { paint, imageCache, FACES } from "./paint.js";
 
 const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -119,6 +120,35 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
     defs.push(`<clipPath id="${id}"><rect x="${num(x).toFixed(1)}" y="${num(y).toFixed(1)}" width="${Math.max(0, num(w)).toFixed(1)}" height="${Math.max(0, num(h)).toFixed(1)}"${turn}/></clipPath>`);
     return id;
   };
+  const resolveItemClipShape = it => {
+    const cs = it?.clipShape;
+    if (!cs) return null;
+    if (typeof cs === "string") {
+      if (cs === "none") return null;
+      const box = it.box ?? it;
+      const x = num(box.x), y = num(box.y), w = num(box.w), h = num(box.h);
+      return { shape: cs, x, y, w, h, radius: undefined, angle: num(it.angle), cx: num(it.cx, x + w / 2), cy: num(it.cy, y + h / 2) };
+    }
+    if (typeof cs === "object" && cs.shape && cs.shape !== "none") {
+      const x = num(cs.x), y = num(cs.y), w = num(cs.w), h = num(cs.h);
+      return {
+        shape: cs.shape, x, y, w, h,
+        radius: cs.radius,
+        cmds: Array.isArray(cs.cmds) && cs.cmds.length ? cs.cmds : null,
+        angle: num(cs.angle), cx: num(cs.cx, x + w / 2), cy: num(cs.cy, y + h / 2),
+      };
+    }
+    return null;
+  };
+  const addShapeClip = cs => {
+    const cmds = cs.cmds ?? clipPathCommands(cs.shape, cs.x, cs.y, cs.w, cs.h, cs.radius);
+    if (!cmds.length) return null;
+    const id = `pl-clip-${++clipSeq}`;
+    const deg = num(cs.angle) * 180 / Math.PI;
+    const turn = deg ? ` transform="rotate(${deg.toFixed(2)} ${num(cs.cx).toFixed(1)} ${num(cs.cy).toFixed(1)})"` : "";
+    defs.push(`<clipPath id="${id}"><path d="${d(cmds)}Z"${turn}/></clipPath>`);
+    return id;
+  };
   const body = [];
   const bgRect = background ? `<rect x="${vbX}" y="${vbY}" width="${width}" height="${height}" fill="${color(background)[0]}"/>` : null;
   for (const it of items) {
@@ -130,6 +160,13 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
       if (!(cw > 0 && ch > 0)) continue;
       itemClipId = addClip(it.clip.x, it.clip.y, cw, ch, it.clip.angle, it.clip.cx, it.clip.cy);
     }
+    let shapeClipId = null;
+    const resolvedShape = resolveItemClipShape(it);
+    if (resolvedShape) {
+      shapeClipId = addShapeClip(resolvedShape);
+      if (!shapeClipId) continue;
+    }
+    const blend = toSvgBlendMode(it.blendMode);
     const seg = [];
     if (it.t === "path") {
       if (!Array.isArray(it.cmds) || !it.cmds.length) continue;
@@ -183,8 +220,15 @@ export function toSvg(items, { width, height, background, files = {}, scale = 1,
       if (deg) seg.push("</g>");
     }
     if (!seg.length) continue;
-    if (itemClipId) body.push(`<g clip-path="url(#${itemClipId})">${seg.join("")}</g>`);
-    else body.push(...seg);
+    if (shapeClipId || itemClipId || blend) {
+      let wrapped = seg.join("");
+      if (shapeClipId) wrapped = `<g clip-path="url(#${shapeClipId})">${wrapped}</g>`;
+      if (itemClipId) wrapped = `<g clip-path="url(#${itemClipId})">${wrapped}</g>`;
+      if (blend) wrapped = `<g style="mix-blend-mode: ${blend}">${wrapped}</g>`;
+      body.push(wrapped);
+    } else {
+      body.push(...seg);
+    }
   }
   const frameClipId = cropToFrame && body.length ? addClip(vbX, vbY, width, height) : null;
   const out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${px(width)}" height="${px(height)}" viewBox="${vbX} ${vbY} ${width} ${height}">`];

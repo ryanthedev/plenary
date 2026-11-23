@@ -184,3 +184,69 @@ describe("Issue #20: Single-frame SVG/PNG export & Print-to-PDF HTML", () => {
     expect(html).toContain("Solo Note");
   });
 });
+
+describe("Issue #117 Phase 2: Shape clipping masks & blend modes export parity (SVG & PNG)", () => {
+  test("toSvg emits <clipPath> for clipShape (with rotation) and mix-blend-mode for allowlisted blendMode", () => {
+    const svg = toSvg(
+      [{
+        t: "image",
+        fileId: SHA1,
+        x: 10, y: 20, w: 100, h: 60,
+        angle: Math.PI / 4, cx: 60, cy: 50, opacity: 1,
+        blendMode: "multiply",
+        clipShape: { shape: "diamond", x: 10, y: 20, w: 100, h: 60, angle: Math.PI / 4, cx: 60, cy: 50 },
+      }],
+      { width: 200, height: 200, files: { [SHA1]: { dataURL: DATA_URL } } },
+    );
+    expect(svg).toContain('<clipPath id="pl-clip-1"><path d="M60.0 20.0L110.0 50.0L60.0 80.0L10.0 50.0Z" transform="rotate(45.00 60.0 50.0)"/></clipPath>');
+    expect(svg).toContain('<g style="mix-blend-mode: multiply"><g clip-path="url(#pl-clip-1)"><image');
+  });
+
+  test("toSvg rejects untrusted/CSS-injection blendMode values and omits mix-blend-mode for normal", () => {
+    const svg = toSvg(
+      [
+        { t: "path", cmds: [["M", 0, 0], ["L", 40, 0], ["L", 40, 40]], fill: "#ff0000", opacity: 1, blendMode: "normal" },
+        { t: "path", cmds: [["M", 0, 0], ["L", 40, 0], ["L", 40, 40]], fill: "#00ff00", opacity: 1, blendMode: 'multiply; background:url(javascript:alert(1))' },
+        { t: "path", cmds: [["M", 0, 0], ["L", 40, 0], ["L", 40, 40]], fill: "#0000ff", opacity: 1, blendMode: 'overlay" onload="alert(1)' },
+      ],
+      { width: 100, height: 100 },
+    );
+    expect(svg).not.toContain("mix-blend-mode");
+    expect(svg).not.toContain("javascript:");
+    expect(svg).not.toContain("onload");
+  });
+
+  test("exportSvg and paintPng achieve full parity for Doc elements with customData.effects", () => {
+    const imgEl = makeElement("image", {
+      id: "img1",
+      x: 20, y: 20, width: 120, height: 80,
+      fileId: SHA1,
+      customData: { effects: { blendMode: "overlay", clipShape: "ellipse" } },
+    });
+    const rectEl = makeElement("rectangle", {
+      id: "rect1",
+      x: 40, y: 40, width: 100, height: 60,
+      backgroundColor: "#3B48E8",
+      customData: { effects: { blendMode: "difference", clipShape: "rounded", clipRadius: 10 } },
+    });
+    const doc = new Doc({
+      elements: [imgEl, rectEl],
+      files: { [SHA1]: { id: SHA1, mimeType: "image/png", dataURL: DATA_URL } },
+    });
+
+    const svg = exportSvg(doc, { scale: 1 });
+    expect(svg).toContain('style="mix-blend-mode: overlay"');
+    expect(svg).toContain('style="mix-blend-mode: difference"');
+    expect(svg).toContain("<clipPath id=\"pl-clip-1\"><path d=\"");
+    expect(svg).toContain("<clipPath id=\"pl-clip-2\"><path d=\"");
+
+    const canvas = fakeCanvas();
+    const img = { naturalWidth: 120, naturalHeight: 80 };
+    paintPng(doc, canvas, { loadImage: () => img, scale: 2 });
+    const gcos = canvas.ctx.calls.filter(c => c[0] === "=globalCompositeOperation").map(c => c[1]);
+    expect(gcos).toContain("overlay");
+    expect(gcos).toContain("difference");
+    expect(canvas.ctx.calls.filter(c => c[0] === "clip").length).toBeGreaterThanOrEqual(2);
+    expect(canvas.ctx.calls.some(c => c[0] === "=filter")).toBe(false);
+  });
+});

@@ -11,6 +11,8 @@
 // Pure: paint(ctx, items, view) touches only ctx. Pictures come in through view.image(fileId), which returns
 // something drawImage takes, or null while it loads (the page owns loading; see imageCache).
 
+import { toCanvasComposite, clipPathCommands } from "../../../packages/core/effects.js";
+
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 // Board content is untrusted: only hex colors reach the context (as in the SVG adapter).
@@ -79,6 +81,57 @@ function clipped(ctx, clip, draw) {
   ctx.restore();
 }
 
+function resolveClipShape(it) {
+  const cs = it?.clipShape;
+  if (!cs) return null;
+  if (typeof cs === "string") {
+    if (cs === "none") return null;
+    const box = it.box ?? it;
+    const x = num(box.x), y = num(box.y), w = num(box.w), h = num(box.h);
+    return { shape: cs, x, y, w, h, radius: undefined, angle: num(it.angle), cx: num(it.cx, x + w / 2), cy: num(it.cy, y + h / 2) };
+  }
+  if (typeof cs === "object" && cs.shape && cs.shape !== "none") {
+    const x = num(cs.x), y = num(cs.y), w = num(cs.w), h = num(cs.h);
+    return {
+      shape: cs.shape, x, y, w, h,
+      radius: cs.radius,
+      cmds: Array.isArray(cs.cmds) && cs.cmds.length ? cs.cmds : null,
+      angle: num(cs.angle), cx: num(cs.cx, x + w / 2), cy: num(cs.cy, y + h / 2),
+    };
+  }
+  return null;
+}
+
+function withClipShape(ctx, cs, draw) {
+  if (!cs) return draw();
+  const cmds = cs.cmds ?? clipPathCommands(cs.shape, cs.x, cs.y, cs.w, cs.h, cs.radius);
+  if (!cmds.length) return;
+  ctx.save();
+  const a = num(cs.angle);
+  if (a) {
+    const cx = num(cs.cx), cy = num(cs.cy);
+    ctx.translate(cx, cy); ctx.rotate(a); ctx.translate(-cx, -cy);
+  }
+  trace(ctx, cmds);
+  ctx.closePath();
+  ctx.clip();
+  if (a) {
+    const cx = num(cs.cx), cy = num(cs.cy);
+    ctx.translate(cx, cy); ctx.rotate(-a); ctx.translate(-cx, -cy);
+  }
+  draw();
+  ctx.restore();
+}
+
+function withBlendMode(ctx, blendMode, draw) {
+  const op = toCanvasComposite(blendMode);
+  if (op === "source-over") return draw();
+  ctx.save();
+  ctx.globalCompositeOperation = op;
+  draw();
+  ctx.restore();
+}
+
 function resolveCropSource(crop, src) {
   if (!crop || typeof crop !== "object") return null;
   const cx = num(crop.x, 0), cy = num(crop.y, 0);
@@ -130,80 +183,84 @@ export function paint(ctx, items, view) {
     const op = Math.max(0, Math.min(1, num(it.opacity, 1)));
     if (op <= 0) continue;
     ctx.globalAlpha = op;
-    clipped(ctx, it.clip, () => {
-      if (it.t === "path") {
-        if (!Array.isArray(it.cmds) || !it.cmds.length) return;
-        trace(ctx, it.cmds);
-        if (it.fill) { ctx.closePath(); ctx.fillStyle = color(it.fill); ctx.fill(); }
-        else {
-          const w = num(it.width, 1);
-          if (!(w > 0)) return;   // canvas ignores a width of 0 or less and would keep the previous one
-          ctx.strokeStyle = color(it.stroke); ctx.lineWidth = w;
-          ctx.setLineDash(Array.isArray(it.dash) ? it.dash.map(v => num(v)) : []);
-          ctx.stroke();
-        }
-      } else if (it.t === "text") {
-        let text = String(it.text ?? "");
-        if (it.reveal != null && it.reveal < 1) text = text.slice(0, Math.round(text.length * Math.max(0, it.reveal)));
-        if (!text) return;
-        const size = num(it.size, 16);
-        if (!(size > 0)) return;
-        const lh = size * num(it.lineHeight, 1.25), lines = text.split("\n");
-        const face = Object.prototype.hasOwnProperty.call(faces, it.font) ? faces[it.font] : faces.sans;   // own keys only
-        ctx.font = `${size.toFixed(1)}px ${face}`;
-        ctx.fillStyle = color(it.color);
-        ctx.textBaseline = "alphabetic";
-        rotated(ctx, it, () => {
-          if (it.box) {
-            const cx = num(it.box.x) + num(it.box.w) / 2, top = num(it.box.y) + num(it.box.h) / 2 - (lines.length * lh) / 2;
-            ctx.textAlign = "center";
-            lines.forEach((l, i) => ctx.fillText(l, cx, top + lh * (i + 0.75)));
-          } else {
-            ctx.textAlign = "left";
-            lines.forEach((l, i) => ctx.fillText(l, num(it.x), num(it.y) + lh * (i + 0.75)));
+    withBlendMode(ctx, it.blendMode, () => {
+      clipped(ctx, it.clip, () => {
+        withClipShape(ctx, resolveClipShape(it), () => {
+          if (it.t === "path") {
+            if (!Array.isArray(it.cmds) || !it.cmds.length) return;
+            trace(ctx, it.cmds);
+            if (it.fill) { ctx.closePath(); ctx.fillStyle = color(it.fill); ctx.fill(); }
+            else {
+              const w = num(it.width, 1);
+              if (!(w > 0)) return;   // canvas ignores a width of 0 or less and would keep the previous one
+              ctx.strokeStyle = color(it.stroke); ctx.lineWidth = w;
+              ctx.setLineDash(Array.isArray(it.dash) ? it.dash.map(v => num(v)) : []);
+              ctx.stroke();
+            }
+          } else if (it.t === "text") {
+            let text = String(it.text ?? "");
+            if (it.reveal != null && it.reveal < 1) text = text.slice(0, Math.round(text.length * Math.max(0, it.reveal)));
+            if (!text) return;
+            const size = num(it.size, 16);
+            if (!(size > 0)) return;
+            const lh = size * num(it.lineHeight, 1.25), lines = text.split("\n");
+            const face = Object.prototype.hasOwnProperty.call(faces, it.font) ? faces[it.font] : faces.sans;   // own keys only
+            ctx.font = `${size.toFixed(1)}px ${face}`;
+            ctx.fillStyle = color(it.color);
+            ctx.textBaseline = "alphabetic";
+            rotated(ctx, it, () => {
+              if (it.box) {
+                const cx = num(it.box.x) + num(it.box.w) / 2, top = num(it.box.y) + num(it.box.h) / 2 - (lines.length * lh) / 2;
+                ctx.textAlign = "center";
+                lines.forEach((l, i) => ctx.fillText(l, cx, top + lh * (i + 0.75)));
+              } else {
+                ctx.textAlign = "left";
+                lines.forEach((l, i) => ctx.fillText(l, num(it.x), num(it.y) + lh * (i + 0.75)));
+              }
+            });
+          } else if (it.t === "image") {
+            const src = view.image?.(it.fileId);
+            const w = num(it.w), h = num(it.h);
+            if (!src || !(w > 0 && h > 0)) return;   // skip zero/negative dimensions during scale or flip animations
+            const dx = num(it.x), dy = num(it.y);
+            if (it.crop) {
+              const c = resolveCropSource(it.crop, src);
+              if (!c) return;
+              rotated(ctx, it, () => ctx.drawImage(src, c.sx, c.sy, c.sw, c.sh, dx, dy, w, h));
+            } else {
+              rotated(ctx, it, () => ctx.drawImage(src, dx, dy, w, h));
+            }
+          } else if (it.t === "video") {
+            const x = num(it.x), y = num(it.y), w = num(it.w), h = num(it.h);
+            if (!(w > 0 && h > 0)) return;
+            rotated(ctx, it, () => {
+              ctx.fillStyle = "#18181b";
+              ctx.fillRect(x, y, w, h);
+              ctx.strokeStyle = "#52525b";
+              ctx.lineWidth = 1;
+              ctx.setLineDash(it.status === "pending" ? [6, 4] : []);
+              ctx.strokeRect(x, y, w, h);
+              ctx.setLineDash([]);
+              // Centered play-icon badge for canvas fallback / PNG exports / thumbnails
+              const r = Math.min(24, Math.max(8, Math.min(w, h) * 0.16));
+              const cx = x + w / 2, cy = y + h / 2;
+              if (w >= 24 && h >= 24) {
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.fillStyle = "rgba(255,255,255,0.22)";
+                ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(cx - r * 0.32, cy - r * 0.45);
+                ctx.lineTo(cx + r * 0.5, cy);
+                ctx.lineTo(cx - r * 0.32, cy + r * 0.45);
+                ctx.closePath();
+                ctx.fillStyle = "#ffffff";
+                ctx.fill();
+              }
+            });
           }
         });
-      } else if (it.t === "image") {
-        const src = view.image?.(it.fileId);
-        const w = num(it.w), h = num(it.h);
-        if (!src || !(w > 0 && h > 0)) return;   // skip zero/negative dimensions during scale or flip animations
-        const dx = num(it.x), dy = num(it.y);
-        if (it.crop) {
-          const c = resolveCropSource(it.crop, src);
-          if (!c) return;
-          rotated(ctx, it, () => ctx.drawImage(src, c.sx, c.sy, c.sw, c.sh, dx, dy, w, h));
-        } else {
-          rotated(ctx, it, () => ctx.drawImage(src, dx, dy, w, h));
-        }
-      } else if (it.t === "video") {
-        const x = num(it.x), y = num(it.y), w = num(it.w), h = num(it.h);
-        if (!(w > 0 && h > 0)) return;
-        rotated(ctx, it, () => {
-          ctx.fillStyle = "#18181b";
-          ctx.fillRect(x, y, w, h);
-          ctx.strokeStyle = "#52525b";
-          ctx.lineWidth = 1;
-          ctx.setLineDash(it.status === "pending" ? [6, 4] : []);
-          ctx.strokeRect(x, y, w, h);
-          ctx.setLineDash([]);
-          // Centered play-icon badge for canvas fallback / PNG exports / thumbnails
-          const r = Math.min(24, Math.max(8, Math.min(w, h) * 0.16));
-          const cx = x + w / 2, cy = y + h / 2;
-          if (w >= 24 && h >= 24) {
-            ctx.beginPath();
-            ctx.arc(cx, cy, r, 0, Math.PI * 2);
-            ctx.fillStyle = "rgba(255,255,255,0.22)";
-            ctx.fill();
-            ctx.beginPath();
-            ctx.moveTo(cx - r * 0.32, cy - r * 0.45);
-            ctx.lineTo(cx + r * 0.5, cy);
-            ctx.lineTo(cx - r * 0.32, cy + r * 0.45);
-            ctx.closePath();
-            ctx.fillStyle = "#ffffff";
-            ctx.fill();
-          }
-        });
-      }
+      });
     });
   }
   ctx.globalAlpha = 1;

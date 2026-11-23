@@ -6,7 +6,7 @@
 
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
-import { overflowMenu } from "./spaces.js";
+import { overflowMenu, avatarEl, auditTone } from "./spaces.js";
 import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
 import { TEMPLATES } from "../../../packages/core/templates.js";
@@ -650,43 +650,53 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     const unitName = d?.unit?.name || (isPersonal ? "Personal Workspace" : "Your workspace");
     const hasLoaded = mem.members.length || mem.admins.length || mem.directory.length;
     const collaboratorsSec = (alwaysShow) => (alwaysShow || mem.members.length
-      ? h("section", { "aria-label": "Collaborators" },
+      ? h("section.adm-sec", { "aria-label": "Collaborators" },
         h("h2.sec", {}, `Collaborators (${mem.members.length})`),
         mem.members.length
-          ? h("ul.rows", {}, mem.members.map(email => h("li.row", {},
-            h("span.who", {}, email),
-            mark(h("button.btn.home-org-btn", { type: "button", disabled: mem.removing === email,
+          ? h("ul.rows.adm-list", {}, mem.members.map(email => h("li.row.adm-row", {},
+            avatarEl(email),
+            h("span.who.adm-who", {}, h("span.adm-name", {}, email)),
+            mark(h("button.btn.btn-danger-ghost.home-org-btn", { type: "button", disabled: mem.removing === email,
               "aria-label": `Remove ${email}`, onclick: () => removeMember(email) },
             mem.removing === email ? "Removing…" : "Remove"), `member-rm:${email}`))))
-          : h("p.muted", {}, "No collaborators added yet."))
+          : h("div.adm-empty", {}, h("p.muted", {}, "No collaborators added yet.")))
       : null);
     let body;
     if (mem.status === "loading" && !hasLoaded) {
-      body = h("p.muted", {}, "Loading members…");
+      body = h("div.adm-empty", {}, h("p.muted", {}, "Loading members…"));
     } else if (mem.status === "error") {
       body = [empty({ title: "Could not load members.", detail: "Check your connection and try again." }),
         mark(h("button.btn.home-org-btn", { type: "button", onclick: () => loadMembers(d.unit.id) }, "Try again"), "members-retry")];
     } else if (isPersonal) {
       body = [
-        mem.admins.length ? h("section", { "aria-label": "Admins" },
+        mem.admins.length ? h("section.adm-sec", { "aria-label": "Admins" },
           h("h2.sec", {}, "Admins"),
-          h("ul.rows", {}, mem.admins.map(a => h("li.row", {}, h("span.who", {}, a), h("span.badge", {}, "Admin"))))) : null,
+          h("ul.rows.adm-list", {}, mem.admins.map(a => h("li.row.adm-row", {},
+            avatarEl(a),
+            h("span.who.adm-who", {}, h("span.adm-name", {}, a)),
+            h("span.badge.badge-accent", {}, "Admin"))))) : null,
         collaboratorsSec(true),
       ];
     } else {
       const dirEmails = new Set(mem.directory.map(p => (p.email ? String(p.email).toLowerCase() : null)).filter(Boolean));
       const pendingAdmins = mem.admins.filter(a => !dirEmails.has(String(a).toLowerCase()));
       body = [
-        h("section", { "aria-label": "Organization members" },
+        h("section.adm-sec", { "aria-label": "Organization members" },
           h("h2.sec", {}, `Members (${mem.directory.length})`),
           mem.directory.length
-            ? h("ul.rows", {}, mem.directory.map(p => h("li.row", {},
-              h("span.who", {}, p.name, p.email && p.email !== p.name ? [" ", h("span.muted", {}, p.email)] : null),
-              p.isAdmin ? h("span.badge", {}, "Admin") : null)))
-            : (!pendingAdmins.length ? h("p.muted", {}, "No members have signed in yet.") : null)),
-        pendingAdmins.length ? h("section", { "aria-label": "Admins" },
+            ? h("ul.rows.adm-list", {}, mem.directory.map(p => h("li.row.adm-row", {},
+              avatarEl(p.name || p.email),
+              h("span.who.adm-who", {},
+                h("span.adm-name", {}, p.name),
+                p.email && p.email !== p.name ? [" ", h("span.muted.adm-email", {}, p.email)] : null),
+              p.isAdmin ? h("span.badge.badge-accent", {}, "Admin") : null)))
+            : (!pendingAdmins.length ? h("div.adm-empty", {}, h("p.muted", {}, "No members have signed in yet.")) : null)),
+        pendingAdmins.length ? h("section.adm-sec", { "aria-label": "Admins" },
           h("h2.sec", {}, "Admins"),
-          h("ul.rows", {}, pendingAdmins.map(a => h("li.row", {}, h("span.who", {}, a), h("span.badge", {}, "Admin"))))) : null,
+          h("ul.rows.adm-list", {}, pendingAdmins.map(a => h("li.row.adm-row", {},
+            avatarEl(a),
+            h("span.who.adm-who", {}, h("span.adm-name", {}, a)),
+            h("span.badge.badge-accent", {}, "Admin"))))) : null,
         collaboratorsSec(false),
       ];
     }
@@ -694,9 +704,10 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       ? `${unitName} — add collaborators by email so they can open shared Spaces and boards.`
       : `${unitName} — organization members who have signed in with your workspace domain.`;
     return replace(main,
-      mark(h("h1", { tabindex: "-1" }, "Workspace members"), "heading"),
+      h("div.home-panel-head", {}, mark(h("h1", { tabindex: "-1" }, "Workspace members"), "heading")),
       h("p.home-panel-sub", {}, sub),
-      isPersonal ? memAddForm : null, memErr, body);
+      isPersonal ? h("div.home-panel-card", {}, memAddForm, memErr) : memErr,
+      body);
   }
 
   function renderAuditPanel() {
@@ -704,21 +715,27 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     const refresh = mark(h("button.btn.home-org-btn", { type: "button", disabled: audit.status === "loading",
       onclick: () => loadAudit(d.unit.id) }, "Refresh"), "audit-refresh");
     const body = audit.status === "loading" && !audit.events.length
-      ? h("p.muted", {}, "Loading audit log…")
+      ? h("div.adm-empty", {}, h("p.muted", {}, "Loading audit log…"))
       : audit.status === "error"
         ? [empty({ title: "Could not load audit log.", detail: "Check your connection and try again." }),
           mark(h("button.btn.home-org-btn", { type: "button", onclick: () => loadAudit(d.unit.id) }, "Try again"), "audit-retry")]
         : audit.events.length
           ? [
-            h("ul.rows.home-audit-list", { "aria-label": "Audit log events" }, audit.events.map(ev => h("li.row", {},
-              h("span.badge", {}, String(ev.action ?? "")),
-              h("span.who", {}, [ev.actor, ev.board ? `board ${ev.board}` : (ev.target ? `target ${ev.target}` : null)].filter(Boolean).join(" · ")),
-              h("span.muted", {}, whenText(ev.at, clock.now()))))),
-            audit.nextBefore ? mark(h("button.btn.home-org-btn", { type: "button", disabled: audit.loadingMore,
+            h("ul.rows.adm-list.home-audit-list", { "aria-label": "Audit log events" }, audit.events.map(ev => {
+              const target = ev.board ? `board ${ev.board}` : (ev.target ? `target ${ev.target}` : null);
+              return h("li.row.adm-row.audit-row", {},
+                h("span", { class: `badge badge-action badge-${auditTone(ev.action)}` }, String(ev.action ?? "")),
+                h("span.who.audit-who", {},
+                  ev.actor ? h("span.audit-actor", {}, ev.actor) : null,
+                  ev.actor && target ? h("span.audit-sep", {}, " · ") : null,
+                  target ? h("span.audit-target", {}, target) : null),
+                h("span.muted.audit-when", {}, whenText(ev.at, clock.now())));
+            })),
+            audit.nextBefore ? h("div.home-audit-more", {}, mark(h("button.btn.home-org-btn", { type: "button", disabled: audit.loadingMore,
               onclick: () => loadAudit(d.unit.id, { before: audit.nextBefore, append: true }) },
-            audit.loadingMore ? "Loading…" : "Load more"), "audit-more") : null,
+            audit.loadingMore ? "Loading…" : "Load more"), "audit-more")) : null,
           ]
-          : h("p.muted", {}, "No audit events yet.");
+          : h("div.adm-empty", {}, h("p.muted", {}, "No audit events yet."));
     return replace(main,
       h("div.home-panel-head", {}, mark(h("h1", { tabindex: "-1" }, "Audit log"), "heading"), refresh),
       h("p.home-panel-sub", {}, `Recent activity in ${unitName}.`),

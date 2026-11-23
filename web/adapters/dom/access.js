@@ -9,7 +9,7 @@
 
 import { h, replace } from "./dom.js";
 import { keeper, announce, announced } from "./focus.js";
-import { shell, showNotice, gate, message } from "./spaces.js";
+import { shell, showNotice, gate, message, avatarEl, roleTone } from "./spaces.js";
 import { createPickerModel, sizeText, viaText, generalLine, SCOPE_NOUN, HIDDEN_ABOVE } from "../../core/access.js";
 import { ownersText } from "../../core/explain.js";
 import { askView, sourceRow } from "./explain.js";
@@ -47,7 +47,7 @@ export function pickerView({ api, teams, rolesFor = null, onAdd, label, setTimer
     oninput: e => { if (timer) clearTimeout(timer); timer = setTimer(() => model.search(e.target.value), delayMs); } });
   const list = h("ul.matches", { "aria-label": "Matches" });
   const roleSel = h("select.field", { "aria-label": "Role", onchange: e => { role = e.target.value; } });
-  const add = act({ "aria-label": "Add" }, "Add", async () => {
+  const add = act({ class: "primary", "aria-label": "Add" }, "Add", async () => {
     if (!S.chosen || (rolesFor && !role)) return;
     busy = true; paint();
     const ok = await onAdd(S.chosen, role);
@@ -98,15 +98,16 @@ export function mountTeamsPage({ root, model, hrefs, signIn = null }) {
     const f = after; after = null; f?.();
   }
   function draw() {
-    createBtn = S.can.create ? keys.mark(keys.keep("create-team", () => act({}, "Create team", async () => { const t = await model.create(name.value); if (t) { name.value = ""; after = () => keys.focusKey(`who:team:${t.id}`); model.emit(); } })), "create-team") : null;
+    createBtn = S.can.create ? keys.mark(keys.keep("create-team", () => act({ class: "primary" }, "Create team", async () => { const t = await model.create(name.value); if (t) { name.value = ""; after = () => keys.focusKey(`who:team:${t.id}`); model.emit(); } })), "create-team") : null;
     if (createBtn) setOff(createBtn, S.busy);
     const rows = [...S.teams].sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
     moreBtn = S.next ? keys.mark(h("button.btn", { type: "button", "aria-disabled": S.busy ? "true" : "false", onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") !== "true") model.loadMore(); } }, "Show more teams"), "show-more") : null;
     replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"),
-      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Teams"), "heading"), h("span.badge", {}, "Organization")),
+      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Teams"), "heading"), h("span.badge.badge-accent", {}, "Organization")),
       h("form.pick-row", { role: "search", onsubmit: e => { e.preventDefault?.(); model.load(q.value); } }, q, h("button.btn", { type: "submit" }, "Search")),
       createBtn ? h("div.pick-row", {}, name, createBtn) : null,
       rows.length ? h("ul.rows", { "aria-label": "Teams" }, rows.map(t => h("li.row", { "aria-label": t.name },
+        avatarEl(t.name, { team: true }),
         keys.mark(h("a.who", { href: hrefs.team(t.id) }, t.name), `who:team:${t.id}`), h("span.p", {}, sizeText(t.size)))))
         : message(S.q ? `No teams match "${S.q}".` : "No teams yet.", S.can.create ? "Create one to give a group of people the same access." : "Admins create teams."),
       moreBtn);
@@ -150,16 +151,18 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
       can ? h("form.pick-row", { onsubmit: e => { e.preventDefault?.(); model.rename(nameIn.value); } }, nameIn, h("button.btn", { type: "submit" }, "Rename")) : null,
       h("h2", {}, "Members"),
       rows.length ? h("ul.rows", { "aria-label": "Members" }, rows.map(r => h("li.row", { "aria-label": r.subject.name },
+        avatarEl(r.subject.name),
         who(r.subject, keys, r.email ?? ""),
-        can ? keys.mark(ctl(act({ "aria-label": `Remove ${r.subject.name}` }, "Remove", () => model.removeMember(r.subject.id), () => S.busy)), `remove:user:${r.subject.id}`) : null)))
+        can ? keys.mark(ctl(act({ class: "btn-danger-ghost", "aria-label": `Remove ${r.subject.name}` }, "Remove", () => model.removeMember(r.subject.id), () => S.busy)), `remove:user:${r.subject.id}`) : null)))
         : message("No members yet.", can ? "Add people below." : ""),
       p.next ? keys.mark(act({}, "Show more members", () => model.loadMore()), "show-more") : null,
-      can ? h("section", { "aria-label": "Add a member" }, h("h2", {}, "Add a member"), view.el) : null,
+      can ? h("section.sp-card", { "aria-label": "Add a member" }, h("h2", {}, "Add a member"), view.el) : null,
       can ? h("section.danger", { "aria-label": "Delete team" }, confirming
         ? [h("p", {}, `Delete ${p.team.name}? Everyone in it loses what it gave them.`),
-          keys.mark(act({}, "Delete team", async () => { if (await model.remove()) confirming = false; render(); }), "confirm-delete"),
-          keys.mark(act({}, "Cancel", () => { confirming = false; after = () => keys.focusKey("delete-team"); render(); }), "cancel-delete")]
-        : keys.mark(act({}, "Delete team…", () => { confirming = true; after = () => keys.focusKey("confirm-delete"); render(); }), "delete-team")) : null);
+          h("div.pick-row", {},
+            keys.mark(act({ class: "btn-danger" }, "Delete team", async () => { if (await model.remove()) confirming = false; render(); }), "confirm-delete"),
+            keys.mark(act({}, "Cancel", () => { confirming = false; after = () => keys.focusKey("delete-team"); render(); }), "cancel-delete"))]
+        : keys.mark(act({ class: "btn-danger-ghost" }, "Delete team…", () => { confirming = true; after = () => keys.focusKey("confirm-delete"); render(); }), "delete-team")) : null);
   }
   model.subscribe(render);
   render();
@@ -188,13 +191,15 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
     const s = r.subject, k = subjectKey(s);
     const options = model.rolesFor(s.type);
     const opts = options.some(o => o.id === r.role) ? options : [{ id: r.role, name: r.roleName || r.role }, ...options];
+    const roleLabel = r.roleName || r.role;
     const select = r.can?.change && options.length
       ? keys.mark(ctl(h("select.field", { "aria-label": `Role of ${s.name}`, onchange: e => { if (S.busy) { e.target.value = r.role; return; } model.set(s, e.target.value).then(ok => { if (!ok) render(); }); } },
         opts.map(o => h("option", { value: o.id, selected: o.id === r.role }, o.name)))), `role:${k}`)
-      : h("span.p", {}, r.roleName || r.role);
-    return h("li.row", { "aria-label": `${s.name}, ${r.roleName || r.role}, ${viaText(r)}` },
+      : h("span", { class: `p role-pill role-pill-${roleTone(roleLabel)}` }, roleLabel);
+    return h("li.row", { "aria-label": `${s.name}, ${roleLabel}, ${viaText(r)}` },
+      avatarEl(s.name, { team: s.type === "team" }),
       who(s, keys, s.type === "team" ? `team of ${s.size ?? 0}` : s.email ?? ""), select, h("span.p", {}, viaText(r)),
-      r.can?.remove ? keys.mark(ctl(act({ "aria-label": `Remove ${s.name}` }, "Remove", () => model.remove(s), () => S.busy)), `remove:${k}`) : null);
+      r.can?.remove ? keys.mark(ctl(act({ class: "btn-danger-ghost", "aria-label": `Remove ${s.name}` }, "Remove", () => model.remove(s), () => S.busy)), `remove:${k}`) : null);
   };
   /** One titled list. `label` names the list for screen readers; the heading is the visible name of the source. */
   const group = (title, label, items, note = null) => (items.length ? h("section", { "aria-label": title }, h("h3", {}, title), note ? h("p.muted", {}, note) : null, h("ul.rows", { "aria-label": label }, items)) : null);
@@ -218,17 +223,21 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
         : `You have no board access of your own to this ${noun}.`;
     const mineSection = w ? h("section.sp-card", { "aria-label": "Your access" }, h("h2", {}, "Your access"),
       h("p", {}, mineCopy),
-      w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", { "aria-label": x.text + (x.strongest ? ", grants the most" : "") }, h("span.who", {}, x.text), x.strongest ? h("span.badge", {}, "Grants the most") : null); })) : null,
+      w.mine.sources.length ? h("ul.rows", { "aria-label": "Where your access comes from" }, w.mine.sources.map(s => { const x = sourceRow(s, here); return h("li.row", { "aria-label": x.text + (x.strongest ? ", grants the most" : "") }, h("span.who", {}, x.text), x.strongest ? h("span.badge.badge-ok", {}, "Grants the most") : null); })) : null,
       w.ask.can || w.ask.pending ? h("p", {}, ownersText(w.owners, w.guest)) : null, ask?.el) : null;
     const requests = p.requests?.length ? h("section.sp-card", { "aria-label": "Access requests" }, h("h2", {}, "Access requests"),
       h("p.muted", {}, "These people asked for more access. Add them below to grant it, or dismiss the request."),
       h("ul.rows", { "aria-label": "Access requests" }, p.requests.map(r => h("li.row", { "aria-label": `${r.user.name} asked for ${r.roleName}` },
+        avatarEl(r.user.name),
         who({ type: "user", id: r.user.id, name: r.user.name }, keys, `asked for ${r.roleName}`),
-        keys.mark(ctl(act({ "aria-label": `Dismiss the request of ${r.user.name}` }, "Dismiss", () => model.dismissRequest(r.user.id), () => S.busy)), `remove:request:${r.user.id}`))))) : null;
+        keys.mark(ctl(act({ class: "btn-danger-ghost", "aria-label": `Dismiss the request of ${r.user.name}` }, "Dismiss", () => model.dismissRequest(r.user.id), () => S.busy)), `remove:request:${r.user.id}`))))) : null;
     const rows = sortRows(p.rows), direct = rows.filter(r => r.via !== "team"), teams = rows.filter(r => r.via === "team");
     const inheritedBy = new Map();
     for (const r of p.inherited) { const k = `${r.scope?.type}:${r.scope?.id}`; if (!inheritedBy.has(k)) inheritedBy.set(k, []); inheritedBy.get(k).push(r); }
-    const inheritedRow = r => h("li.row", { "aria-label": `${r.subject.name}, ${r.roleName}, ${viaText(r)}` }, h("span.who", {}, r.subject.name), h("span.p", {}, r.roleName),
+    const inheritedRow = r => h("li.row", { "aria-label": `${r.subject.name}, ${r.roleName}, ${viaText(r)}` },
+      avatarEl(r.subject.name, { team: r.subject.type === "team" }),
+      h("span.who", {}, r.subject.name),
+      h("span", { class: `p role-pill role-pill-${roleTone(r.roleName)}` }, r.roleName),
       r.scope && r.scope.type !== "unit" ? h("a", { href: hrefs.access(r.scope.type, r.scope.id) }, viaText(r)) : h("span.p", {}, viaText(r)));
     const general = [...p.general.map(g => h("li.row", { "aria-label": generalLine(g) }, h("span.who", {}, generalLine(g))))];
     const orgAdmins = p.organization?.admins ?? [];
@@ -256,9 +265,9 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
         return group(`Inherited from ${from}`, `Access inherited from ${from}`, list.map(inheritedRow)); }),
       p.hiddenAbove ? h("p.muted", { "data-fk": "hidden-above" }, HIDDEN_ABOVE) : null,
       group("Everyone in the organization", "General access", general),
-      group("Organization admins", "Organization admins", orgAdmins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name))), p.organization?.more ? "They manage access in every Space. The list shows the first few." : "They manage access in every Space; they see boards only where they are added."),
+      group("Organization admins", "Organization admins", orgAdmins.map(a => h("li.row", { "aria-label": a.name }, avatarEl(a.name), h("span.who", {}, a.name))), p.organization?.more ? "They manage access in every Space. The list shows the first few." : "They manage access in every Space; they see boards only where they are added."),
       p.next ? keys.mark(act({}, "Show more", () => model.loadMore()), "show-more") : null,
-      p.admins?.length ? [h("h2", {}, "Admins"), h("ul.rows", { "aria-label": "Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null))))] : null,
+      p.admins?.length ? [h("h2", {}, "Admins"), h("ul.rows", { "aria-label": "Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, avatarEl(a.name), h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null))))] : null,
       addable ? h("section.sp-card", { "aria-label": "Add people or teams" }, h("h2", {}, "Add people or teams"), view.el) : noAddCard);
   }
   model.subscribe(render);

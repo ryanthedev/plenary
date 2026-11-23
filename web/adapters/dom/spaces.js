@@ -51,12 +51,68 @@ export function overflowMenu({ label, items }) {
 /** Focus an input and select its text once it is in the page (so typing replaces the old title). */
 const focusSelect = el => { globalThis.queueMicrotask?.(() => { el.focus?.(); el.select?.(); }); return el; };
 
+/** Build a CSP-safe inline SVG node, falling back to an empty decorative span on minimal stub DOMs. */
+function svgEl(tag, attrs = {}, kids = []) {
+  if (typeof document === "undefined" || typeof document.createElementNS !== "function") {
+    return h("span", { class: attrs.class ?? "", "aria-hidden": "true" });
+  }
+  const ns = "http://www.w3.org/2000/svg";
+  const el = document.createElementNS(ns, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, String(v));
+  for (const k of kids) if (k) el.append(k);
+  return el;
+}
+
+/** Shared Plenary brand mark used in Home and standalone admin/Space headers. */
+export function brandMark() {
+  return h("span.home-brand-mark", { "aria-hidden": "true" },
+    svgEl("svg", { viewBox: "0 0 24 24", class: "home-brand-ico", "aria-hidden": "true" }, [
+      svgEl("path", { d: "M4 6a2 2 0 0 1 2-2h5v7H4V6z" }),
+      svgEl("path", { d: "M13 4h5a2 2 0 0 1 2 2v5h-7V4z" }),
+      svgEl("path", { d: "M4 13h7v7H6a2 2 0 0 1-2-2v-5z" }),
+      svgEl("path", { d: "M13 13h7v5a2 2 0 0 1-2 2h-5v-7z" }),
+    ]));
+}
+
+/** Deterministic initials + soft-tint circular (or team rounded-square) avatar for admin rows. */
+export function avatarEl(label, { team = false } = {}) {
+  const raw = String(label ?? "").trim();
+  const base = raw.includes("@") && !raw.includes(" ") ? raw.split("@")[0] : raw;
+  const parts = base.split(/[\s._-]+/).filter(Boolean);
+  const letters = parts.length >= 2
+    ? `${parts[0][0]}${parts[parts.length - 1][0]}`
+    : (parts[0] ? parts[0].slice(0, 2) : "?");
+  let hash = 0;
+  const key = raw.toLowerCase();
+  for (let i = 0; i < key.length; i++) hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0;
+  const tone = Math.abs(hash) % 6;
+  return h("span", { class: `adm-avatar adm-avatar-t${tone}${team ? " adm-avatar-team" : ""}`, "aria-hidden": "true" }, letters.toUpperCase());
+}
+
+/** Semantic pill tone for a role id or display name. */
+export function roleTone(role) {
+  const k = String(role ?? "").toLowerCase();
+  if (k.includes("owner") || k.includes("admin")) return "accent";
+  if (k.includes("editor") || k.includes("edit")) return "ok";
+  if (k.includes("annotat") || k.includes("comment")) return "warn";
+  return "neutral";
+}
+
+/** Semantic pill tone for an audit action string. */
+export function auditTone(action) {
+  const k = String(action ?? "").toLowerCase();
+  if (/(delete|remove|revoke|trash|offboard|ban|drop)/.test(k)) return "danger";
+  if (/(create|add|restore|invite|join|enable)/.test(k)) return "ok";
+  if (/(update|grant|role|rename|move|edit|set|transfer|reassign)/.test(k)) return "accent";
+  return "neutral";
+}
+
 /** The page chrome shared by both pages. */
 export function shell(root, hrefs) {
   const status = h("div.home-status", { role: "status", "aria-live": "polite", hidden: true });
   const main = h("main.home-main.sp-main", { id: "home-main", tabindex: "-1" });
   root.replaceChildren(h("div.home.sp-page", {},
-    h("header.home-top", {}, h("a.logo", { href: hrefs.home, "aria-label": "Plenary home" }, "Plenary"), h("span.spacer")), status, main));
+    h("header.home-top", {}, h("a.logo", { href: hrefs.home, "aria-label": "Plenary home" }, brandMark(), "Plenary"), h("span.spacer")), status, main));
   return { status, main };
 }
 export function showNotice(status, model) {

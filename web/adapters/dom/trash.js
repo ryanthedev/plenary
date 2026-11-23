@@ -24,12 +24,12 @@ export function mountTrashPage({ root, model, hrefs, signIn = null }) {
   const row = item => {
     const board = item.type === "board", title = board ? boardName(item.title, { start: true }) : item.name, label = board ? boardName(item.title) : item.name;
     const where = board ? fromText(item.from) : [groupText(item.group), item.boards ? `${item.boards} board${item.boards === 1 ? "" : "s"} went with it` : "no boards in it"].filter(Boolean).join(" · ");
-    const btn = h("button.btn", { type: "button", "aria-label": `Restore ${board ? "" : "Space "}${label}`, "aria-disabled": S.busy === item.id ? "true" : null, "data-fk": `restore:${item.id}`,
+    const btn = h("button.btn.trash-restore", { type: "button", "aria-label": `Restore ${board ? "" : "Space "}${label}`, "aria-disabled": S.busy === item.id ? "true" : null, "data-fk": `restore:${item.id}`,
       onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") === "true") { e.preventDefault?.(); return; } model.restore(item); } }, S.busy === item.id ? "Restoring…" : "Restore");
     buttons.set(item.id, btn);
     return h("li.card.trash-row", {},
-      h("div.card-open", {}, h("span.t", {}, board ? title : [title, " ", h("span.badge", {}, "Space")]), h("span.p", {}, board ? `Was in ${where}` : where || "A Space"),
-        h("span.p", {}, `${item.by ? `Deleted by ${item.by.name}` : "Deleted"} · ${daysText(item.daysLeft)}`)),
+      h("div.card-open", {}, h("span.t", {}, board ? title : [title, " ", h("span.badge.badge-accent", {}, "Space")]), h("span.p", {}, board ? `Was in ${where}` : where || "A Space"),
+        h("span.p.trash-meta", {}, `${item.by ? `Deleted by ${item.by.name}` : "Deleted"} · ${daysText(item.daysLeft)}`)),
       h("span.card-menu", {}, btn));
   };
   function render() {

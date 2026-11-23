@@ -43,13 +43,15 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
     if (to) keys.focusKey(to);
   }
 
+  const kindTone = k => (k === "custom" ? "badge-accent" : k === "member" ? "badge-warn" : "");
+
   const listItem = r => {
     const used = usedText(r), range = rangeText(r), selected = r.id === S.selected && !S.draft?.isNew;
     return h("li.row.role-row", { "aria-label": [r.name, KIND[r.kind], r.summary, range, used].filter(Boolean).join(", "), ...(selected ? { "data-selected": "true" } : {}) },
       h("div.role-row-main", {},
         h("div.role-row-head", {},
           keys.mark(h("button.btn.ghost.who.role-pick", { type: "button", "aria-current": selected ? "true" : "false", onclick: () => { deleting = false; after = () => "heading-detail"; model.select(r.id); } }, r.name), `rolepick:${r.id}`),
-          h("span.badge.role-kind", {}, KIND[r.kind])),
+          h("span", { class: `badge role-kind${kindTone(r.kind) ? ` ${kindTone(r.kind)}` : ""}` }, KIND[r.kind])),
         r.summary ? h("p.role-summary", {}, r.summary) : null),
       (range || used) ? h("div.role-row-meta", {},
         range ? h("span.badge.role-scope", {}, range) : null,
@@ -101,13 +103,14 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
       onchange: e => { if (!editable || member || S.busy) { e.target.value = shown.ladder ?? ""; return; } model.setLadder(e.target.value); } },
       member || !editable ? h("option", { value: shown.ladder ?? "", selected: true }, shown.ladder ? (LADDER_LABEL[shown.ladder] ?? shown.ladder) : "None") : null,
       editable && !member ? [...new Set([...ladders, ...(shown.ladder && !ladders.includes(shown.ladder) ? [shown.ladder] : [])])].map(l => h("option", { value: l, selected: l === shown.ladder }, LADDER_LABEL[l] ?? l)) : null)), "ladder");
-    saveBtn = editable ? keys.mark(act({}, d.isNew ? "Create role" : "Save role", () => { if (dirtyNow() || d.isNew) model.save(); }, () => S.busy), "save") : null;
+    saveBtn = editable ? keys.mark(act({ class: "primary" }, d.isNew ? "Create role" : "Save role", () => { if (dirtyNow() || d.isNew) model.save(); }, () => S.busy), "save") : null;
     discardBtn = editable ? keys.mark(act({}, d.isNew ? "Cancel copy" : "Discard changes", () => { after = () => "heading-detail"; model.discard(); }, () => S.busy), "discard") : null;
     sync();
     if (saveBtn && d.isNew) setOff(saveBtn, S.busy);
     const used = r ? usedText(r) : null;
     return h("section.role-detail", { "aria-label": "Role details" },
-      h("div.sp-head", {}, keys.mark(h("h2", { id: "role-title", tabindex: "-1" }, d?.isNew ? "New role" : r.name), "heading-detail"), h("span.badge", {}, d?.isNew ? "Custom, unsaved" : KIND[r.kind]),
+      h("div.sp-head", {}, keys.mark(h("h2", { id: "role-title", tabindex: "-1" }, d?.isNew ? "New role" : r.name), "heading-detail"),
+        h("span", { class: `badge${d?.isNew ? " badge-accent" : (kindTone(r.kind) ? ` ${kindTone(r.kind)}` : "")}` }, d?.isNew ? "Custom, unsaved" : KIND[r.kind]),
         d?.isNew ? h("span.badge", {}, `Copy of ${S.page.roles.find(x => x.id === d.base)?.name ?? "a role"}`) : null,
         !d?.isNew && r?.kind === "custom" && r.base ? h("span.badge", {}, `Like ${S.page.roles.find(x => x.id === r.base)?.name ?? "another role"}`) : null),
       used ? h("p", {}, used) : null,
@@ -115,13 +118,16 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
       h("div.pick-row", {}, h("label.l", {}, "Name", nameIn), h("label.l", {}, "Board access", ladderSel)),
       matrixView(model.rows(), editable),
       S.confirm ? h("div.banner", { role: "alert" }, h("p", {}, impactText(r ?? { kind: "custom" }, S.confirm.impact), " Saving changes what they can do within about a minute."),
-        keys.mark(act({}, "Save anyway", () => { after = () => "save"; model.confirmSave(); }, () => S.busy), "confirm-save"), keys.mark(act({}, "Cancel", () => { after = () => "save"; model.cancelConfirm(); }, () => S.busy), "confirm-cancel")) : null,
-      h("div.pick-row", {}, saveBtn, discardBtn, r ? keys.mark(act({}, "Duplicate", () => { after = () => "heading-detail"; model.duplicate(r.id); }, () => S.busy), "duplicate") : null),
+        h("div.banner-acts", {},
+          keys.mark(act({ class: "primary" }, "Save anyway", () => { after = () => "save"; model.confirmSave(); }, () => S.busy), "confirm-save"),
+          keys.mark(act({}, "Cancel", () => { after = () => "save"; model.cancelConfirm(); }, () => S.busy), "confirm-cancel"))) : null,
+      h("div.pick-row.role-actions", {}, saveBtn, discardBtn, r ? keys.mark(act({}, "Duplicate", () => { after = () => "heading-detail"; model.duplicate(r.id); }, () => S.busy), "duplicate") : null),
       r?.kind === "custom" && r.editable && !d?.isNew ? h("section.danger", { "aria-label": "Delete role" }, deleting
         ? [h("p", {}, `Delete ${r.name}? A role that is in use cannot be deleted.`),
-          keys.mark(act({}, "Delete role", () => { deleting = false; after = () => model.roleOf(r.id) ? "delete-role" : "heading"; model.remove(); }, () => S.busy), "confirm-delete"),
-          keys.mark(act({}, "Cancel", () => { deleting = false; after = () => "delete-role"; render(); }, () => S.busy), "cancel-delete")]
-        : keys.mark(act({}, "Delete role…", () => { deleting = true; after = () => "confirm-delete"; render(); }), "delete-role")) : null);
+          h("div.pick-row", {},
+            keys.mark(act({ class: "btn-danger" }, "Delete role", () => { deleting = false; after = () => model.roleOf(r.id) ? "delete-role" : "heading"; model.remove(); }, () => S.busy), "confirm-delete"),
+            keys.mark(act({}, "Cancel", () => { deleting = false; after = () => "delete-role"; render(); }, () => S.busy), "cancel-delete"))]
+        : keys.mark(act({ class: "btn-danger-ghost" }, "Delete role…", () => { deleting = true; after = () => "confirm-delete"; render(); }), "delete-role")) : null);
   }
 
   function draw() {

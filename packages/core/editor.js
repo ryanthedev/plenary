@@ -22,6 +22,7 @@ import { itemFromElements } from "./library.js";
 import { parseExcalidraw, toExcalidrawClipboard, remapExcalidrawIds } from "./excalidraw.js";
 import { parseLinkCardUrl, buildLinkCard, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "./link-card.js";
 import { parseEmbedUrl, buildEmbedElement, parseEmbedFromElement } from "./embed.js";
+import { alignElements, distributeElements, tidyElements, computeSmartGuides } from "./layout.js";
 
 export const TOOLS = [
   { id: "select", keys: ["v", "1"], icon: "↖", name: "Select" },
@@ -1186,23 +1187,27 @@ export class Editor {
     const g = this.grid; return { x: Math.round(w.x / g) * g, y: Math.round(w.y / g) * g };
   }
 
-  // Snap a moving box to the grid, or to other elements' edges and centers (with guides).
+  // Snap a moving box to the grid, or to other elements' edges and centers (with smart guides).
   snapMove(box, dx, dy, skip) {
     this.guides = [];
     if (!box) return { dx, dy };
     if (this.grid) { const g = this.grid; return { dx: Math.round((box.x + dx) / g) * g - box.x, dy: Math.round((box.y + dy) / g) * g - box.y }; }
     if (!this.snapOn) return { dx, dy };
     const tol = (SNAP * this.slopScale()) / this.view.scale;
-    const xs = [box.x, box.x + box.w / 2, box.x + box.w].map(v => v + dx), ys = [box.y, box.y + box.h / 2, box.y + box.h].map(v => v + dy);
-    let bx = null, by = null;
+    const movingBox = { x: box.x + dx, y: box.y + dy, w: box.w, h: box.h };
+    const staticBoxes = [];
     for (const el of this.doc.visible()) {
       if (skip.has(el.id) || isLabel(el)) continue;
-      const b = bounds(el, this.doc), tx = [b.x, b.x + b.w / 2, b.x + b.w], ty = [b.y, b.y + b.h / 2, b.y + b.h];
-      for (const a of xs) for (const t of tx) { const d = t - a; if (Math.abs(d) <= tol && (!bx || Math.abs(d) < Math.abs(bx.d))) bx = { d, at: t, b }; }
-      for (const a of ys) for (const t of ty) { const d = t - a; if (Math.abs(d) <= tol && (!by || Math.abs(d) < Math.abs(by.d))) by = { d, at: t, b }; }
+      staticBoxes.push(bounds(el, this.doc));
     }
-    if (bx) { dx += bx.d; this.guides.push({ x: bx.at, y0: Math.min(box.y + dy, bx.b.y), y1: Math.max(box.y + dy + box.h, bx.b.y + bx.b.h) }); }
-    if (by) { dy += by.d; this.guides.push({ y: by.at, x0: Math.min(box.x + dx, by.b.x), x1: Math.max(box.x + dx + box.w, by.b.x + by.b.w) }); }
+    const res = computeSmartGuides(movingBox, staticBoxes, tol);
+    dx += res.dx;
+    dy += res.dy;
+    this.guides = res.guides.map(g => (
+      g.axis === "x"
+        ? { ...g, x: g.at, y0: g.from, y1: g.to }
+        : { ...g, y: g.at, x0: g.from, x1: g.to }
+    ));
     return { dx, dy };
   }
 
@@ -1664,35 +1669,54 @@ export class Editor {
     });
   }
 
-  align(how) {
-    const els = this.selected().filter(e => !isLabel(e)); if (els.length < 2) return;
-    const B = unionBox(els.map(e => bounds(e, this.doc)));
-    this.transact(tx => {
-      for (const e of els) {
-        const b = bounds(e, this.doc); let dx = 0, dy = 0;
-        if (how === "left") dx = B.x - b.x; if (how === "right") dx = B.x + B.w - (b.x + b.w); if (how === "hcenter") dx = B.x + B.w / 2 - (b.x + b.w / 2);
-        if (how === "top") dy = B.y - b.y; if (how === "bottom") dy = B.y + B.h - (b.y + b.h); if (how === "vcenter") dy = B.y + B.h / 2 - (b.y + b.h / 2);
-        this.shift(tx, e, dx, dy);
+  layoutCandidates() {
+    return this.selected().map(e => (this.doc.editable(e) ? e : { ...e, locked: true }));
+  }
+
+  applyLayoutShifts(shifts) {
+    if (!shifts.length) return false;
+    const ok = this.transact(tx => {
+      for (const { id, dx, dy } of shifts) {
+        const el = this.doc.get(id);
+        if (!el || !this.doc.editable(el)) continue;
+        this.shift(tx, el, dx, dy);
       }
+      return true;
     });
+    return !!ok;
+  }
+
+  alignSelection(mode) {
+    if (this.readOnly) return false;
+    const shifts = alignElements(this.layoutCandidates(), mode, { doc: this.doc });
+    return this.applyLayoutShifts(shifts);
+  }
+
+  distributeSelection(axis) {
+    if (this.readOnly) return false;
+    const shifts = distributeElements(this.layoutCandidates(), axis, { doc: this.doc });
+    return this.applyLayoutShifts(shifts);
+  }
+
+  tidySelection(opts = {}) {
+    if (this.readOnly) return false;
+    const shifts = tidyElements(this.layoutCandidates(), { ...opts, doc: this.doc });
+    return this.applyLayoutShifts(shifts);
+  }
+
+  align(how) {
+    return this.alignSelection(how);
   }
 
   distribute(axis) {
-    const els = this.selected().filter(e => !isLabel(e)); if (els.length < 3) return;
-    const k = axis === "h" ? ["x", "w"] : ["y", "h"];
-    const items = els.map(e => ({ e, b: bounds(e, this.doc) })).sort((a, b) => a.b[k[0]] - b.b[k[0]]);
-    const span = items[items.length - 1].b[k[0]] + items[items.length - 1].b[k[1]] - items[0].b[k[0]];
-    const gap = (span - items.reduce((s, i) => s + i.b[k[1]], 0)) / (items.length - 1);
-    this.transact(tx => {
-      let at = items[0].b[k[0]];
-      for (const { e, b } of items) { const d = at - b[k[0]]; this.shift(tx, e, axis === "h" ? d : 0, axis === "v" ? d : 0); at += b[k[1]] + gap; }
-    });
+    return this.distributeSelection(axis);
   }
 
   shift(tx, e, dx, dy) {
     if (!dx && !dy) return;
     const c = tx.get(e.id); c.x += dx; c.y += dy;
-    const l = isShape(e) && this.doc.labelOf(e); if (l) { const cl = tx.get(l.id); cl.x += dx; cl.y += dy; }
+    const l = (isShape(e) || isLinear(e)) && this.doc.labelOf(e);
+    if (l && this.doc.editable(l)) { const cl = tx.get(l.id); cl.x += dx; cl.y += dy; }
   }
 
   nudge(dx, dy) { const els = this.selected().filter(e => this.doc.editable(e)); if (els.length) this.transact(tx => els.forEach(e => this.shift(tx, e, dx, dy))); }

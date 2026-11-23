@@ -14,6 +14,7 @@ import { BLEND_MODES, CLIP_SHAPES, effectsOf, normalizeEffects } from "../../../
 import { buildIconLibraryItems, getIconPack } from "../../../packages/core/icon-packs.js";
 import { icon } from "./icons.js";
 import { createColorPicker } from "./color-picker.js";
+import { isPhoneTouchViewport } from "./settings-dialog.js";
 
 export const HEADS = [["none", null, null], ["→", null, "arrow"], ["↔", "arrow", "arrow"], ["▶", null, "triangle"], ["▷", null, "triangle_outline"], ["●", null, "dot"], ["◆", null, "diamond"], ["⊣", null, "bar"]];
 export const OPACITIES = [100, 75, 50, 25];
@@ -114,14 +115,17 @@ export function renderPanel(root, ctx) {
   const ed = S.eds[stream];
   const m = propsModel(ed);
   const dis = !may;
+  const touchSheet = Boolean(ctx.inSheet || isPhoneTouchViewport(ctx.win ?? globalThis));
+  const touchBtnStyle = touchSheet ? { minHeight: "44px", minWidth: "44px", maxWidth: "100%" } : undefined;
+  const touchSelectStyle = touchSheet ? { minHeight: "44px", fontSize: "16px", maxWidth: "100%", minWidth: "0", flex: "1 1 140px" } : undefined;
   // `fk` is the control's focus key (web/adapters/dom/focus.js): made of what it changes, never of what it says, so a redraw restores focus to the SAME control.
   const chip = (txt, on, onclick, title, view = false, fk = null) => {
     const iconOnly = typeof txt !== "string" && !Array.isArray(txt);
-    return h("button.c" + (on ? ".on" : ""), { title, ...(iconOnly && title ? { "aria-label": title } : {}), disabled: !view && dis, "data-fk": fk, onclick: () => onclick?.() }, txt);
+    return h("button.c" + (on ? ".on" : ""), { type: "button", title, ...(iconOnly && title ? { "aria-label": title } : {}), disabled: !view && dis, "data-fk": fk, onclick: () => onclick?.() }, txt);
   };
   const act = fn => S.act(stream, fn);
   const style = patch => act(e => e.setStyle(patch));
-  const row = (lab, key, ...opts) => h("div.row", {}, h("span.lab", {}, lab, key ? h("i", {}, key) : null), h("span.opts", {}, ...opts));
+  const row = (lab, key, ...opts) => h("div.row", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {}, h("span.lab", {}, lab, key ? h("i", {}, key) : null), h("span.opts", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {}, ...opts));
 
   function properties() {
     const out = [];
@@ -177,21 +181,23 @@ export function renderPanel(root, ctx) {
             return true;
           });
         });
-        const blendSel = h("select.anim-sel", {
+        const blendSel = h("select.field.anim-sel", {
           "aria-label": "Blend mode",
           "data-effect": "blendMode",
           "data-fk": "effects:blendMode",
           disabled: dis,
           value: m.blendMode,
+          style: touchSelectStyle,
           onchange: e => applyEffects({ blendMode: e.currentTarget.value }),
           onkeydown: k => k.stopPropagation(),
         }, BLEND_MODES.map(mode => h("option", { value: mode, selected: m.blendMode === mode }, mode)));
-        const clipSel = h("select.anim-sel", {
+        const clipSel = h("select.field.anim-sel", {
           "aria-label": "Mask / Clip",
           "data-effect": "clipShape",
           "data-fk": "effects:clipShape",
           disabled: dis,
           value: m.clipShape,
+          style: touchSelectStyle,
           onchange: e => applyEffects({ clipShape: e.currentTarget.value }),
           onkeydown: k => k.stopPropagation(),
         }, CLIP_SHAPES.map(shape => h("option", { value: shape, selected: m.clipShape === shape }, shape)));
@@ -218,11 +224,13 @@ export function renderPanel(root, ctx) {
         rows.push(
           row("Align", "", [["Left", "left"], ["Center X", "hcenter"], ["Right", "right"], ["Top", "top"], ["Center Y", "vcenter"], ["Bottom", "bottom"]].map(([t, w]) =>
             h("button.c", {
+              type: "button",
               title: `Align ${t}`,
               "aria-label": `Align ${t}`,
               "data-align": w,
               "data-fk": `arrange:align:${w}`,
               disabled: dis,
+              style: touchBtnStyle,
               onclick: () => act(e => e.alignSelection(w)),
             }, t))),
         );
@@ -230,19 +238,23 @@ export function renderPanel(root, ctx) {
           rows.push(
             row("Distribute", "",
               h("button.c", {
+                type: "button",
                 title: "Distribute horizontally",
                 "aria-label": "Distribute horizontally",
                 "data-distribute": "h",
                 "data-fk": "arrange:dist:h",
                 disabled: dis,
+                style: touchBtnStyle,
                 onclick: () => act(e => e.distributeSelection("h")),
               }, "Horizontal"),
               h("button.c", {
+                type: "button",
                 title: "Distribute vertically",
                 "aria-label": "Distribute vertically",
                 "data-distribute": "v",
                 "data-fk": "arrange:dist:v",
                 disabled: dis,
+                style: touchBtnStyle,
                 onclick: () => act(e => e.distributeSelection("v")),
               }, "Vertical")),
           );
@@ -250,11 +262,13 @@ export function renderPanel(root, ctx) {
         rows.push(
           row("Layout", "",
             h("button.c", {
+              type: "button",
               title: "Tidy selection into neat row, column, or grid",
               "aria-label": "Tidy selection",
               "data-action": "tidy",
               "data-fk": "arrange:tidy",
               disabled: dis,
+              style: touchBtnStyle,
               onclick: () => act(e => e.tidySelection()),
             }, "Tidy")),
         );
@@ -357,8 +371,10 @@ export function renderPanel(root, ctx) {
           h("button.c.on", {
             type: "button",
             title: "Clear local layer filter and show board layers",
+            "aria-label": "Show all layers",
             "data-action": "reset-local-layers",
             "data-fk": "layers:reset-local",
+            style: touchBtnStyle,
             onclick: () => ctx.onResetLocalView?.(),
           }, "Show all layers"))
         : null;
@@ -400,7 +416,7 @@ export function renderPanel(root, ctx) {
       };
       return [
         h("div.lib", {}, items.map((it, i) => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, "data-fk": `lib:${it.id ?? i}`, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")))),
-        h("div.row", { style: { marginTop: "8px" } }, h("span.opts", {},
+        h("div.row", { style: touchSheet ? { marginTop: "8px", minWidth: "0", maxWidth: "100%" } : { marginTop: "8px" } }, h("span.opts", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {},
           chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)"),
           h("button.c" + (k8sInstalled ? ".on" : ""), {
             type: "button",
@@ -408,6 +424,7 @@ export function renderPanel(root, ctx) {
             "aria-label": "Install Kubernetes pack",
             "data-icon-pack": "kubernetes",
             "data-fk": "lib:pack:kubernetes",
+            style: touchBtnStyle,
             onclick: () => installPack("kubernetes"),
           }, "＋ Kubernetes pack"),
           h("button.c" + (cloudInstalled ? ".on" : ""), {
@@ -416,6 +433,7 @@ export function renderPanel(root, ctx) {
             "aria-label": "Install Cloud pack",
             "data-icon-pack": "cloud",
             "data-fk": "lib:pack:cloud",
+            style: touchBtnStyle,
             onclick: () => installPack("cloud"),
           }, "＋ Cloud pack"))),
         h("div.hint", {}, items.length ? "Click an item to insert it. Drop a .excalidrawlib to add." : "Empty. Select shapes and save them, install an icon pack, or drop a .excalidrawlib."),
@@ -437,7 +455,15 @@ export function renderPanel(root, ctx) {
     h("button.tb" + (state.mode === "tabs" ? ".on" : ""), { title: "Tabs", "aria-label": "Tabs layout", "aria-pressed": String(state.mode === "tabs"), onclick: () => ctx.setState({ type: "mode", mode: "tabs" }) }, icon("tabs", { size: 15 })),
     h("button.tb", { title: "Fold all / unfold all", "aria-label": "Fold or unfold all", onclick: () => ctx.setState({ type: "foldAll", folded: state.folded.length < 6 }) }, icon("fold", { size: 15 })),
     h("button.tb", { title: "Reset the panel layout", "aria-label": "Reset panel layout", onclick: () => ctx.setState({ type: "reset" }) }, icon("settings", { size: 15 }))));
-  if (tabs) out.push(h("div.tabs", {}, secs.map(s => h("button" + (s.active ? ".on" : ""), { "data-fk": `panel-tab:${s.id}`, onclick: () => ctx.setState({ type: "tab", id: s.id }) }, s.title))));
+  if (tabs) out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" }, secs.map(s => h("button" + (s.active ? ".on" : ""), {
+    type: "button",
+    role: "tab",
+    "aria-selected": String(Boolean(s.active)),
+    "aria-label": s.title,
+    "data-fk": `panel-tab:${s.id}`,
+    style: touchBtnStyle,
+    onclick: () => ctx.setState({ type: "tab", id: s.id }),
+  }, s.title))));
   for (const s of secs) {
     if (!s.active) continue;
     out.push(h("div.sec" + (s.folded ? ".folded" : ""), { "data-sec": s.id },

@@ -95,7 +95,13 @@ function setupMobile(opts = {}) {
   Object.assign(globalThis, {
     document: doc, Node: N, devicePixelRatio: 3,
     matchMedia: q => ({
-      matches: q.includes("max-width: 640px") ? phone : q.includes("pointer: coarse") ? coarse : false,
+      matches: q.includes("pointer: coarse") && q.includes("max-width: 768px")
+        ? (phone && coarse)
+        : q.includes("max-width: 640px")
+          ? phone
+          : q.includes("pointer: coarse")
+            ? coarse
+            : false,
       addEventListener() {},
     }),
     ResizeObserver: class { constructor(fn) { this.fn = fn; } observe() { this.fn([]); } },
@@ -349,4 +355,48 @@ test("mobile layout invariants (<= 640px) for presenter, annotator, and viewer",
     expect(byId.sheet.textContent).not.toContain("Lock tool");
     expect(byId.sheet.textContent).not.toContain("Mermaid");
   }
+});
+
+test("Wave 9B mobile shell integration: Settings hides Keybindings on phone, Views sheet has mobile attributes, Style sheet has touch-safe controls", () => {
+  const { doc, byId, S, step } = setupMobile({ token: "t-ada", phone: true, coarse: true });
+
+  // Open Settings from topbar menu on phone -> Keybindings tab is gated out, Preferences stay touch-friendly
+  const settingsBtn = find(byId.topbar, e => e.attrs["aria-label"] === "Settings & keybindings");
+  expect(settingsBtn).toBeTruthy();
+  settingsBtn.click();
+  step(2);
+  const settingsModal = find(doc.body, e => e.classList.contains("settings-modal"));
+  expect(settingsModal).toBeTruthy();
+  expect(settingsModal.attrs["data-mobile-sheet"]).toBe("1");
+  expect(find(settingsModal, e => e.attrs["data-settings-tab"] === "keybindings")).toBeUndefined();
+  expect(find(settingsModal, e => e.attrs["data-pref-theme"] === "dark")).toBeTruthy();
+  find(settingsModal, e => e.attrs["data-action"] === "close-settings").click();
+  step(2);
+
+  // Open Views navigator from topbar pill -> data-mobile-sheet="1" and 16px search input
+  const viewsPill = find(byId.topbar, e => e.attrs["data-views-open"] === "1");
+  expect(viewsPill).toBeTruthy();
+  viewsPill.click();
+  step(2);
+  const viewsModal = find(doc.body, e => e.classList.contains("views-modal"));
+  expect(viewsModal).toBeTruthy();
+  expect(viewsModal.attrs["data-mobile-sheet"]).toBe("1");
+  expect(parseFloat(find(viewsModal, e => e.classList.contains("views-search")).style.fontSize)).toBeGreaterThanOrEqual(16);
+  find(viewsModal, e => e.attrs["aria-label"] === "Close views navigator").click();
+  step(2);
+
+  // Draw a rectangle, open Style sheet from dock -> Effects selects are 16px-safe & 44px touch targets
+  S.setTool("rectangle");
+  S.pointerDown({ x: 80, y: 80 });
+  S.pointerMove({ x: 180, y: 150 });
+  S.pointerUp({ x: 180, y: 150 });
+  step(2);
+  const styleBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Style"));
+  expect(styleBtn).toBeTruthy();
+  styleBtn.click();
+  step(2);
+  const blendSel = find(byId.sheet, e => e.attrs["data-effect"] === "blendMode");
+  expect(blendSel).toBeTruthy();
+  expect(parseFloat(blendSel.style.fontSize)).toBeGreaterThanOrEqual(16);
+  expect(parseFloat(blendSel.style.minHeight)).toBeGreaterThanOrEqual(44);
 });

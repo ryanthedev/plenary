@@ -9,6 +9,7 @@ import { filterFramesAndViews } from "../../../packages/core/views.js";
 import { h, replace } from "./dom.js";
 import { icon } from "./icons.js";
 import { trapFocus } from "./a11y.js";
+import { isPhoneTouchViewport } from "./settings-dialog.js";
 
 const LISTBOX_ID = "views-nav-listbox";
 
@@ -17,6 +18,7 @@ const LISTBOX_ID = "views-nav-listbox";
  * @param {{
  *   host: HTMLElement,
  *   doc?: Document,
+ *   win?: { matchMedia?: (query: string) => { matches?: boolean } | null } | null,
  *   getState: () => {
  *     frames: import("../../../packages/core/views.js").NamedFrame[],
  *     views: import("../../../packages/core/views.js").NamedView[],
@@ -30,6 +32,7 @@ const LISTBOX_ID = "views-nav-listbox";
  *   onSaveView: (name: string) => any,
  *   onDeleteView: (viewId: string) => void,
  *   onResetLocalView: () => void,
+ *   onSoloLayer?: ((layerId: string) => void) | null,
  *   onRestoreFocus?: (opener: any) => void,
  *   onClose?: () => void,
  * }} opts
@@ -37,6 +40,7 @@ const LISTBOX_ID = "views-nav-listbox";
 export function createViewsMenu({
   host,
   doc = globalThis.document,
+  win = null,
   getState,
   onJumpFrame,
   onSelectView,
@@ -44,9 +48,11 @@ export function createViewsMenu({
   onSaveView,
   onDeleteView,
   onResetLocalView,
+  onSoloLayer = null,
   onRestoreFocus = null,
   onClose = null,
 }) {
+  const isPhone = () => isPhoneTouchViewport(win ?? doc?.defaultView ?? globalThis);
   let openState = false;
   let query = "";
   let activeIndex = 0;
@@ -55,6 +61,7 @@ export function createViewsMenu({
   let searchInput = null;
   let listHost = null;
   let statusHost = null;
+  let soloHost = null;
   let saveInput = null;
   let trap = null;
   let openerRef = null;
@@ -78,6 +85,7 @@ export function createViewsMenu({
     searchInput = null;
     listHost = null;
     statusHost = null;
+    soloHost = null;
     saveInput = null;
     entries = [];
     if (restoreFocus) {
@@ -139,6 +147,9 @@ export function createViewsMenu({
 
   function renderBody() {
     if (!openState || !listHost || !statusHost) return;
+    const phoneTouch = isPhone();
+    const touchBtnStyle = phoneTouch ? { minHeight: "44px", minWidth: "44px" } : undefined;
+    const touchRowStyle = phoneTouch ? { minHeight: "44px" } : undefined;
     const state = getState();
     const { frames, views } = filterFramesAndViews(query, {
       frames: state.frames,
@@ -160,7 +171,9 @@ export function createViewsMenu({
           h("span.views-filter-label", {}, label),
           h("button.c.on", {
             type: "button",
+            "aria-label": "Show all layers",
             "data-action": "reset-local-layers",
+            style: touchBtnStyle,
             onclick: () => {
               onResetLocalView();
               renderBody();
@@ -197,7 +210,9 @@ export function createViewsMenu({
         },
         h("button.views-row-btn", {
           type: "button",
+          "aria-label": `Switch to view ${v.name}`,
           "data-views-item": `view:${v.id}`,
+          style: touchRowStyle,
           onclick: () => activateEntry(entry),
           onmouseenter: () => { activeIndex = idx; updateActiveHighlight(); },
         },
@@ -210,6 +225,7 @@ export function createViewsMenu({
             title: `Delete view ${v.name}`,
             "aria-label": `Delete view ${v.name}`,
             "data-delete-view": v.id,
+            style: touchBtnStyle,
             onclick: ev => {
               ev.stopPropagation();
               onDeleteView(v.id);
@@ -230,6 +246,7 @@ export function createViewsMenu({
             title: "Previous view ([)",
             "aria-label": "Previous view",
             "data-step-view": "-1",
+            style: touchBtnStyle,
             onclick: () => {
               onStepView(-1);
               renderBody();
@@ -241,6 +258,7 @@ export function createViewsMenu({
             title: "Next view (])",
             "aria-label": "Next view",
             "data-step-view": "1",
+            style: touchBtnStyle,
             onclick: () => {
               onStepView(1);
               renderBody();
@@ -272,7 +290,9 @@ export function createViewsMenu({
       },
       h("button.views-row-btn", {
         type: "button",
+        "aria-label": `Jump to frame ${f.name}`,
         "data-views-item": `frame:${f.id}`,
+        style: touchRowStyle,
         onclick: () => activateEntry(entry),
         onmouseenter: () => { activeIndex = idx; updateActiveHighlight(); },
       },
@@ -291,6 +311,36 @@ export function createViewsMenu({
         : h("div.hint.views-empty", {}, state.frames.length ? "No matching frames." : "No frames on this board yet. Press F to draw a frame.")));
 
     replace(listHost, sections);
+
+    // Quick Solo Layer controls live in a sibling region outside role="listbox" so combobox semantics stay pure.
+    if (soloHost) {
+      if (typeof onSoloLayer === "function" && Array.isArray(local?.layers) && local.layers.length > 0) {
+        replace(soloHost,
+          h("div.views-section", {},
+            h("div.views-sec-head", {}, h("span", {}, `Solo layer · ${local.layers.length}`)),
+            h("div.opts", { style: { display: "flex", flexWrap: "wrap", gap: "6px" } }, local.layers.map(l => {
+              const isSolo = Boolean(l.solo || (local.mode === "solo" && local.soloLayerId === l.id));
+              return h("button.c.views-solo-chip" + (isSolo ? ".on" : ""), {
+                type: "button",
+                title: isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`,
+                "aria-label": isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`,
+                "aria-pressed": String(isSolo),
+                "data-action": "solo-layer",
+                "data-solo-layer": l.id,
+                style: touchBtnStyle,
+                onclick: () => {
+                  onSoloLayer(l.id);
+                  renderBody();
+                  restoreInsideModal(el => el.getAttribute?.("data-solo-layer") === l.id);
+                },
+              }, isSolo ? `Solo: ${l.name || "Layer"}` : (l.name || "Layer"));
+            }))));
+        soloHost.hidden = false;
+      } else {
+        replace(soloHost);
+        soloHost.hidden = true;
+      }
+    }
     if (entries.length) {
       activeIndex = Math.max(0, Math.min(activeIndex, entries.length - 1));
       updateActiveHighlight();
@@ -324,6 +374,9 @@ export function createViewsMenu({
     activeIndex = 0;
     openerRef = opener ?? doc?.activeElement ?? null;
 
+    const phoneTouch = isPhone();
+    const touchInputStyle = phoneTouch ? { minHeight: "44px", fontSize: "16px" } : undefined;
+    const touchBtnStyle = phoneTouch ? { minHeight: "44px", minWidth: "44px" } : undefined;
     const state = getState();
     searchInput = h("input.field.views-search", {
       type: "search",
@@ -334,6 +387,7 @@ export function createViewsMenu({
       placeholder: "Search frames & views…",
       "aria-label": "Search frames and views",
       value: "",
+      style: touchInputStyle,
       oninput: e => {
         query = e.currentTarget.value ?? "";
         activeIndex = 0;
@@ -375,6 +429,7 @@ export function createViewsMenu({
 
     statusHost = h("div.views-status-host", { hidden: true });
     listHost = h("div.views-results", { id: LISTBOX_ID, role: "listbox", "aria-label": "Frames and views" });
+    soloHost = h("div.views-solo-host", { role: "region", "aria-label": "Solo layers", hidden: true });
 
     let footer = null;
     if (state.canSave) {
@@ -383,6 +438,7 @@ export function createViewsMenu({
         maxLength: 200,
         placeholder: "New view name (optional)…",
         "aria-label": "New view name",
+        style: touchInputStyle,
         onkeydown: e => {
           if (isToggleShortcut(e)) {
             e.preventDefault();
@@ -399,16 +455,20 @@ export function createViewsMenu({
           if (e.key !== "Escape" && e.key !== "Tab") e.stopPropagation();
         },
       });
-      footer = h("footer.views-footer", {},
+      footer = h("footer.views-footer", { style: phoneTouch ? { flexWrap: "wrap" } : undefined },
         saveInput,
         h("button.btn.primary", {
           type: "button",
+          "aria-label": "Save current view",
           "data-action": "save-view",
+          style: touchBtnStyle,
           onclick: () => handleSaveSubmit(),
         }, icon("plus", { size: 14 }), " Save current view"));
     } else {
       footer = h("footer.views-footer.views-footer-hint", {},
-        h("span.dim", {}, "Use ↑↓ and Enter to jump · [ / ] to step views · Switching views is local to you."));
+        h("span.dim", {}, phoneTouch
+          ? "Tap a frame or view to jump · Switching views is local to you."
+          : "Use ↑↓ and Enter to jump · [ / ] to step views · Switching views is local to you."));
     }
 
     dialog = h("div.dialog.views-modal", {
@@ -416,23 +476,27 @@ export function createViewsMenu({
       "aria-modal": "true",
       "aria-labelledby": "views-nav-title",
       "aria-label": "Jump to frame or view",
+      "data-mobile-sheet": "1",
+      ...(phoneTouch ? { "data-phone-touch": "1" } : {}),
       tabindex: "-1",
     },
     h("h2", { id: "views-nav-title" },
       icon("frame", { size: 16 }),
       " Jump to frame or view",
       h("span.spacer"),
-      h("kbd.views-kbd", {}, "⌘J"),
+      phoneTouch ? null : h("kbd.views-kbd", {}, "⌘J"),
       h("button.tb", {
         type: "button",
         title: "Close",
-        "aria-label": "Close",
+        "aria-label": "Close views navigator",
+        style: touchBtnStyle,
         onclick: () => close({ restoreFocus: true }),
       }, icon("close", { size: 16 }))),
     h("div.dbody.views-body", {},
       h("div.views-search-wrap", {}, searchInput),
       statusHost,
-      listHost),
+      listHost,
+      soloHost),
     footer);
 
     veil = h("div.dialog-veil.views-veil", {

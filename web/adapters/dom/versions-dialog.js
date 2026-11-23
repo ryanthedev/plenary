@@ -7,6 +7,7 @@
 import { h, replace } from "./dom.js";
 import { icon } from "./icons.js";
 import { trapFocus } from "./a11y.js";
+import { isPhoneTouchViewport } from "./settings-dialog.js";
 
 const ERROR_MESSAGES = {
   auth: "Sign in again to access version history.",
@@ -45,6 +46,7 @@ export function formatRelativeTime(ts, nowMs) {
  * @param {{
  *   host: HTMLElement,
  *   doc?: Document,
+ *   win?: { matchMedia?: (query: string) => { matches?: boolean } | null } | null,
  *   board: string,
  *   versions: import("../../ports/versions.js").VersionsPort,
  *   clock: { now(): number },
@@ -59,6 +61,7 @@ export function formatRelativeTime(ts, nowMs) {
 export function createVersionsDialog({
   host,
   doc = globalThis.document,
+  win = null,
   board,
   versions,
   clock,
@@ -69,6 +72,7 @@ export function createVersionsDialog({
   onRestoreFocus = null,
   onClose = null,
 }) {
+  const isPhone = () => isPhoneTouchViewport(win ?? doc?.defaultView ?? globalThis);
   let openState = false;
   let loading = false;
   let busyId = null;
@@ -205,12 +209,15 @@ export function createVersionsDialog({
 
   function renderBody() {
     if (!bodyHost) return;
+    const phoneTouch = isPhone();
+    const touchInputStyle = phoneTouch ? { fontSize: "16px", minHeight: "44px" } : undefined;
+    const touchBtnStyle = phoneTouch ? { minHeight: "44px", minWidth: "44px" } : undefined;
     const writable = canWrite();
     const nowMs = clock.now();
     const nodes = [];
 
     if (writable) {
-      const input = h("input.versions-input", {
+      const input = h("input.field.versions-input", {
         type: "text",
         placeholder: "Snapshot name…",
         "aria-label": "Snapshot name",
@@ -218,6 +225,7 @@ export function createVersionsDialog({
         maxLength: 120,
         disabled: saving,
         value: labelDraft,
+        style: touchInputStyle,
         oninput: e => {
           labelDraft = e.currentTarget.value;
           if (errorMsg) { errorMsg = ""; }
@@ -230,11 +238,13 @@ export function createVersionsDialog({
       });
       const saveBtn = h("button.btn.primary", {
         type: "button",
+        "aria-label": saving ? "Saving snapshot" : "Save snapshot",
         "data-action": "save-version",
         disabled: saving,
+        style: touchBtnStyle,
         onclick: () => { handleSave(); },
       }, saving ? "Saving…" : "Save snapshot");
-      nodes.push(h("div.versions-form", {}, input, saveBtn));
+      nodes.push(h("div.versions-form", { style: phoneTouch ? { flexWrap: "wrap" } : undefined }, input, saveBtn));
     }
 
     if (errorMsg) {
@@ -264,6 +274,7 @@ export function createVersionsDialog({
               "data-version-id": v.id,
               "aria-label": `Restore ${v.label}`,
               disabled: Boolean(busyId) || saving,
+              style: touchBtnStyle,
               onclick: () => { handleRestore(v); },
             }, isBusy ? "…" : "Restore"),
             h("button.tb.versions-del", {
@@ -273,6 +284,7 @@ export function createVersionsDialog({
               title: `Delete ${v.label}`,
               "aria-label": `Delete ${v.label}`,
               disabled: Boolean(busyId) || saving,
+              style: touchBtnStyle,
               onclick: () => { handleDelete(v); },
             }, icon("trash", { size: 14 }))) : null);
       })));
@@ -293,12 +305,15 @@ export function createVersionsDialog({
     openState = true;
     openerRef = opener;
     errorMsg = "";
+    const phoneTouch = isPhone();
+    const touchBtnStyle = phoneTouch ? { minHeight: "44px", minWidth: "44px" } : undefined;
 
     bodyHost = h("div.dbody.versions-body", {});
     const closeBtn = h("button.tb", {
       type: "button",
       title: "Close",
       "aria-label": "Close version history",
+      style: touchBtnStyle,
       onclick: () => close({ restoreFocus: true }),
     }, icon("close", { size: 16 }));
 
@@ -307,6 +322,8 @@ export function createVersionsDialog({
       "aria-modal": "true",
       "aria-labelledby": "versions-dialog-title",
       "aria-label": "Version history",
+      "data-mobile-sheet": "1",
+      ...(phoneTouch ? { "data-phone-touch": "1" } : {}),
       tabindex: "-1",
     },
     h("h2", { id: "versions-dialog-title" },
@@ -315,7 +332,13 @@ export function createVersionsDialog({
       closeBtn),
     bodyHost,
     h("footer", {},
-      h("button.btn", { type: "button", onclick: () => close({ restoreFocus: true }) }, "Close")));
+      h("button.btn", {
+        type: "button",
+        "aria-label": "Close version history",
+        "data-action": "close-versions",
+        style: touchBtnStyle,
+        onclick: () => close({ restoreFocus: true }),
+      }, "Close")));
 
     veil = h("div.dialog-veil.versions-veil", {
       onclick: e => { if (e.target === e.currentTarget) close({ restoreFocus: true }); },

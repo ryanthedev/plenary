@@ -18,10 +18,25 @@ import { icon } from "./icons.js";
 import { trapFocus } from "./a11y.js";
 
 /**
+ * Detect coarse-pointer narrow phone viewports (<= 768px) where hardware keyboard shortcuts are irrelevant.
+ * Safely guarded when `matchMedia` is absent.
+ * @param {{ matchMedia?: (query: string) => { matches?: boolean } | null } | null | undefined} [win]
+ * @returns {boolean}
+ */
+export function isPhoneTouchViewport(win = globalThis) {
+  try {
+    return Boolean(win?.matchMedia?.("(pointer: coarse) and (max-width: 768px)")?.matches);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Create a single-instance Settings & Keybindings modal controller.
  * @param {{
  *   host: HTMLElement,
  *   doc?: Document,
+ *   win?: { matchMedia?: (query: string) => { matches?: boolean } | null } | null,
  *   getSettings: () => import("../../core/settings.js").UserSettings,
  *   getTargets?: () => { frames: { id: string, name: string }[], views: { id: string, name: string }[] },
  *   onChange: (next: import("../../core/settings.js").UserSettings) => void,
@@ -33,6 +48,7 @@ import { trapFocus } from "./a11y.js";
 export function createSettingsDialog({
   host,
   doc = globalThis.document,
+  win = null,
   getSettings,
   getTargets = () => ({ frames: [], views: [] }),
   onChange,
@@ -41,6 +57,7 @@ export function createSettingsDialog({
   onClose = null,
 }) {
   let openState = false;
+  let phoneTouch = false;
   /** @type {"preferences" | "keybindings"} */
   let activeTab = "preferences";
   let query = "";
@@ -55,6 +72,8 @@ export function createSettingsDialog({
   let trap = null;
   let openerRef = null;
   let captureCleanup = null;
+
+  const isPhone = () => isPhoneTouchViewport(win ?? doc?.defaultView ?? globalThis);
 
   function stopCapture() {
     capturingAction = null;
@@ -139,6 +158,7 @@ export function createSettingsDialog({
   }
 
   function switchTab(nextTab) {
+    if (phoneTouch && nextTab === "keybindings") return;
     if (activeTab === nextTab) return;
     stopCapture();
     pendingConflict = null;
@@ -149,6 +169,12 @@ export function createSettingsDialog({
 
   function renderTabs() {
     if (!tabsHost) return;
+    if (phoneTouch) {
+      tabsHost.hidden = true;
+      replace(tabsHost);
+      return;
+    }
+    tabsHost.hidden = false;
     const tabBtn = (id, label) => {
       const selected = activeTab === id;
       return h("button.settings-tab" + (selected ? ".on" : ""), {
@@ -176,24 +202,29 @@ export function createSettingsDialog({
 
   function renderPreferencesPanel() {
     const cur = getSettings();
+    const touchCtrlStyle = phoneTouch ? { minHeight: "44px", minWidth: "44px", fontSize: "16px" } : undefined;
     const themeChip = (val, label) => h("button.c" + (cur.defaultTheme === val ? ".on" : ""), {
       type: "button",
+      "aria-label": `Default theme: ${label}`,
       "aria-pressed": String(cur.defaultTheme === val),
       "data-pref-theme": val,
+      style: touchCtrlStyle,
       onclick: () => { onChange({ ...cur, defaultTheme: val }); renderBody(); },
     }, label);
 
     const roughChip = (val, label) => h("button.c" + (cur.roughDefault === val ? ".on" : ""), {
       type: "button",
+      "aria-label": `Default stroke style: ${label}`,
       "aria-pressed": String(cur.roughDefault === val),
       "data-pref-rough": String(val),
+      style: touchCtrlStyle,
       onclick: () => { onChange({ ...cur, roughDefault: val }); renderBody(); },
     }, label);
 
     return h("div.settings-panel", {
       id: "settings-panel-preferences",
-      role: "tabpanel",
-      "aria-labelledby": "settings-tab-preferences",
+      role: phoneTouch ? "region" : "tabpanel",
+      "aria-labelledby": phoneTouch ? "settings-dialog-title" : "settings-tab-preferences",
     },
     h("div.settings-row", {},
       h("div.settings-row-info", {},
@@ -210,8 +241,10 @@ export function createSettingsDialog({
       h("button.c" + (cur.gridDefault ? ".on" : ""), {
         type: "button",
         role: "switch",
+        "aria-label": "Snap to grid by default",
         "aria-checked": String(Boolean(cur.gridDefault)),
         "data-pref-grid": "1",
+        style: touchCtrlStyle,
         onclick: () => { onChange({ ...cur, gridDefault: !cur.gridDefault }); renderBody(); },
       }, cur.gridDefault ? "On" : "Off")),
     h("div.settings-row", {},
@@ -440,8 +473,9 @@ export function createSettingsDialog({
 
   function renderBody() {
     if (!openState || !bodyHost) return;
+    if (phoneTouch && activeTab !== "preferences") activeTab = "preferences";
     const saved = captureBodyFocus();
-    replace(bodyHost, activeTab === "preferences" ? renderPreferencesPanel() : renderKeybindingsPanel());
+    replace(bodyHost, (phoneTouch || activeTab === "preferences") ? renderPreferencesPanel() : renderKeybindingsPanel());
     if (saved) {
       const twin = findByAttr(bodyHost, saved.attr, saved.val);
       if (twin) twin.focus?.();
@@ -456,7 +490,8 @@ export function createSettingsDialog({
   function open({ opener = null, tab = "preferences" } = {}) {
     if (openState) close({ restoreFocus: false });
     openState = true;
-    activeTab = tab === "keybindings" ? "keybindings" : "preferences";
+    phoneTouch = isPhone();
+    activeTab = (!phoneTouch && tab === "keybindings") ? "keybindings" : "preferences";
     query = "";
     pendingConflict = null;
     stopCapture();
@@ -464,21 +499,26 @@ export function createSettingsDialog({
 
     tabsHost = h("div.settings-tabs", { role: "tablist", "aria-label": "Settings sections" });
     bodyHost = h("div.dbody.settings-body");
+    const touchBtnStyle = phoneTouch ? { minHeight: "44px", fontSize: "16px" } : undefined;
+    const touchIconStyle = phoneTouch ? { minWidth: "44px", minHeight: "44px" } : undefined;
 
     dialog = h("div.dialog.settings-modal", {
       role: "dialog",
       "aria-modal": "true",
       "aria-labelledby": "settings-dialog-title",
+      "data-mobile-sheet": "1",
+      ...(phoneTouch ? { "data-phone-touch": "1" } : {}),
       tabindex: "-1",
     },
     h("h2", { id: "settings-dialog-title" },
       icon("settings", { size: 17 }),
-      " Settings & keybindings",
+      phoneTouch ? " Settings" : " Settings & keybindings",
       h("span.spacer"),
       h("button.tb", {
         type: "button",
         title: "Close (Esc)",
         "aria-label": "Close settings",
+        style: touchIconStyle,
         onclick: () => close({ restoreFocus: true }),
       }, icon("close", { size: 16 }))),
     tabsHost,
@@ -486,7 +526,9 @@ export function createSettingsDialog({
     h("footer.settings-footer", {},
       h("button.btn", {
         type: "button",
+        "aria-label": "Reset settings to defaults",
         "data-action": "reset-settings",
+        style: touchBtnStyle,
         onclick: () => {
           stopCapture();
           pendingConflict = null;
@@ -496,7 +538,9 @@ export function createSettingsDialog({
       }, "Reset to defaults"),
       h("button.btn.primary", {
         type: "button",
+        "aria-label": "Done",
         "data-action": "close-settings",
+        style: touchBtnStyle,
         onclick: () => close({ restoreFocus: true }),
       }, "Done")));
 
@@ -508,7 +552,7 @@ export function createSettingsDialog({
     renderTabs();
     renderBody();
 
-    const initialTab = tabsHost.querySelector?.(`[data-settings-tab="${activeTab}"]`) ?? dialog;
+    const initialTab = (!phoneTouch && tabsHost.querySelector?.(`[data-settings-tab="${activeTab}"]`)) || dialog;
     trap = trapFocus(dialog, {
       onEscape: () => {
         if (capturingAction) {
@@ -528,6 +572,16 @@ export function createSettingsDialog({
 
   function refresh() {
     if (!openState) return;
+    const nextPhone = isPhone();
+    if (nextPhone !== phoneTouch) {
+      phoneTouch = nextPhone;
+      if (phoneTouch && activeTab !== "preferences") {
+        stopCapture();
+        pendingConflict = null;
+        activeTab = "preferences";
+      }
+      renderTabs();
+    }
     renderBody();
   }
 

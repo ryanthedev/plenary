@@ -23,6 +23,7 @@ import { parseExcalidraw, toExcalidrawClipboard, remapExcalidrawIds } from "./ex
 import { parseLinkCardUrl, buildLinkCard, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "./link-card.js";
 import { parseEmbedUrl, buildEmbedElement, parseEmbedFromElement } from "./embed.js";
 import { alignElements, distributeElements, tidyElements, computeSmartGuides } from "./layout.js";
+import { isContainer, childrenOfContainer, findContainingFrame, expandContainerBounds, buildSwimlane } from "./containers.js";
 
 export const TOOLS = [
   { id: "select", keys: ["v", "1"], icon: "↖", name: "Select" },
@@ -703,8 +704,30 @@ export class Editor {
     switch (g.kind) {
       case "move": {
         if (!g.moved) return this.changed();
-        const dirty = new Map(this.selected().map(e => [e.id, clone(e)]));
-        for (const id of g.extra ?? []) { const e = this.doc.get(id); if (e) dirty.set(id, clone(e)); }
+        const dirty = new Map();
+        const movedIds = new Set(g.orig?.keys() ?? []);
+        for (const id of movedIds) {
+          const e = this.doc.get(id);
+          if (e) dirty.set(id, clone(e));
+        }
+        // Auto-parent non-frame elements dropped inside or dragged out of a container.
+        for (const id of this.sel) {
+          const cur = dirty.get(id);
+          if (!cur || isContainer(cur) || isLabel(cur)) continue;
+          if (cur.frameId && movedIds.has(cur.frameId)) continue;
+          const host = findContainingFrame(this.doc, cur);
+          const nextFrameId = host ? host.id : null;
+          if ((cur.frameId ?? null) !== nextFrameId) {
+            cur.frameId = nextFrameId;
+            const label = (isShape(cur) || isLinear(cur)) && this.doc.labelOf(cur);
+            if (label && this.doc.editable(label)) {
+              if (!g.before.has(label.id)) g.before.set(label.id, clone(label));
+              const lc = dirty.get(label.id) ?? clone(label);
+              lc.frameId = nextFrameId;
+              dirty.set(label.id, lc);
+            }
+          }
+        }
         return this.commitGesture(g.before, dirty);
       }
       case "resize": case "point": case "rotate": {
@@ -918,6 +941,40 @@ export class Editor {
     this.commit(before, dirty);
   }
 
+  // Expand a set of element ids to include all editable bound labels and (transitively)
+  // editable children + bound labels of any editable containers, deduplicated.
+  expandMoveIds(seedIds) {
+    /** @type {Set<string>} */
+    const ids = new Set();
+    /** @type {any[]} */
+    const queue = [];
+    for (const id of seedIds) {
+      if (ids.has(id)) continue;
+      const el = this.doc.get(id);
+      if (!el || !this.doc.editable(el)) continue;
+      ids.add(id);
+      queue.push(el);
+    }
+    while (queue.length) {
+      const el = queue.shift();
+      if (isShape(el) || isLinear(el)) {
+        const l = this.doc.labelOf(el);
+        if (l && !ids.has(l.id) && this.doc.editable(l)) {
+          ids.add(l.id);
+        }
+      }
+      if (isContainer(el)) {
+        for (const child of childrenOfContainer(this.doc, el.id)) {
+          if (!ids.has(child.id) && this.doc.editable(child)) {
+            ids.add(child.id);
+            queue.push(child);
+          }
+        }
+      }
+    }
+    return ids;
+  }
+
   moveSel(g, p, w, m) {
     const dragSlop = DRAG_SLOP * this.slopScale(g.pointerType ?? m.pointerType);
     if (!g.moved && Math.hypot(p.x - g.p.x, p.y - g.p.y) < dragSlop) return;
@@ -925,11 +982,10 @@ export class Editor {
       g.moved = true;
       // Alt-drag leaves copies behind (the originals move).
       if (g.alt) this.duplicateInPlace();
-      const ids = new Set(this.sel);
-      for (const id of [...ids]) { const el = this.doc.get(id); const l = el && isShape(el) && this.doc.labelOf(el); if (l) ids.add(l.id); }
+      const ids = this.expandMoveIds(this.sel);
       g.extra = [...ids].filter(id => !this.sel.has(id));
       /** @type {[string, any][]} */
-      const origEntries = [...ids].map(id => /** @type {[string, any]} */ ([id, clone(this.doc.get(id))])).filter(([, e]) => e && this.doc.editable(e));
+      const origEntries = [...ids].map(id => /** @type {[string, any]} */ ([id, clone(this.doc.get(id))])).filter(([, e]) => e);
       g.orig = new Map(origEntries);
       g.before = new Map([...g.orig].map(([id, e]) => [id, clone(e)]));
       g.box = unionBox([...g.orig.values()].filter(e => !isLabel(e)).map(e => bounds(e, this.doc)));
@@ -1294,21 +1350,49 @@ export class Editor {
   cloneSelection(dx, dy, selectCopies = true) {
     const els = this.selected(); if (!els.length) return [];
     const map = new Map(), groupMap = new Map(), out = [];
-    const all = this.withLabels(els);
+    const all = this.withLabelsAndChildren(els);
     for (const el of all) map.set(el.id, newId());
     this.transact(tx => {
       for (const el of all) {
         const c = clone(el); c.id = map.get(el.id); c.x += dx; c.y += dy; c.seed = Math.floor(Math.random() * 2 ** 31); c.version = 0;
         c.groupIds = (c.groupIds ?? []).map(g => { if (!groupMap.has(g)) groupMap.set(g, newId()); return groupMap.get(g); });
         if (c.containerId) c.containerId = map.get(c.containerId) ?? null;
+        if (c.frameId) c.frameId = map.get(c.frameId) ?? c.frameId;
         c.boundElements = (c.boundElements ?? []).filter(b => map.has(b.id)).map(b => ({ ...b, id: map.get(b.id) }));
         for (const k of ["startBinding", "endBinding"]) if (c[k]) c[k] = map.has(c[k].elementId) ? { ...c[k], elementId: map.get(c[k].elementId) } : null;
         c.customData = { ...c.customData, z: (c.customData?.z ?? 0) + 0.5 };
         tx.add(c); out.push(c.id);
       }
     });
-    if (selectCopies) this.select(out.filter(id => !isLabel(this.doc.get(id))));
+    if (selectCopies) this.select(els.map(e => map.get(e.id)).filter(id => id && !isLabel(this.doc.get(id))));
     return out;
+  }
+
+  // Elements plus bound labels and (transitively) live children of any containers among them.
+  withLabelsAndChildren(els) {
+    /** @type {any[]} */
+    const all = [];
+    /** @type {Set<string>} */
+    const ids = new Set();
+    /** @type {any[]} */
+    const queue = [];
+    for (const el of els) {
+      if (!el || ids.has(el.id)) continue;
+      ids.add(el.id);
+      all.push(el);
+      queue.push(el);
+    }
+    while (queue.length) {
+      const el = queue.shift();
+      const l = (isShape(el) || isLinear(el)) && this.doc.labelOf(el);
+      if (l && !ids.has(l.id)) { ids.add(l.id); all.push(l); }
+      if (isContainer(el)) {
+        for (const child of childrenOfContainer(this.doc, el.id)) {
+          if (!ids.has(child.id)) { ids.add(child.id); all.push(child); queue.push(child); }
+        }
+      }
+    }
+    return all;
   }
 
   // Elements plus the labels of the shapes and arrows among them (a label goes where its host goes).
@@ -1675,11 +1759,21 @@ export class Editor {
 
   applyLayoutShifts(shifts) {
     if (!shifts.length) return false;
+    const explicitIds = new Set(shifts.map(s => s.id));
+    /** @type {Set<string>} */
+    const shifted = new Set();
     const ok = this.transact(tx => {
       for (const { id, dx, dy } of shifts) {
+        if (!dx && !dy) continue;
         const el = this.doc.get(id);
-        if (!el || !this.doc.editable(el)) continue;
-        this.shift(tx, el, dx, dy);
+        if (!el || !this.doc.editable(el) || shifted.has(id)) continue;
+        const followers = this.expandMoveIds([id]);
+        for (const fid of followers) {
+          if (fid !== id && explicitIds.has(fid)) continue;
+          if (shifted.has(fid)) continue;
+          const c = tx.get(fid);
+          if (c) { c.x += dx; c.y += dy; shifted.add(fid); }
+        }
       }
       return true;
     });
@@ -1719,7 +1813,73 @@ export class Editor {
     if (l && this.doc.editable(l)) { const cl = tx.get(l.id); cl.x += dx; cl.y += dy; }
   }
 
-  nudge(dx, dy) { const els = this.selected().filter(e => this.doc.editable(e)); if (els.length) this.transact(tx => els.forEach(e => this.shift(tx, e, dx, dy))); }
+  nudge(dx, dy) {
+    if (!dx && !dy) return;
+    const ids = this.expandMoveIds(this.sel);
+    if (!ids.size) return;
+    this.transact(tx => {
+      for (const id of ids) {
+        const c = tx.get(id);
+        if (c) { c.x += dx; c.y += dy; }
+      }
+    });
+  }
+
+  // Resize a container (`frame`) to neatly wrap its live children with padding (single undoable step).
+  fitContainerToChildren(containerId, opts = {}) {
+    if (this.readOnly) return false;
+    const container = this.doc.get(containerId);
+    if (!container || !isContainer(container) || !this.doc.editable(container)) return false;
+    const children = childrenOfContainer(this.doc, container.id);
+    if (!children.some(c => !isLabel(c))) return false;
+    const next = expandContainerBounds(container, children, { ...opts, doc: this.doc });
+    if (!next) return false;
+    if (
+      Math.abs(container.x - next.x) < 1e-6 &&
+      Math.abs(container.y - next.y) < 1e-6 &&
+      Math.abs(container.width - next.width) < 1e-6 &&
+      Math.abs(container.height - next.height) < 1e-6
+    ) {
+      return false;
+    }
+    const ok = this.transact(tx => {
+      const c = tx.get(container.id);
+      if (!c) return false;
+      c.x = next.x;
+      c.y = next.y;
+      c.width = next.width;
+      c.height = next.height;
+      return true;
+    });
+    return !!ok;
+  }
+
+  // Create and select a horizontal or vertical multi-lane swimlane group of Protocol v1.1-valid frames.
+  addSwimlane(opts = {}) {
+    if (this.readOnly) return [];
+    const layer = typeof opts.layer === "string" && opts.layer ? opts.layer : this.activeLayer;
+    const laneCount = Array.isArray(opts.lanes) && opts.lanes.length > 0 ? opts.lanes.length : 3;
+    const z = Number.isFinite(opts.z) ? opts.z : this.doc.minZ(layer) - laneCount;
+    const frames = buildSwimlane({ ...opts, layer, z });
+    if (!frames.length) return [];
+    if (opts.x == null && opts.y == null) {
+      const box = unionBox(frames.map(bbox));
+      if (box) {
+        const at = this.toWorld({ x: this.size.w / 2, y: this.size.h / 2 });
+        const dx = at.x - (box.x + box.w / 2);
+        const dy = at.y - (box.y + box.h / 2);
+        for (const f of frames) { f.x += dx; f.y += dy; }
+      }
+    }
+    const ok = this.transact(tx => {
+      for (const f of frames) tx.add(f);
+      return true;
+    });
+    if (!ok) return [];
+    const ids = frames.map(f => f.id);
+    this.select(ids);
+    return ids;
+  }
 
   // Style the selection, and remember it for the next element drawn.
   setStyle(patch) {

@@ -127,7 +127,7 @@ describe("#114 Canvas Right-Click Context Menu", () => {
     expect(ids).toEqual([
       "cut", "copy", "paste", "duplicate", "delete",
       "bring-front", "bring-forward", "send-backward", "send-back",
-      "lock", "comment",
+      "lock", "copy-link", "comment",
     ]);
 
     // Lock toggles element.locked

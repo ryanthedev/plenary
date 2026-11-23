@@ -65,6 +65,7 @@ export function clampMenuPosition({ x, y, width, height, viewportWidth, viewport
  *     reorder: (how: "front" | "forward" | "backward" | "back") => void,
  *     moveToLayer: (layerId: string) => void,
  *     toggleLock: () => void,
+ *     copyLink?: () => void,
  *     addComment: () => void,
  *     selectAll: () => void,
  *     addStickyNote: () => void,
@@ -133,6 +134,17 @@ export function buildCanvasMenuItems(ctx) {
       disabled: !canWrite,
       action: actions.toggleLock,
     });
+
+    if (els.length >= 1 && typeof actions.copyLink === "function") {
+      const isFrame = els.length === 1 && els[0].type === "frame";
+      sep();
+      items.push({
+        id: "copy-link",
+        label: isFrame ? "Copy link to frame" : "Copy link to selection",
+        icon: "share",
+        action: actions.copyLink,
+      });
+    }
 
     if (canComment) {
       sep();

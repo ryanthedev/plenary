@@ -231,6 +231,17 @@ async function child(mode) {
     }
     R.viewKey("ArrowLeft"); R.clipboardKey("c", { cmd: true }); R.settingsKey("'", { cmd: true });
 
+    // ── settings (#116, #22) ──
+    const St = mods["web/core/settings.js"];
+    St.loadSettings(storage);
+    St.saveSettings(storage, { defaultTheme: "dark", gridDefault: true, roughDefault: 2, keybinds: { "tool.rectangle": "b" }, frameBinds: { "Alt+1": "frame:f1" } });
+    St.detectKeybindConflict({ "tool.rectangle": "b" }, "tool.ellipse", "b");
+    St.normalizeCombo({ key: "j", metaKey: true });
+    St.resolveKeybind(St.loadSettings(storage), { key: "b" });
+    St.parseDeepLink({ hash: "#frame=f1", search: "" });
+    St.buildDeepLink({ origin: "https://plenary.test", pathname: "/", search: "?board=b1", kind: "el", id: "e1" });
+    St.resetSettings(storage);
+
     // ── collab models ──
     const P = mods["web/core/collab/presence-model.js"], Gt = mods["web/core/collab/gate.js"];
     const Rm = mods["web/core/collab/records-model.js"], Nm = mods["web/core/collab/notes-model.js"];

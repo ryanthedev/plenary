@@ -38,6 +38,18 @@ import { collabFrame } from "./collab/frame.js";
 import { createVideoOverlay } from "./video-overlay.js";
 import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
 import { createViewsMenu } from "./views-menu.js";
+import { createSettingsDialog } from "./settings-dialog.js";
+import {
+  loadSettings,
+  saveSettings,
+  resetSettings,
+  resolveKeybind,
+  resolveTheme,
+  effectiveKeybinds,
+  formatCombo,
+  parseDeepLink,
+  buildDeepLink,
+} from "../../core/settings.js";
 import { hitTest } from "../../../packages/core/geometry.js";
 
 const RAW_BOARD_ID_RE = /^(?:b-[a-z0-9]{8,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
@@ -88,8 +100,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
+  let userSettings = loadSettings(prefs);
+  const prefersDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+  const initialTheme = theme0 === "dark" || theme0 === "light"
+    ? theme0
+    : resolveTheme(userSettings.defaultTheme, prefersDark());
   const ui = {
-    theme: theme0 === "dark" || (theme0 !== "light" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light",
+    theme: initialTheme,
+    settings: userSettings,
     panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
     localView: { soloLayerId: null, activeViewId: null },
     renamingBoard: false,
@@ -124,6 +142,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     mine: (() => { try { const v = JSON.parse(get(mineKey) ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } })(),
     onChange: () => { chromeDirty = true; syncMove(); },
   });
+  S.eds.board.style.roughness = userSettings.roughDefault;
+  S.eds.notes.style.roughness = userSettings.roughDefault;
   if (!ui.drawer && me.role === "annotator") ui.drawer = "notes";
   net.onFile(file => { S.receiveFiles({ [file.id]: file }); });
   // A picture that could not be saved for everyone (PROTOCOL.md § Blobs): it shows here, but nobody else will see it.
@@ -345,6 +365,100 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     btn?.setAttribute?.("aria-expanded", "true");
     viewsMenu.open({ opener: savedOpener });
   }
+
+  // ── Customizable User Settings & Keybindings (#116) ──
+  function applyUserSettings(next, { fromDialog = false } = {}) {
+    const prev = userSettings;
+    userSettings = saveSettings(prefs, next);
+    ui.settings = userSettings;
+    if (userSettings.roughDefault !== prev.roughDefault) {
+      S.eds.board.style.roughness = userSettings.roughDefault;
+      if (!S.penStyle) S.eds.notes.style.roughness = userSettings.roughDefault;
+    }
+    if (fromDialog && userSettings.defaultTheme !== prev.defaultTheme) {
+      setTheme(resolveTheme(userSettings.defaultTheme, prefersDark()));
+    }
+    chromeDirty = true;
+  }
+  const settingsDialog = createSettingsDialog({
+    host: document.body,
+    doc: document,
+    getSettings: () => userSettings,
+    getTargets: () => ({
+      frames: listNamedFrames(S.eds.board.doc),
+      views: viewsOf(S.eds.board.doc),
+    }),
+    onChange: next => applyUserSettings(next, { fromDialog: true }),
+    onReset: () => {
+      const prev = userSettings;
+      userSettings = resetSettings(prefs);
+      ui.settings = userSettings;
+      S.eds.board.style.roughness = userSettings.roughDefault;
+      if (!S.penStyle) S.eds.notes.style.roughness = userSettings.roughDefault;
+      if (userSettings.defaultTheme !== prev.defaultTheme) {
+        setTheme(resolveTheme(userSettings.defaultTheme, prefersDark()));
+      }
+      chromeDirty = true;
+      toast("Settings reset to defaults");
+      return userSettings;
+    },
+    onRestoreFocus: saved => restoreOpener(saved, visibleControl([".header-more", "[data-dock-more]"]) ?? canvas),
+  });
+  /**
+   * @param {any} [opener]
+   * @param {"preferences" | "keybindings"} [tab]
+   */
+  function openSettingsDialog(opener = null, tab = "preferences") {
+    if (settingsDialog.isOpen()) { settingsDialog.close({ restoreFocus: true }); return; }
+    const savedOpener = captureOpener(opener);
+    dismissOverlays();
+    settingsDialog.open({ opener: savedOpener, tab });
+  }
+
+  // ── Deep Links to Frame / Element / View (#22) ──
+  let pendingDeepLink = parseDeepLink(globalThis.location);
+  function applyDeepLink(target, { animate = true } = {}) {
+    if (!target) return false;
+    if (target.kind === "frame") return jumpToFrame(target.id, { animate });
+    if (target.kind === "view") return activateView(target.id, { animate });
+    if (target.kind === "el") {
+      const bEl = S.eds.board.doc.get(target.id);
+      const nEl = !bEl || bEl.isDeleted ? S.eds.notes.doc.get(target.id) : null;
+      const hit = (bEl && !bEl.isDeleted)
+        ? { stream: /** @type {const} */ ("board"), el: bEl }
+        : (nEl && !nEl.isDeleted)
+          ? { stream: /** @type {const} */ ("notes"), el: nEl }
+          : null;
+      if (!hit) return false;
+      S.eds.notes.cancelCamera();
+      S.eds.board.fit([hit.el], 64, { animate });
+      S.syncView("board");
+      const canSelect = hit.stream === "board"
+        ? S.role === "presenter"
+        : (S.effective === "presenter" || (S.effective !== "viewer" && S.isMine(hit.el.id)));
+      if (canSelect) {
+        const ed = S.eds[hit.stream];
+        const other = S.eds[hit.stream === "board" ? "notes" : "board"];
+        other.select([]);
+        if (S.role === "presenter") S.active = hit.stream;
+        ed.select(ed.withGroup(hit.el));
+      }
+      dirty = true;
+      chromeDirty = true;
+      return true;
+    }
+    return false;
+  }
+  function activateFrameBindTarget(target) {
+    if (typeof target !== "string" || !target) return false;
+    const ok = target.startsWith("view:")
+      ? activateView(target.slice(5))
+      : target.startsWith("frame:")
+        ? jumpToFrame(target.slice(6))
+        : (jumpToFrame(target) || activateView(target));
+    if (!ok) toast("Bound frame or view not found on this board");
+    return ok;
+  }
   function pasteAtPoint(worldPoint) {
     if (!S.may()) { toast("View only: nothing is pasted"); return; }
     const clip = globalThis.navigator?.clipboard;
@@ -430,6 +544,31 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         reorder: how => { S.act(stream, x => x.reorder(how)); chromeDirty = true; },
         moveToLayer: layerId => { S.act("board", x => x.moveToLayer(layerId)); chromeDirty = true; },
         toggleLock: () => { S.act(stream, x => x.toggleLock()); chromeDirty = true; },
+        copyLink: () => {
+          const selectedList = hitEl ? (ed.sel.has(hitEl.id) ? ed.selected() : [hitEl]) : [];
+          const els = selectedList.filter(el => el && !isLabel(el));
+          const primary = els[0] ?? hitEl;
+          if (!primary) return;
+          const isFrame = els.length <= 1 && primary.type === "frame";
+          const loc = globalThis.location;
+          const url = buildDeepLink({
+            origin: loc?.origin ?? "",
+            pathname: loc?.pathname ?? "/",
+            search: loc?.search ?? "",
+            kind: isFrame ? "frame" : "el",
+            id: primary.id,
+          });
+          if (!url) return;
+          const clip = globalThis.navigator?.clipboard;
+          const label = isFrame ? "Copied link to frame" : "Copied link to selection";
+          if (typeof clip?.writeText === "function") {
+            Promise.resolve(clip.writeText(url))
+              .then(() => toast(label))
+              .catch(() => toast("Couldn't copy link"));
+          } else {
+            toast("Clipboard unavailable");
+          }
+        },
         addComment: () => startComment(p),
         selectAll: () => { S.key("a", { cmd: true }); chromeDirty = true; },
         addStickyNote: () => { S.placeNote(w); chromeDirty = true; },
@@ -641,21 +780,59 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (e.defaultPrevented) return;
     const t = e.target;
     const k0 = keyName(e), m0 = mods(e);
-    if ((m0.cmd || m0.ctrl) && !m0.shift && !m0.alt && k0 === "j" && viewsMenu.isOpen()) {
+    const resolved = resolveKeybind(userSettings, e);
+    if (resolved?.kind === "action" && resolved.action === "action.views" && viewsMenu.isOpen()) {
       e.preventDefault(); e.stopPropagation?.();
       viewsMenu.close({ restoreFocus: true });
+      return;
+    }
+    if (resolved?.kind === "action" && resolved.action === "action.settings" && settingsDialog.isOpen()) {
+      e.preventDefault(); e.stopPropagation?.();
+      settingsDialog.close({ restoreFocus: true });
       return;
     }
     if (hasOpenDialog() || isEditable(t) || inDialog(t) || isSlider(t)) return;   // inputs, dialogs, sliders keep their keys
     if (isInteractive(t) && (e.key === "Enter" || e.key === " " || e.code === "Space")) return;   // let focused buttons/links activate
     if (e.key === " " || e.code === "Space") space = true;
     const k = k0, m = m0;
-    if ((m.cmd || m.ctrl) && !m.shift && !m.alt && k === "j") { e.preventDefault(); e.stopPropagation?.(); openViewsMenu(); return; }
-    if (!m.cmd && !m.ctrl && !m.alt && (k === "pagedown" || k === "pageup") && resolvedLocalView().active) {
+
+    if (resolved?.kind === "frameBind") {
       e.preventDefault(); e.stopPropagation?.();
-      stepBoardFrame(k === "pagedown" ? 1 : -1);
+      activateFrameBindTarget(resolved.target);
       return;
     }
+    if (resolved?.kind === "action") {
+      const act = resolved.action;
+      if (act.startsWith("tool.")) {
+        const toolId = act.slice(5);
+        if (S.setTool(toolId)) { e.preventDefault(); e.stopPropagation?.(); chromeDirty = true; }
+        else if (!S.may() && toolId !== "hand") { e.preventDefault(); e.stopPropagation?.(); }
+        return;
+      }
+      if (act === "action.views") { e.preventDefault(); e.stopPropagation?.(); openViewsMenu(); return; }
+      if (act === "action.settings") { e.preventDefault(); e.stopPropagation?.(); openSettingsDialog(); return; }
+      if (act === "action.export") { e.preventDefault(); e.stopPropagation?.(); if (S.role === "presenter") openDialog("export"); return; }
+      if (act === "action.panel") { if (S.role === "presenter") { e.preventDefault(); e.stopPropagation?.(); setPanel({ type: "open" }); } return; }
+      if (act === "action.grid") {
+        if (S.role === "presenter" && S.may()) {
+          e.preventDefault(); e.stopPropagation?.();
+          S.act("board", ed => ed.setAppState({ grid: ed.grid ? 0 : 20 }), { settings: true });
+          chromeDirty = true;
+        }
+        return;
+      }
+      if (act === "action.toolLock") { if (S.may()) { e.preventDefault(); e.stopPropagation?.(); S.toggleLock(); chromeDirty = true; } return; }
+      if (act === "action.fit") { e.preventDefault(); e.stopPropagation?.(); S.fit(); chromeDirty = true; return; }
+      if (act === "action.zoomReset") { e.preventDefault(); e.stopPropagation?.(); S.zoomAt(1); chromeDirty = true; return; }
+      if (act === "action.zoomIn") { e.preventDefault(); e.stopPropagation?.(); S.zoomAt(Math.min(ZOOM_MAX, S.eds.board.view.scale * 1.25)); chromeDirty = true; return; }
+      if (act === "action.zoomOut") { e.preventDefault(); e.stopPropagation?.(); S.zoomAt(Math.max(ZOOM_MIN, S.eds.board.view.scale / 1.25)); chromeDirty = true; return; }
+      if (act === "action.nextFrame") { e.preventDefault(); e.stopPropagation?.(); stepBoardFrame(1); return; }
+      if (act === "action.prevFrame") { e.preventDefault(); e.stopPropagation?.(); stepBoardFrame(-1); return; }
+    }
+    if (resolved?.kind === "unbound") {
+      return;
+    }
+
     if (!m.cmd && !m.ctrl && !m.alt && !m.shift && (e.key === "[" || e.key === "]")) {
       const hasSel = (activeEditor()?.sel?.size ?? 0) > 0;
       if ((!S.may() || !hasSel) && viewsOf(S.eds.board.doc).length > 0) {
@@ -664,8 +841,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         return;
       }
     }
-    if ((m.cmd || m.ctrl) && m.shift && k === "e") { e.preventDefault(); e.stopPropagation?.(); if (S.role === "presenter") openDialog("export"); return; }
-    if (!m.cmd && !m.ctrl && !m.alt && k === "i" && S.role === "presenter") { e.preventDefault(); e.stopPropagation?.(); setPanel({ type: "open" }); return; }
     if (S.key(k, m)) { e.preventDefault(); e.stopPropagation?.(); chromeDirty = true; }
   });
   document.addEventListener("keyup", e => { if (e.key === " " || e.code === "Space") space = false; });
@@ -1146,6 +1321,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function dismissOverlays({ keepSheet = false, keepDialog = false } = {}) {
     contextMenu.close({ restoreFocus: false });
     viewsMenu.close({ restoreFocus: false });
+    settingsDialog.close({ restoreFocus: false });
     if (ui.moreOpen) closeMoreMenuNow();
     if (why.isOpen()) why.close(false);
     if (!keepSheet && ui.sheet) {
@@ -1200,11 +1376,17 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     return { canUndo: may && (ed?.undoStack?.length ?? 0) > 0, canRedo: may && (ed?.redoStack?.length ?? 0) > 0 };
   };
 
+  const toolKeyDisp = t => {
+    const eff = effectiveKeybinds(userSettings)[`tool.${t.id}`];
+    if (eff !== undefined) return eff ? formatCombo(eff) : "";
+    return t.keys?.[0] ? t.keys[0].toUpperCase() : "";
+  };
   function toolButton(t, extra = "") {
     const disabled = t.id !== "hand" && !S.may();
-    return h(`button.tb${S.tool === t.id ? ".on" : ""}${extra}`, { title: `${t.name}${keyLabel(t) ? " — " + keyLabel(t) : ""}`, "aria-label": t.name, "aria-pressed": String(S.tool === t.id), disabled, "data-tool": t.id,
+    const kd = toolKeyDisp(t);
+    return h(`button.tb${S.tool === t.id ? ".on" : ""}${extra}`, { title: `${t.name}${kd ? " — " + kd : ""}`, "aria-label": t.name, "aria-pressed": String(S.tool === t.id), disabled, "data-tool": t.id,
       onclick: () => { if (t.id === "image") { S.setTool("image"); openPicker(); } else S.setTool(t.id); canvas.focus(); chromeDirty = true; } },
-    h("span.ic", {}, icon(t.id, { size: 18 })), t.keys?.[0] ? h("span.k", {}, t.keys[0].toUpperCase()) : null);
+    h("span.ic", {}, icon(t.id, { size: 18 })), kd ? h("span.k", {}, kd) : null);
   }
 
   // Share (PROTOCOL.md § Share dialog): offered only when the welcome said `can.share` (members.manage on the board); if that changed mid-session the server answers 403 and the dialog says so.
@@ -1370,11 +1552,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? boardMenuItem("importFile", "Import .excalidraw", "Import .excalidraw", openExcalidrawImport, { disabled: !may }) : null,
       role === "presenter" ? boardMenuItem("mermaid", "Mermaid", "Insert Mermaid", () => openDialog("mermaid"), { disabled: !may }) : null,
     ]);
+    const effKeys = effectiveKeybinds(userSettings);
     const viewSection = menuSection("View", [
-      boardMenuItem("frame", "Jump to frame or view", "Jump to frame / view", () => openViewsMenu(), { kbd: "⌘J", badge: viewsOf(S.eds.board.doc).length ? String(viewsOf(S.eds.board.doc).length) : "" }),
+      boardMenuItem("frame", "Jump to frame or view", "Jump to frame / view", () => openViewsMenu(), { kbd: formatCombo(effKeys["action.views"]), badge: viewsOf(S.eds.board.doc).length ? String(viewsOf(S.eds.board.doc).length) : "" }),
       boardMenuItem(ui.theme === "dark" ? "sun" : "moon", "Light / dark", ui.theme === "dark" ? "Light theme" : "Dark theme", toggleTheme),
-      role === "presenter" ? boardMenuItem("grid", "Toggle grid", "Snap to grid", toggleGrid, { disabled: !may, kbd: "⌘'", badge: gridOn ? "On" : "", on: gridOn }) : null,
-      role !== "viewer" ? boardMenuItem("panel", "Side panel", "Side panel", togglePanel, { kbd: "I", badge: ui.panel.open ? "On" : "", on: ui.panel.open }) : null,
+      role === "presenter" ? boardMenuItem("grid", "Toggle grid", "Snap to grid", toggleGrid, { disabled: !may, kbd: formatCombo(effKeys["action.grid"]), badge: gridOn ? "On" : "", on: gridOn }) : null,
+      role !== "viewer" ? boardMenuItem("panel", "Side panel", "Side panel", togglePanel, { kbd: formatCombo(effKeys["action.panel"]), badge: ui.panel.open ? "On" : "", on: ui.panel.open }) : null,
+      boardMenuItem("settings", "Settings & keybindings", "Settings & keybindings…", () => openSettingsDialog(), { kbd: formatCombo(effKeys["action.settings"]) }),
     ]);
     const collabSection = menuSection("Collaborate", [
       boardMenuItem("note", "Notes", "Notes", toggleNotes, { badge: String(notesCount()), on: ui.drawer === "notes" }),
@@ -1718,6 +1902,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           : (admin ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
         canMove() ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
+        h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Settings & keybindings", onclick: () => { setSheet(null, { restore: false }); openSettingsDialog(); } }, h("span.ic", {}, icon("settings", { size: 20 })), "Settings"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
         h("button.tb", { "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark")));
     } else if (ui.sheet === "panel") body = h("div.scroll", {}, panelNodes(true));
@@ -2048,6 +2233,17 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   addEventListener("popstate", () => {
     if (ui.sheet) setSheet(null, { fromPopstate: true });
   });
+  addEventListener("hashchange", () => {
+    const next = parseDeepLink(globalThis.location);
+    if (!next) return;
+    if (S.status === "live" && S.eds.board.size.w && S.eds.board.size.h) {
+      if (!applyDeepLink(next, { animate: true })) {
+        toast(`Linked ${next.kind === "el" ? "element" : next.kind} not found`);
+      }
+    } else {
+      pendingDeepLink = next;
+    }
+  });
   addEventListener("beforeunload", /** @param {BeforeUnloadEvent} e */ e => {
     if (S.pending > 0) {
       e.preventDefault();
@@ -2083,11 +2279,25 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     if (S.mine.size !== savedMine) { savedMine = S.mine.size; put(mineKeyOf(mineUser), JSON.stringify([...S.mine].slice(-5000))); }
   }
-  // First catch-up done: show everything once.
+  // First catch-up done: resolve any deep link, or fit everything once.
   function fitOnce() {
-    if (fitted || S.status !== "live") return;
-    const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length;
+    if (S.status !== "live") return;
     if (!S.eds.board.size.w || !S.eds.board.size.h) return;
+    if (pendingDeepLink) {
+      const target = pendingDeepLink;
+      const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length || viewsOf(S.eds.board.doc).length;
+      if (hasContent && !S.gesture) {
+        pendingDeepLink = null;
+        fitted = true;
+        if (!applyDeepLink(target, { animate: true })) {
+          toast(`Linked ${target.kind === "el" ? "element" : target.kind} not found`);
+          S.fit({ animate: false });
+        }
+        return;
+      }
+    }
+    if (fitted) return;
+    const hasContent = S.eds.board.doc.live().length || S.eds.notes.doc.live().length;
     if (!hasContent) { fitted = true; return; }
     if (S.gesture) return;
     fitted = true;

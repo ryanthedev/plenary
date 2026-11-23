@@ -837,3 +837,23 @@ body.stale .watching { opacity: .45; }
 .settings-fb-select { flex: 1; min-width: 0; height: 28px; padding: 0 6px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--fg); font-size: 12px; }
 .settings-footer { justify-content: space-between !important; gap: 8px; }
 
+/* Board Version History modal (#19) */
+.versions-veil { z-index: 44; }
+.versions-modal { width: min(520px, 100%); max-height: min(78vh, 580px); display: flex; flex-direction: column; }
+.versions-body { display: flex; flex-direction: column; gap: 10px; overflow: hidden; min-height: 0; }
+.versions-form { display: flex; gap: 8px; flex-shrink: 0; }
+.versions-input { flex: 1; min-width: 0; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-subtle); color: var(--fg); font-size: 13px; }
+.versions-input:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+.versions-error { padding: 8px 10px; border-radius: 8px; background: var(--bad-bg, rgba(224, 49, 49, 0.1)); border: 1px solid var(--bad, #e03131); color: var(--fg); font-size: 12.5px; }
+.versions-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; max-height: 320px; padding-right: 2px; }
+.versions-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.versions-row:hover { background: var(--surface-hover); }
+.versions-info { flex: 1; min-width: 0; }
+.versions-label { font-size: 13px; font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.versions-meta { font-size: 11.5px; color: var(--fg-dim); margin-top: 2px; }
+.versions-acts { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.versions-del { width: 28px; height: 28px; min-width: 28px; opacity: 0.72; }
+.versions-del:hover { opacity: 1; color: var(--bad); background: var(--bad-bg); }
+.versions-empty { padding: 10px 4px; }
+.effects-sec { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+

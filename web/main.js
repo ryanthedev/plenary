@@ -30,6 +30,7 @@ import { mountSpacePage, mountGroupPage } from "./adapters/dom/spaces.js";
 import { createDialogs, randomKey } from "./adapters/dom/dialogs.js";
 import { httpAccess } from "./adapters/access/http.js";
 import { httpShare } from "./adapters/share/http.js";
+import { httpVersions } from "./adapters/versions/http.js";
 import { httpAdmin } from "./adapters/admin/http.js";
 import { httpMove } from "./adapters/move/http.js";
 import { httpTrash } from "./adapters/trash/http.js";
@@ -188,6 +189,8 @@ if (!signIn.token) {
     share: httpShare({ fetch: fetchNow, token: signIn.token, timers: clock }),
     // Move to… in the More menu (PROTOCOL.md § Move board, "Where it appears"): the same port as the Space page and Home.
     move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() },
+    // Board version history & named snapshots (#19).
+    versions: httpVersions({ fetch: fetchNow, token: signIn.token, timers: clock }),
     // The collaboration UI over this session (presence and records ride the board connection; web/adapters/collab/sync.js).
     collab: (S, o) => syncCollabPort(S, { name: me.name, ...o }),
     notice: signInNotice(/** @type {any} */ ({ ...signIn, dev: null }), me.name),

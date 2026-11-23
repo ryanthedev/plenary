@@ -62,6 +62,7 @@ export function clampMenuPosition({ x, y, width, height, viewportWidth, viewport
  *     del: () => void,
  *     group: () => void,
  *     ungroup: () => void,
+ *     tidy?: () => void,
  *     reorder: (how: "front" | "forward" | "backward" | "back") => void,
  *     moveToLayer: (layerId: string) => void,
  *     toggleLock: () => void,
@@ -86,6 +87,8 @@ export function buildCanvasMenuItems(ctx) {
     const els = (selected ?? []).filter(e => e && !isLabel(e));
     const canGroup = canWrite && els.length >= 2;
     const canUngroup = canWrite && els.some(e => Array.isArray(e.groupIds) && e.groupIds.length > 0);
+    const unlockedCount = els.filter(e => !e.locked).length;
+    const canTidy = canWrite && unlockedCount >= 2 && typeof actions.tidy === "function";
     const allLocked = els.length > 0 && els.every(e => Boolean(e.locked));
     const currentLayer = els.length === 1 ? layerOf(els[0]) : activeLayer;
 
@@ -97,10 +100,11 @@ export function buildCanvasMenuItems(ctx) {
       { id: "delete", label: "Delete", icon: "trash", shortcut: "⌫", danger: true, disabled: !canWrite, action: actions.del },
     );
 
-    if (canGroup || canUngroup) {
+    if (canGroup || canUngroup || canTidy) {
       sep();
       if (canGroup) items.push({ id: "group", label: "Group", icon: "group", shortcut: "⌘G", action: actions.group });
       if (canUngroup) items.push({ id: "ungroup", label: "Ungroup", icon: "ungroup", shortcut: "⌘⇧G", action: actions.ungroup });
+      if (canTidy) items.push({ id: "tidy", label: "Tidy selection", icon: "grid", action: actions.tidy });
     }
 
     sep();

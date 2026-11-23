@@ -10,6 +10,8 @@ import { FONT_FAMILY, fontClass } from "../../../packages/core/style.js";
 import { isShape, isLabel, layerOf } from "../../../packages/core/model.js";
 import { listNamedFrames } from "../../../packages/core/views.js";
 import { parseLibrary, mergeLibrary } from "../../../packages/core/library.js";
+import { BLEND_MODES, CLIP_SHAPES, effectsOf, normalizeEffects } from "../../../packages/core/effects.js";
+import { buildIconLibraryItems, getIconPack } from "../../../packages/core/icon-packs.js";
 import { icon } from "./icons.js";
 import { createColorPicker } from "./color-picker.js";
 
@@ -24,6 +26,7 @@ export function propsModel(ed) {
   const txt = e?.type === "text" ? e : label;
   const v = k => (e && e[k] !== undefined ? e[k] : st[k]);
   const arrow = sel.find(x => x.type === "arrow" || x.type === "line");
+  const fx = effectsOf(e);
   return {
     count: sel.length,
     strokeColor: v("strokeColor"), backgroundColor: v("backgroundColor"), strokeWidth: v("strokeWidth"), strokeStyle: v("strokeStyle"),
@@ -31,6 +34,8 @@ export function propsModel(ed) {
     font: fontClass(txt?.fontFamily ?? st.fontFamily), fontSize: txt?.fontSize ?? st.fontSize,
     arrowType: arrow ? (arrow.elbowed ? "elbow" : arrow.roundness ? "curve" : "sharp") : st.elbowed ? "elbow" : st.roundness ? "curve" : "sharp",
     heads: arrow ? [arrow.startArrowhead ?? null, arrow.endArrowhead ?? null] : [null, "arrow"],
+    blendMode: fx.blendMode,
+    clipShape: fx.clipShape,
   };
 }
 
@@ -74,6 +79,29 @@ export function loadLibrary(store) { try { return parseLibrary(store?.get(LIB_KE
 /** Save the library; a full or unavailable store (STORAGE_UNAVAILABLE) is survived: the library stays in memory. */
 export function saveLibrary(store, items) { try { store?.set(LIB_KEY, JSON.stringify({ type: "excalidrawlib", version: 2, libraryItems: items })); } catch {} }
 export function addToLibrary(items, incoming) { return mergeLibrary(items, incoming); }
+
+/**
+ * Build deterministic-ID icon pack items so repeated installs never duplicate existing icons.
+ * @param {string} packId
+ * @param {number} [now]
+ */
+export function iconPackLibraryItems(packId, now) {
+  const pack = getIconPack(packId);
+  if (!pack) return [];
+  const raw = buildIconLibraryItems(pack.id, now != null ? { now } : undefined) ?? [];
+  return raw.map((item, idx) => ({
+    ...item,
+    id: `icon-pack:${pack.id}:${pack.icons[idx]?.id ?? idx}`,
+  }));
+}
+
+/** Return true if every icon in `packId` is already present in `items`. */
+export function isIconPackInstalled(items, packId) {
+  const pack = getIconPack(packId);
+  if (!pack || !Array.isArray(items) || !items.length) return false;
+  const ids = new Set(items.map(it => it?.id));
+  return pack.icons.every(ic => ids.has(`icon-pack:${pack.id}:${ic.id}`));
+}
 
 /**
  * Build the panel into `root`. ctx: { session, state, setState(op), h, inSheet, library, setLibrary, onChange }.
@@ -135,6 +163,45 @@ export function renderPanel(root, ctx) {
       }
     }
     if (!notesOnly) {
+      if (m.count >= 1) {
+        const applyEffects = patch => act(e => {
+          const els = e.selected().filter(x => !isLabel(x) && e.doc.editable(x));
+          if (!els.length) return;
+          e.transact(tx => {
+            for (const el of els) {
+              const cur = tx.get(el.id);
+              if (!cur) continue;
+              const next = normalizeEffects({ ...effectsOf(cur), ...patch });
+              cur.customData = { ...(cur.customData ?? {}), effects: next };
+            }
+            return true;
+          });
+        });
+        const blendSel = h("select.anim-sel", {
+          "aria-label": "Blend mode",
+          "data-effect": "blendMode",
+          "data-fk": "effects:blendMode",
+          disabled: dis,
+          value: m.blendMode,
+          onchange: e => applyEffects({ blendMode: e.currentTarget.value }),
+          onkeydown: k => k.stopPropagation(),
+        }, BLEND_MODES.map(mode => h("option", { value: mode, selected: m.blendMode === mode }, mode)));
+        const clipSel = h("select.anim-sel", {
+          "aria-label": "Mask / Clip",
+          "data-effect": "clipShape",
+          "data-fk": "effects:clipShape",
+          disabled: dis,
+          value: m.clipShape,
+          onchange: e => applyEffects({ clipShape: e.currentTarget.value }),
+          onkeydown: k => k.stopPropagation(),
+        }, CLIP_SHAPES.map(shape => h("option", { value: shape, selected: m.clipShape === shape }, shape)));
+        out.push(
+          h("div.effects-sec", { "data-effects": "1" },
+            h("div.hint", { style: { margin: "8px 0 4px" } }, "Effects"),
+            row("Blend", "", blendSel),
+            row("Mask", "", clipSel)),
+        );
+      }
       out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));
       out.push(row("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
       out.push(row("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))));
@@ -145,13 +212,61 @@ export function renderPanel(root, ctx) {
   const B = S.eds.board;
   const bodies = {
     properties,
-    arrange: () => [
-      h("div.row", {}, h("span.opts", {}, [["Left", "left"], ["Right", "right"], ["Top", "top"], ["Bottom", "bottom"], ["Center H", "hcenter"], ["Center V", "vcenter"]].map(([t, w]) => chip(t, false, () => act(e => e.align(w)), `align ${w}`)))),
-      h("div.row", {}, h("span.opts", {}, chip("Dist H", false, () => act(e => e.distribute("h")), "Distribute horizontally"), chip("Dist V", false, () => act(e => e.distribute("v")), "Distribute vertically"),
-        [["Front", "front"], ["Forward", "forward"], ["Backward", "backward"], ["Back", "back"]].map(([t, w]) => chip(t, false, () => act(e => e.reorder(w)), w)))),
-      h("div.row", {}, h("span.opts", {}, chip("group", false, () => act(e => e.group()), "Group (⌘G)"), chip("ungroup", false, () => act(e => e.ungroup()), "Ungroup (⌘⇧G)"), chip("dup", false, () => act(e => e.cloneSelection(20, 20)), "Duplicate (⌘D)"), chip("lock", false, () => act(e => e.toggleLock()), "Lock (⌘⇧L)"))),
-      h("div.row", {}, h("span.opts", {}, chip("-15°", false, () => act(e => e.rotateBy(-15)), "Rotate -15°"), chip("+15°", false, () => act(e => e.rotateBy(15)), "Rotate +15°"), chip("+90°", false, () => act(e => e.rotateBy(90)), "Rotate +90°"), chip("0°", false, () => act(e => e.resetRotation()), "Reset rotation"))),
-    ],
+    arrange: () => {
+      const rows = [];
+      if (m.count >= 2) {
+        rows.push(
+          row("Align", "", [["Left", "left"], ["Center X", "hcenter"], ["Right", "right"], ["Top", "top"], ["Center Y", "vcenter"], ["Bottom", "bottom"]].map(([t, w]) =>
+            h("button.c", {
+              title: `Align ${t}`,
+              "aria-label": `Align ${t}`,
+              "data-align": w,
+              "data-fk": `arrange:align:${w}`,
+              disabled: dis,
+              onclick: () => act(e => e.alignSelection(w)),
+            }, t))),
+        );
+        if (m.count >= 3) {
+          rows.push(
+            row("Distribute", "",
+              h("button.c", {
+                title: "Distribute horizontally",
+                "aria-label": "Distribute horizontally",
+                "data-distribute": "h",
+                "data-fk": "arrange:dist:h",
+                disabled: dis,
+                onclick: () => act(e => e.distributeSelection("h")),
+              }, "Horizontal"),
+              h("button.c", {
+                title: "Distribute vertically",
+                "aria-label": "Distribute vertically",
+                "data-distribute": "v",
+                "data-fk": "arrange:dist:v",
+                disabled: dis,
+                onclick: () => act(e => e.distributeSelection("v")),
+              }, "Vertical")),
+          );
+        }
+        rows.push(
+          row("Layout", "",
+            h("button.c", {
+              title: "Tidy selection into neat row, column, or grid",
+              "aria-label": "Tidy selection",
+              "data-action": "tidy",
+              "data-fk": "arrange:tidy",
+              disabled: dis,
+              onclick: () => act(e => e.tidySelection()),
+            }, "Tidy")),
+        );
+      }
+      rows.push(
+        h("div.row", {}, h("span.opts", {},
+          [["Front", "front"], ["Forward", "forward"], ["Backward", "backward"], ["Back", "back"]].map(([t, w]) => chip(t, false, () => act(e => e.reorder(w)), w)))),
+        h("div.row", {}, h("span.opts", {}, chip("group", false, () => act(e => e.group()), "Group (⌘G)"), chip("ungroup", false, () => act(e => e.ungroup()), "Ungroup (⌘⇧G)"), chip("dup", false, () => act(e => e.cloneSelection(20, 20)), "Duplicate (⌘D)"), chip("lock", false, () => act(e => e.toggleLock()), "Lock (⌘⇧L)"))),
+        h("div.row", {}, h("span.opts", {}, chip("-15°", false, () => act(e => e.rotateBy(-15)), "Rotate -15°"), chip("+15°", false, () => act(e => e.rotateBy(15)), "Rotate +15°"), chip("+90°", false, () => act(e => e.rotateBy(90)), "Rotate +90°"), chip("0°", false, () => act(e => e.resetRotation()), "Reset rotation"))),
+      );
+      return rows;
+    },
     frames: () => {
       const fs = listNamedFrames(B.doc);
       const goFrame = id => { if (ctx.onJumpFrame) ctx.onJumpFrame(id); else S.goToFrame(id); ctx.onChange(); };
@@ -275,10 +390,35 @@ export function renderPanel(root, ctx) {
     },
     library: () => {
       const items = ctx.library ?? [];
+      const k8sInstalled = isIconPackInstalled(items, "kubernetes");
+      const cloudInstalled = isIconPackInstalled(items, "cloud");
+      const installPack = packId => {
+        const packItems = iconPackLibraryItems(packId, ctx.clock?.now());
+        if (!packItems.length) return;
+        const next = addToLibrary(items, packItems);
+        if (next.length !== items.length) ctx.setLibrary(next);
+      };
       return [
         h("div.lib", {}, items.map((it, i) => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, "data-fk": `lib:${it.id ?? i}`, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")))),
-        h("div.row", { style: { marginTop: "8px" } }, h("span.opts", {}, chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)"))),
-        h("div.hint", {}, items.length ? "Click an item to insert it. Drop a .excalidrawlib to add." : "Empty. Select shapes and save them, or drop a .excalidrawlib."),
+        h("div.row", { style: { marginTop: "8px" } }, h("span.opts", {},
+          chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)"),
+          h("button.c" + (k8sInstalled ? ".on" : ""), {
+            type: "button",
+            title: k8sInstalled ? "Kubernetes pack installed" : "Install Kubernetes vector icon pack",
+            "aria-label": "Install Kubernetes pack",
+            "data-icon-pack": "kubernetes",
+            "data-fk": "lib:pack:kubernetes",
+            onclick: () => installPack("kubernetes"),
+          }, "＋ Kubernetes pack"),
+          h("button.c" + (cloudInstalled ? ".on" : ""), {
+            type: "button",
+            title: cloudInstalled ? "Cloud pack installed" : "Install Cloud & Architecture vector icon pack",
+            "aria-label": "Install Cloud pack",
+            "data-icon-pack": "cloud",
+            "data-fk": "lib:pack:cloud",
+            onclick: () => installPack("cloud"),
+          }, "＋ Cloud pack"))),
+        h("div.hint", {}, items.length ? "Click an item to insert it. Drop a .excalidrawlib to add." : "Empty. Select shapes and save them, install an icon pack, or drop a .excalidrawlib."),
       ];
     },
   };

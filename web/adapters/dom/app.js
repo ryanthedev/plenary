@@ -9,13 +9,14 @@ import { trapFocus, hasActiveOverlay } from "./a11y.js";
 import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth } from "../../../packages/core/panel.js";
 import { isMermaid } from "../../../packages/core/mermaid.js";
-import { isLabel, layerOf } from "../../../packages/core/model.js";
+import { isLabel, layerOf, BASE_LAYER } from "../../../packages/core/model.js";
 import { listNamedFrames, viewsOf, addView, deleteView, resolveLocalLayers, captureCurrentView, stepViewIndex } from "../../../packages/core/views.js";
 import { parseLinkCardUrl, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "../../../packages/core/link-card.js";
 import { parseEmbedUrl, parseEmbedFromElement, embedPlayButtonRect } from "../../../packages/core/embed.js";
 import { buildTemplateScene, getTemplate } from "../../../packages/core/templates.js";
 import { parseLibrary } from "../../../packages/core/library.js";
 import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
+import { isDrawio, parseDrawio, MAX_DRAWIO_BYTES } from "../../../packages/core/drawio.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
 
@@ -43,6 +44,7 @@ import { consumePendingTemplate } from "./home.js";
 import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
 import { createViewsMenu } from "./views-menu.js";
 import { createSettingsDialog } from "./settings-dialog.js";
+import { createVersionsDialog } from "./versions-dialog.js";
 import {
   loadSettings,
   saveSettings,
@@ -85,7 +87,8 @@ export function formatDocumentTitle(displayTitle) {
  *           collab?: ((S: any, o: { jumpTo(p: { x: number, y: number, scale?: number }): void }) => any) | null,
  *           clock: import("../../ports/clock.js").Clock, expAt?: number | null,
  *           relogin?: { href: string, go(): void } | null, admin?: any, homeHref?: string | null,
- *           access?: any, newKey?: (() => string) | null, share?: any, move?: any, trashShown?: () => boolean,
+ *           access?: any, newKey?: (() => string) | null, share?: any, move?: any,
+ *           versions?: import("../../ports/versions.js").VersionsPort | null, trashShown?: () => boolean,
  *           boardTitle?: string | null, getBoardTitle?: (() => Promise<any>) | null,
  *           renameBoard?: ((title: string) => Promise<any>) | null }} o
  *   collab: the root's collab port factory (web/ports/collab.js; production and dev: web/adapters/collab/sync.js over
@@ -100,7 +103,7 @@ export function formatDocumentTitle(displayTitle) {
  *   homeHref: where the top bar's Home link goes (the Home screen); null = no link (dev rooms).
  * @returns {{ S: any, ui: any, net: any, collab: any, port: any, setTheme(t: string): void, openDialog(d: string): void, openShare(): any, setPanel(op: any): void, startComment(p: { x: number, y: number }): void }}
  */
-export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, trashShown = () => false, boardTitle = null, getBoardTitle = null, renameBoard = null }) {
+export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = null, notice = null, collab: collabPort = null, clock, expAt = null, relogin = null, admin = null, homeHref = null, access = null, newKey = null, share = null, move = null, versions = null, trashShown = () => false, boardTitle = null, getBoardTitle = null, renameBoard = null }) {
   if (!clock || typeof clock.now !== "function" || typeof clock.mono !== "function") throw new Error("mountApp: the clock port is required");
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
@@ -421,6 +424,132 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     settingsDialog.open({ opener: savedOpener, tab });
   }
 
+  // ── Board Version History & Named Snapshots (#19) ──
+  function parseSnapshotHerdr(snap) {
+    const rawApp = snap.appState;
+    if (rawApp !== undefined && (!rawApp || typeof rawApp !== "object" || Array.isArray(rawApp))) return null;
+    const rawHerdr = rawApp?.herdr;
+    if (rawHerdr !== undefined && (!rawHerdr || typeof rawHerdr !== "object" || Array.isArray(rawHerdr))) return null;
+    const herdr = rawHerdr ?? {};
+
+    let layers = [{ id: BASE_LAYER, name: "Layer 1", visible: true, locked: false }];
+    if (herdr.layers !== undefined) {
+      if (!Array.isArray(herdr.layers) || herdr.layers.length === 0) return null;
+      const seenIds = new Set();
+      const validLayers = [];
+      for (const l of herdr.layers) {
+        if (!l || typeof l !== "object" || Array.isArray(l) || typeof l.id !== "string" || !l.id.trim() || l.id.length > 64) return null;
+        if (seenIds.has(l.id)) continue;
+        seenIds.add(l.id);
+        validLayers.push({
+          id: l.id,
+          name: typeof l.name === "string" ? l.name.slice(0, 80) : "",
+          visible: l.visible !== false,
+          locked: Boolean(l.locked),
+        });
+      }
+      if (!validLayers.length) return null;
+      layers = validLayers;
+    }
+
+    let views = [];
+    if (herdr.views !== undefined) {
+      if (!Array.isArray(herdr.views) || herdr.views.some(v => !v || typeof v !== "object" || Array.isArray(v))) return null;
+      views = JSON.parse(JSON.stringify(herdr.views));
+    }
+
+    let timeline = null;
+    if (herdr.timeline !== undefined && herdr.timeline !== null) {
+      if (typeof herdr.timeline !== "object" || Array.isArray(herdr.timeline)) return null;
+      timeline = JSON.parse(JSON.stringify(herdr.timeline));
+    }
+
+    let grid = 0;
+    if (herdr.grid !== undefined) {
+      if (typeof herdr.grid !== "number" || !Number.isFinite(herdr.grid) || herdr.grid < 0) return null;
+      grid = herdr.grid;
+    }
+
+    return { layers, views, timeline, grid };
+  }
+  function restoreVersionSnapshot(version) {
+    if (S.role !== "presenter" || !S.may()) return false;
+    const snap = version?.snapshot;
+    if (!snap || typeof snap !== "object" || Array.isArray(snap) || !Array.isArray(snap.elements)) return false;
+    const herdrPatch = parseSnapshotHerdr(snap);
+    if (!herdrPatch) return false;
+    const restoredById = new Map();
+    for (const raw of snap.elements) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.id !== "string" || !raw.id || typeof raw.type !== "string" || raw.isDeleted) continue;
+      restoredById.set(raw.id, raw);
+    }
+    const files = snap.files && typeof snap.files === "object" && !Array.isArray(snap.files) && Object.keys(snap.files).length
+      ? snap.files
+      : undefined;
+    let applied = false;
+    S.act("board", ed => {
+      const ok = Boolean(ed.transact(tx => {
+        for (const liveEl of ed.doc.live()) {
+          if (!restoredById.has(liveEl.id)) {
+            const c = tx.get(liveEl.id);
+            if (c) c.isDeleted = true;
+          }
+        }
+        for (const [id, raw] of restoredById) {
+          const existing = ed.doc.getAny(id);
+          if (existing) {
+            const c = tx.get(id);
+            if (!c) continue;
+            const maxVer = Math.max(c.version ?? 0, Number.isFinite(raw.version) ? raw.version : 0);
+            for (const k of Object.keys(c)) delete c[k];
+            Object.assign(c, JSON.parse(JSON.stringify(raw)));
+            c.isDeleted = false;
+            c.version = maxVer;
+          } else {
+            const next = JSON.parse(JSON.stringify(raw));
+            next.isDeleted = false;
+            tx.add(next);
+          }
+        }
+        return true;
+      }, files ? { files } : undefined));
+      if (ok) {
+        applied = true;
+      }
+    });
+    if (!applied) return false;
+    S.act("board", ed => {
+      ed.setAppState(herdrPatch);
+      ed.fixLayer();
+      ed.select([]);
+    }, { settings: true });
+    dirty = true;
+    chromeDirty = true;
+    toast(`Restored version: ${version.label}`, 2200);
+    return true;
+  }
+  const versionsDialog = versions
+    ? createVersionsDialog({
+      host: document.body,
+      doc: document,
+      board,
+      versions,
+      clock,
+      canWrite: () => S.role === "presenter" && S.may(),
+      getSnapshot: () => S.eds.board.doc.toScene(),
+      onRestore: restoreVersionSnapshot,
+      onToast: (msg, ms) => toast(msg, ms),
+      onRestoreFocus: saved => restoreOpener(saved, visibleControl([".header-more", "[data-dock-more]"]) ?? canvas),
+    })
+    : null;
+  function openVersionsDialog(opener = null) {
+    if (!versionsDialog) return;
+    if (versionsDialog.isOpen()) { versionsDialog.close({ restoreFocus: true }); return; }
+    const savedOpener = captureOpener(opener);
+    dismissOverlays();
+    versionsDialog.open({ opener: savedOpener });
+  }
+
   // ── Deep Links to Frame / Element / View (#22) ──
   let pendingDeepLink = parseDeepLink(globalThis.location);
   function applyDeepLink(target, { animate = true } = {}) {
@@ -547,6 +676,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         del: () => { S.act(stream, x => x.deleteIds([...x.sel])); chromeDirty = true; },
         group: () => { S.act(stream, x => x.group()); chromeDirty = true; },
         ungroup: () => { S.act(stream, x => x.ungroup()); chromeDirty = true; },
+        tidy: () => { S.act(stream, x => x.tidySelection()); chromeDirty = true; },
         reorder: how => { S.act(stream, x => x.reorder(how)); chromeDirty = true; },
         moveToLayer: layerId => { S.act("board", x => x.moveToLayer(layerId)); chromeDirty = true; },
         toggleLock: () => { S.act(stream, x => x.toggleLock()); chromeDirty = true; },
@@ -1172,13 +1302,42 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       toast("That isn't a valid .excalidraw file");
     }
   }
+  async function addDrawioFile(file, at) {
+    if (!S.may()) return false;
+    if (file.size > MAX_DRAWIO_BYTES) { toast("That .drawio file is too large (max 10 MB)"); return false; }
+    try {
+      const text = await file.text();
+      if (!isDrawio(text)) { toast("That isn't a valid .drawio file"); return false; }
+      const parsed = parseDrawio(text, { now: clock.now() });
+      if (!parsed.ok) { toast(parsed.error || "That isn't a valid .drawio file"); return false; }
+      if (!parsed.elements.length) { toast("No elements in that .drawio file"); return false; }
+      if (!S.may()) return false;
+      const stream = S.role === "presenter" ? S.active : "notes";
+      let ids = [];
+      S.act(stream, ed => {
+        ids = ed.insertElements(parsed.elements, {}, at);
+      });
+      chromeDirty = true;
+      if (ids.length) {
+        const n = parsed.elements.filter(e => !isLabel(e)).length || ids.length;
+        const from = file.name ? ` from ${file.name}` : "";
+        toast(`Imported ${n} element${n === 1 ? "" : "s"}${from}`);
+        return true;
+      }
+      return false;
+    } catch {
+      toast("That isn't a valid .drawio file");
+      return false;
+    }
+  }
   async function addLibraryFile(file) {
     try { const items = parseLibrary(await file.text()); if (!items.length) return toast("No library items in that file"); setLibrary(addToLibrary(ui.library, items)); toast(`Library: ${items.length} added`); }
     catch { toast("That isn't an .excalidrawlib file"); }
   }
   function takeFiles(files, at) {
     for (const f of files) {
-      if (/\.excalidraw$/i.test(f.name)) addExcalidrawFile(f, at);
+      if (/\.(drawio|xml)$/i.test(f.name)) addDrawioFile(f, at);
+      else if (/\.(excalidraw|json)$/i.test(f.name)) addExcalidrawFile(f, at);
       else if (/\.excalidrawlib$/i.test(f.name)) addLibraryFile(f);
       else if (f.type?.startsWith("video/")) addVideoFile(f, at);
       else addPicture(f, at);
@@ -1367,6 +1526,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     contextMenu.close({ restoreFocus: false });
     viewsMenu.close({ restoreFocus: false });
     settingsDialog.close({ restoreFocus: false });
+    versionsDialog?.close({ restoreFocus: false });
     if (ui.moreOpen) closeMoreMenuNow();
     if (why.isOpen()) why.close(false);
     if (!keepSheet && ui.sheet) {
@@ -1598,6 +1758,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? boardMenuItem("importFile", "Import .excalidraw", "Import .excalidraw", openExcalidrawImport, { disabled: !may }) : null,
       role === "presenter" ? boardMenuItem("mermaid", "Mermaid", "Insert Mermaid", () => openDialog("mermaid"), { disabled: !may }) : null,
       role === "presenter" ? boardMenuItem("play", "Embed URL", "Embed URL…", () => openDialog("embed"), { disabled: !may }) : null,
+      versions ? boardMenuItem("history", "Version history", "Version history…", () => openVersionsDialog()) : null,
     ]);
     const effKeys = effectiveKeybinds(userSettings);
     const viewSection = menuSection("View", [
@@ -1949,6 +2110,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openShareDialog(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share")
           : (admin ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => { setSheet(null, { restore: false }); openAdminShare(); } }, h("span.ic", {}, icon("share", { size: 20 })), "Share") : null),
         canMove() ? h("button.tb", { "aria-haspopup": "dialog", onclick: () => openMoveDialog() }, h("span.ic", {}, icon("moveToLayer", { size: 20 })), "Move to…") : null,
+        versions ? h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Version history", onclick: () => { setSheet(null, { restore: false }); openVersionsDialog(); } }, h("span.ic", {}, icon("history", { size: 20 })), "Versions") : null,
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Settings & keybindings", onclick: () => { setSheet(null, { restore: false }); openSettingsDialog(); } }, h("span.ic", {}, icon("settings", { size: 20 })), "Settings"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
@@ -1962,7 +2124,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   const panelNodes = (inSheet = false) => renderPanel(null, {
     session: S, state: ui.panel, h, inSheet, library: ui.library, setLibrary, setState: setPanel,
-    prefs, canvas, colorPicker: ui.colorPicker, colorPickerState: ui.colorPickerState,
+    prefs, canvas, clock, colorPicker: ui.colorPicker, colorPickerState: ui.colorPickerState,
     setColorPicker: prop => { cancelActiveSampler(); ui.colorPicker = prop; chromeDirty = true; },
     localView: resolvedLocalView(),
     onSoloLayer: toggleSoloLayer,

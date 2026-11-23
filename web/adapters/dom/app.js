@@ -362,6 +362,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     onSaveView: name => saveCurrentView(name),
     onDeleteView: id => { deleteSavedView(id); },
     onResetLocalView: () => { resetLocalView(); },
+    onSoloLayer: id => { toggleSoloLayer(id); },
     onRestoreFocus: saved => restoreOpener(saved, visibleControl(["[data-views-open]"]) ?? canvas),
     onClose: () => {
       const btn = document.querySelector?.("[data-views-open]");

@@ -1,14 +1,14 @@
 // A real server on an ephemeral port with a temp data dir, plus socket clients, for test/server.
 import { join } from "node:path";
-import { createServer } from "../../server/server.js";
-import { createLogger } from "../../server/log.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { diskBlobs } from "../../server/blobs/disk.js";
-import { authPort } from "../../server/auth/port.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy, roleCache } from "../../server/auth/tenancy.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { createLogger } from "../../server/core/log.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
+import { diskBlobs } from "../../server/adapters/driven/blobs/disk.js";
+import { authPort } from "../../server/ports/auth.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy, roleCache } from "../../server/core/auth/tenancy.js";
 import { Replica } from "../../packages/protocol/replica.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
 import { tempDir, sleep, until, testNets } from "./helpers.js";

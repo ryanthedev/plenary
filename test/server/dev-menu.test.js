@@ -195,11 +195,11 @@ test("a name the Registry removes after start is warned about once per name, not
 });
 
 test("a slow Registry gets 503 within the bound (not a dropped connection), with one short warn and no token in it", async () => {
-  const { httpRoutes } = await import("../../server/auth/http.js");
-  const { memoryRegistry } = await import("../../server/auth/registry.js");
-  const { sessions } = await import("../../server/auth/session.js");
-  const { tenancy } = await import("../../server/auth/tenancy.js");
-  const { devAuth } = await import("../../server/auth/dev.js");
+  const { httpRoutes } = await import("../../server/adapters/driving/auth-http.js");
+  const { memoryRegistry } = await import("../../server/adapters/driven/auth/registry.js");
+  const { sessions } = await import("../../server/adapters/driven/auth/session.js");
+  const { tenancy } = await import("../../server/core/auth/tenancy.js");
+  const { devAuth } = await import("../../server/adapters/driven/auth/dev.js");
   const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: () => new Promise(() => {}) };
   const warns = [];
   const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { "SECRET-t": { name: "ada" } } }),
@@ -225,9 +225,9 @@ test("a Registry that cannot answer publishes nothing (fails closed)", async () 
 });
 
 test("a Registry that fails at start turns the menu OFF with one warn line; the start does not throw (cluster fakes)", async () => {
-  const { sqliteStore } = await import("../../server/store/sqlite.js");
-  const { sqliteRegistry } = await import("../../server/registry/sqlite.js");
-  const { memoryBus } = await import("../../server/bus/memory.js");
+  const { sqliteStore } = await import("../../server/adapters/driven/store/sqlite.js");
+  const { sqliteRegistry } = await import("../../server/adapters/driven/registry/sqlite.js");
+  const { memoryBus } = await import("../../server/adapters/driven/bus/memory.js");
   const lines = [];
   const adapters = {
     postgresStore: async () => ({ ...sqliteStore({ path: join(tempDir(), "p.db") }), clusterId: async () => "c-aaaaaaaaaaaaaaaa" }),
@@ -245,11 +245,11 @@ test("a Registry that fails at start turns the menu OFF with one warn line; the 
 });
 
 test("a Registry that throws at request time: 503 and a short 'Registry failed' warn", async () => {
-  const { httpRoutes } = await import("../../server/auth/http.js");
-  const { memoryRegistry } = await import("../../server/auth/registry.js");
-  const { sessions } = await import("../../server/auth/session.js");
-  const { tenancy } = await import("../../server/auth/tenancy.js");
-  const { devAuth } = await import("../../server/auth/dev.js");
+  const { httpRoutes } = await import("../../server/adapters/driving/auth-http.js");
+  const { memoryRegistry } = await import("../../server/adapters/driven/auth/registry.js");
+  const { sessions } = await import("../../server/adapters/driven/auth/session.js");
+  const { tenancy } = await import("../../server/core/auth/tenancy.js");
+  const { devAuth } = await import("../../server/adapters/driven/auth/dev.js");
   const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async () => { throw new Error("SECRET connection string"); } };
   const warns = [];
   const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { "SECRET-t": { name: "ada" } } }),
@@ -262,11 +262,11 @@ test("a Registry that throws at request time: 503 and a short 'Registry failed' 
 });
 
 test("the Registry gets the bound so it can cancel its own query (timeoutMs is passed through)", async () => {
-  const { httpRoutes } = await import("../../server/auth/http.js");
-  const { memoryRegistry } = await import("../../server/auth/registry.js");
-  const { sessions } = await import("../../server/auth/session.js");
-  const { tenancy } = await import("../../server/auth/tenancy.js");
-  const { devAuth } = await import("../../server/auth/dev.js");
+  const { httpRoutes } = await import("../../server/adapters/driving/auth-http.js");
+  const { memoryRegistry } = await import("../../server/adapters/driven/auth/registry.js");
+  const { sessions } = await import("../../server/adapters/driven/auth/session.js");
+  const { tenancy } = await import("../../server/core/auth/tenancy.js");
+  const { devAuth } = await import("../../server/adapters/driven/auth/dev.js");
   let seen;
   const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async (u, o) => { seen = o; return []; } };
   const handle = httpRoutes({ registry, sessions: await sessions({ key: "s".repeat(32) }), tenancy: tenancy({ registry }), dev: devAuth({ enabled: true, tokens: { t: { name: "ada" } } }),
@@ -277,11 +277,11 @@ test("the Registry gets the bound so it can cancel its own query (timeoutMs is p
 });
 
 test("a fractional waitMs is rounded to whole ms before it reaches the Registry (Postgres ignores a fractional bound)", async () => {
-  const { httpRoutes } = await import("../../server/auth/http.js");
-  const { memoryRegistry } = await import("../../server/auth/registry.js");
-  const { sessions } = await import("../../server/auth/session.js");
-  const { tenancy } = await import("../../server/auth/tenancy.js");
-  const { devAuth } = await import("../../server/auth/dev.js");
+  const { httpRoutes } = await import("../../server/adapters/driving/auth-http.js");
+  const { memoryRegistry } = await import("../../server/adapters/driven/auth/registry.js");
+  const { sessions } = await import("../../server/adapters/driven/auth/session.js");
+  const { tenancy } = await import("../../server/core/auth/tenancy.js");
+  const { devAuth } = await import("../../server/adapters/driven/auth/dev.js");
   const seen = [];
   const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async (u, o) => { seen.push(o.timeoutMs); return []; } };
   for (const waitMs of [1234.6, 0.2, 2.5]) {
@@ -294,11 +294,11 @@ test("a fractional waitMs is rounded to whole ms before it reaches the Registry 
 });
 
 test("a huge waitMs is clamped to 2^31-1 (a bigger delay would overflow the timer and fire at once)", async () => {
-  const { httpRoutes } = await import("../../server/auth/http.js");
-  const { memoryRegistry } = await import("../../server/auth/registry.js");
-  const { sessions } = await import("../../server/auth/session.js");
-  const { tenancy } = await import("../../server/auth/tenancy.js");
-  const { devAuth } = await import("../../server/auth/dev.js");
+  const { httpRoutes } = await import("../../server/adapters/driving/auth-http.js");
+  const { memoryRegistry } = await import("../../server/adapters/driven/auth/registry.js");
+  const { sessions } = await import("../../server/adapters/driven/auth/session.js");
+  const { tenancy } = await import("../../server/core/auth/tenancy.js");
+  const { devAuth } = await import("../../server/adapters/driven/auth/dev.js");
   const seen = [];
   let slow = false;
   const registry = { ...memoryRegistry({ now: Date.now }), tenantAdminsAmong: async (u, o) => { seen.push(o.timeoutMs); if (slow) await Bun.sleep(30); return []; } };
@@ -314,9 +314,9 @@ test("a huge waitMs is clamped to 2^31-1 (a bigger delay would overflow the time
 });
 
 test("the start-up OFF warn's cause: a SQLSTATE first, then code, then name; a hand-built code with ':' or '.' (user:pw) never gets through", async () => {
-  const { sqliteStore } = await import("../../server/store/sqlite.js");
-  const { sqliteRegistry } = await import("../../server/registry/sqlite.js");
-  const { memoryBus } = await import("../../server/bus/memory.js");
+  const { sqliteStore } = await import("../../server/adapters/driven/store/sqlite.js");
+  const { sqliteRegistry } = await import("../../server/adapters/driven/registry/sqlite.js");
+  const { memoryBus } = await import("../../server/adapters/driven/bus/memory.js");
   const cases = [
     [{ code: "ERR_POSTGRES_SERVER_ERROR" }, "(ERR_POSTGRES_SERVER_ERROR)"],
     [{ code: "user:pw" }, "(Error)"], [{ code: "a.b" }, "(Error)"], [{ code: "ok_code", errno: "not a state" }, "(ok_code)"],

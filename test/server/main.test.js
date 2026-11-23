@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { inflateSync } from "node:zlib";
 import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
 
 afterAll(cleanup);
 const MAIN = new URL("../../server/main.js", import.meta.url).pathname;

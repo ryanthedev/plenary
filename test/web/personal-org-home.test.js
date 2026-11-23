@@ -3,11 +3,11 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy } from "../../server/auth/tenancy.js";
-import { homeService } from "../../server/auth/home.js";
-import { sessions as createSessions } from "../../server/auth/session.js";
-import { httpRoutes } from "../../server/auth/http.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { sessions as createSessions } from "../../server/adapters/driven/auth/session.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
 import { httpHome } from "../../web/adapters/home/http.js";
 import { httpAdmin } from "../../web/adapters/admin/http.js";
 import { createHomeModel } from "../../web/core/home.js";

@@ -4,7 +4,7 @@ import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { rmSync, readdirSync } from "node:fs";
-import { sqliteStore } from "../../server/store/sqlite.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
 import { storeContract, entry, code } from "./store-contract.js";
 import { tempDir, cleanup } from "./helpers.js";
 

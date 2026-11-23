@@ -10,15 +10,15 @@ import { Editor } from "../../packages/core/editor.js";
 import { makeElement } from "../../packages/core/model.js";
 import { openLink, docDiff, seeded } from "../../web/core/sync.js";
 import { wsNet, httpSnapshotFetcher } from "../../web/adapters/transport/ws.js";
-import { createServer } from "../../server/server.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { authPort } from "../../server/auth/port.js";
-import { httpRoutes } from "../../server/auth/http.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { authPort } from "../../server/ports/auth.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
 
 /** Build a minimal valid snapshot message at `seq` with board elements. */
 function makeSnapshot(seq, elements = []) {

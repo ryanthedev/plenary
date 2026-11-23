@@ -21,11 +21,11 @@
 //
 // Secrets: the client id and secret are never logged. Logs carry method, path (no query string) and status only.
 
-import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../server/auth/http.js";
-import { googleOidc } from "../server/auth/oidc.js";
-import { sessions as makeSessions } from "../server/auth/session.js";
-import { memoryRegistry } from "../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../server/auth/tenancy.js";
+import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../server/adapters/driving/auth-http.js";
+import { googleOidc } from "../server/adapters/driven/auth/oidc.js";
+import { sessions as makeSessions } from "../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../server/core/auth/tenancy.js";
 
 export const PORT = 8080;
 export const ORIGIN = `http://localhost:${PORT}`;

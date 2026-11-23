@@ -18,7 +18,7 @@ import { localRoom } from "../../web/adapters/transport/local.js";
 import { bindEditor } from "../../web/core/sync.js";
 import { createSession } from "../../web/core/session.js";
 import { collabPort } from "../../web/core/collab/port.js";
-import { blobRoutes } from "../../server/blob-http.js";
+import { blobRoutes } from "../../server/adapters/driving/blob-http.js";
 
 describe("H1: op chunking and single-element size guard", () => {
   test("insertElements and undo chunk 3,500+ elements into <=512 KB ops that all pass opProblem and sync cleanly", () => {

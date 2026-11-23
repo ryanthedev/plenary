@@ -34,7 +34,7 @@ import { describe, test, expect } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT, listFiles, importsOf, checkBoundaries } from "../arch-scan.js";
-import { denied } from "../../server/static.js";
+import { denied } from "../../server/adapters/driving/static.js";
 
 /** Every relative edge of a web/ file, `new URL(…, import.meta.url)` included (kind "url"). */
 const edgesOf = (f, src) => importsOf(f, src, ROOT, { urls: true });

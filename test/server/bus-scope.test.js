@@ -2,9 +2,9 @@
 // handlers see the subject without it, and two clusters on one bus never hear each other. Memory bus: no server needed;
 // the same isolation on a real NATS is test/server/cluster-isolation.test.js.
 import { test, expect } from "bun:test";
-import { memoryBus } from "../../server/bus/memory.js";
-import { subjects, scopeBus } from "../../server/bus/port.js";
-import { isClusterId } from "../../server/ids.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { subjects, scopeBus } from "../../server/ports/bus.js";
+import { isClusterId } from "../../server/core/ids.js";
 import { sleep } from "./helpers.js";
 
 const A = "c-aaaaaaaaaaaaaaaa", B = "c-bbbbbbbbbbbbbbbb";

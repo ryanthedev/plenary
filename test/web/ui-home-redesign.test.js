@@ -8,7 +8,7 @@ import { mountHome, PENDING_TEMPLATE_KEY, consumePendingTemplate } from "../../w
 import { createDialogs } from "../../web/adapters/dom/dialogs.js";
 import { createHomeModel } from "../../web/core/home.js";
 import { virtualClock } from "../../web/adapters/clock/virtual.js";
-import { staticSite } from "../../server/static.js";
+import { staticSite } from "../../server/adapters/driving/static.js";
 
 const card = (id, o = {}) => ({
   id,

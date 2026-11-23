@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
 
 test("accessContext(s): same statement count for existing, unknown and other-type ids, per scope type", async () => {
   let count = 0;

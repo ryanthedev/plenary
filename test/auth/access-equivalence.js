@@ -4,13 +4,13 @@
 // on Spaces, Groups and boards, custom roles, direct grants, live / expiring / revoked invites and links, a second Unit in the same
 // batch, guests and Unit admins; checked with the content tier absent and held by the admin.
 import { test, expect } from "bun:test";
-import { tenancy } from "../../server/auth/tenancy.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
 
 const ROLES = ["viewer", "commenter", "annotator", "editor", "owner"], GENERAL = [null, "viewer", "annotator", "editor"];
 
 /**
  * @param {string} name
- * @param {(o: { now: () => number }) => Promise<import("../../server/auth/registry-port.js").Registry>} makeRegistry
+ * @param {(o: { now: () => number }) => Promise<import("../../server/ports/registry.js").Registry>} makeRegistry
  * @param {{ seeds?: number[], cleanup?: (r: any) => Promise<void>|void }} [o]
  */
 export function accessEquivalence(name, makeRegistry, { seeds = [7, 19, 101], cleanup } = {}) {

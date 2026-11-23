@@ -15,8 +15,8 @@ const IDENTITY_KEYS = ["domain", "email", "name", "user"];
 
 /**
  * @param {string} name
- * @param {() => Promise<{ idp: import("../../server/auth/idp-port.js").IdP,
- *   authorize(begun: object): Promise<string>, expected: import("../../server/auth/idp-port.js").Identity,
+ * @param {() => Promise<{ idp: import("../../server/ports/idp.js").IdP,
+ *   authorize(begun: object): Promise<string>, expected: import("../../server/ports/idp.js").Identity,
  *   outage?: (on: boolean) => void }>} make
  */
 export function idpContract(name, make) {

@@ -5,14 +5,14 @@
 import { test, expect, afterAll, describe } from "bun:test";
 import { join } from "node:path";
 import { SQL } from "bun";
-import { roomHost } from "../../server/room-host.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { postgresStore } from "../../server/store/postgres.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { roomHost } from "../../server/core/room-host.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
 import { cleanup, tempDir, until } from "./helpers.js";
-import { createLogger } from "../../server/log.js";
+import { createLogger } from "../../server/core/log.js";
 
 afterAll(cleanup);
 const T = "t-aaa", B = "b-one";

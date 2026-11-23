@@ -2,9 +2,9 @@
 import { test, expect, afterAll } from "bun:test";
 import { readdirSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { diskBlobs, imageKind, MAX_BLOB_BYTES } from "../../server/blobs/disk.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { createLogger } from "../../server/log.js";
+import { diskBlobs, imageKind, MAX_BLOB_BYTES } from "../../server/adapters/driven/blobs/disk.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
+import { createLogger } from "../../server/core/log.js";
 import { tempDir, cleanup, fakePng, sha1 } from "./helpers.js";
 
 afterAll(cleanup);

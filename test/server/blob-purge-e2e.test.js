@@ -3,7 +3,7 @@
 import { test, expect, afterAll } from "bun:test";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, fakePng, sha1, until } from "./helpers.js";
-import { BLOB_PENDING_MS } from "../../server/blobs/port.js";
+import { BLOB_PENDING_MS } from "../../server/ports/blobs.js";
 
 afterAll(cleanup);
 const H1 = "a".repeat(40), H2 = "b".repeat(40);

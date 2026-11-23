@@ -2,13 +2,13 @@
 // `unavailable` within config.requestDeadlineMs when the Registry (or Sessions, or the IdP) is slow, on VIRTUAL time, and a late result
 // is dropped. The guard test enumerates the route table, so a route added later has to be classified here or the suite fails.
 import { test, expect, beforeEach } from "bun:test";
-import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { homeService } from "../../server/auth/home.js";
-import { googleOidc } from "../../server/auth/oidc.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { googleOidc } from "../../server/adapters/driven/auth/oidc.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 const ORIGIN = "https://plenary.test";

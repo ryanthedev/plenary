@@ -1,11 +1,11 @@
 // HTTP & announcingRegistry tests for board lifecycle: PATCH /boards/:board and DELETE /boards/:board.
 import { describe, test, expect, beforeEach } from "bun:test";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy, roleCache, identityKey } from "../../server/auth/tenancy.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { subjects } from "../../server/bus/port.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy, roleCache, identityKey } from "../../server/core/auth/tenancy.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { subjects } from "../../server/ports/bus.js";
 import { announcingRegistry } from "../../server/main.js";
 
 const ORIGIN = "https://plenary.test";

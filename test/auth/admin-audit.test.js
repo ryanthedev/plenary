@@ -3,11 +3,11 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
 
 const ORIGIN = "https://plenary.test";
 const config = {

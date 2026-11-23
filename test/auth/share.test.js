@@ -2,12 +2,12 @@
 // PERMISSION, never a role name), what GET /boards/:board/share lists (live ones, guests tagged, nothing for anyone else), the invite's 30-day
 // default, the guest/owner cap, and idempotent revoke. Over the HTTP routes with the in-memory Registry.
 import { test, expect, beforeEach } from "bun:test";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { INVITE_TTL_MS } from "../../server/admin/boards.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { INVITE_TTL_MS } from "../../server/core/admin/boards.js";
 import { mkBoard } from "./fixtures.js";
 
 const ORIGIN = "https://plenary.test";
@@ -207,7 +207,7 @@ test("DW-52.8 a guest manager (owner outside the Unit) is not sent the Unit's do
 });
 
 test("DW-52.2c the same expiry rule on the durable SQLite Registry: refused values never reach it, the edge value round-trips as an exact integer", async () => {
-  const { sqliteRegistry } = await import("../../server/registry/sqlite.js");
+  const { sqliteRegistry } = await import("../../server/adapters/driven/registry/sqlite.js");
   const { mkdtempSync, rmSync } = await import("node:fs"), { tmpdir } = await import("node:os"), { join } = await import("node:path");
   const dir = mkdtempSync(join(tmpdir(), "plenary-share-exp-"));
   const reg = sqliteRegistry({ path: join(dir, "r.db"), fullfsync: false });
@@ -245,7 +245,7 @@ test("DW-52.10 hiddenAbove: a boolean, only when access also comes from a Space 
 });
 
 test("expiresAt refusals say what is wanted: a whole number of ms in the future, at most 10 years ahead (the AdminError message, for logs and API callers)", async () => {
-  const { createLink, AdminError } = await import("../../server/admin/boards.js");
+  const { createLink, AdminError } = await import("../../server/core/admin/boards.js");
   const ada = { user: "dev:ada", name: "ada", email: "ada@acme.com", domain: "acme.com" };
   for (const expiresAt of [1e300, T0 + 0.5, T0 - 1]) {
     const e = await createLink({ caller: ada, board, role: "viewer", expiresAt }, { registry: mem, tenancy: makeTenancy({ registry: mem, now }), now }).catch(x => x);

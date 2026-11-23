@@ -3,17 +3,17 @@
 // reconnect gets the lower step, a write is `forbidden`, and the removed management permission is gone from the very next access answer.
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
-import { createServer } from "../../server/server.js";
-import { createLogger } from "../../server/log.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { subjects } from "../../server/bus/port.js";
-import { authPort } from "../../server/auth/port.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy } from "../../server/auth/tenancy.js";
-import { spaceService } from "../../server/auth/spaces.js";
-import { rolesService } from "../../server/auth/roles.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { createLogger } from "../../server/core/log.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { subjects } from "../../server/ports/bus.js";
+import { authPort } from "../../server/ports/auth.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
+import { spaceService } from "../../server/core/auth/spaces.js";
+import { rolesService } from "../../server/core/auth/roles.js";
 import { makeElement } from "../../packages/core/model.js";
 import { sock } from "./rig.js";
 import { tempDir, cleanup, until } from "./helpers.js";

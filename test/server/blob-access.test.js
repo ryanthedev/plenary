@@ -1,9 +1,9 @@
 // server/blob-access.js (signing, scoping, quota) over the real disk adapter, with an injected clock. No HTTP, no socket.
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
-import { blobAccess, URL_TTL_MS } from "../../server/blob-access.js";
-import { diskBlobs } from "../../server/blobs/disk.js";
-import { PortError } from "../../server/ids.js";
+import { blobAccess, URL_TTL_MS } from "../../server/core/blob-access.js";
+import { diskBlobs } from "../../server/adapters/driven/blobs/disk.js";
+import { PortError } from "../../server/core/ids.js";
 import { tempDir, cleanup, fakePng, sha1, deferred } from "./helpers.js";
 
 afterAll(cleanup);

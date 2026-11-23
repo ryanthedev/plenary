@@ -5,11 +5,11 @@ import { describe, test, expect, beforeAll } from "bun:test";
 import { authContract } from "../contracts/auth-contract.js";
 import { httpAuth } from "../../../web/adapters/auth/http.js";
 import { virtualClock } from "../../../web/adapters/clock/virtual.js";
-import { httpRoutes, EXCHANGE_COOKIE, LOGIN_COOKIE } from "../../../server/auth/http.js";
-import { googleOidc } from "../../../server/auth/oidc.js";
-import { sessions as makeSessions } from "../../../server/auth/session.js";
-import { memoryRegistry } from "../../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../../server/auth/tenancy.js";
+import { httpRoutes, EXCHANGE_COOKIE, LOGIN_COOKIE } from "../../../server/adapters/driving/auth-http.js";
+import { googleOidc } from "../../../server/adapters/driven/auth/oidc.js";
+import { sessions as makeSessions } from "../../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../../server/core/auth/tenancy.js";
 import { fakeIdp, CLIENT_ID } from "../../auth/fake-idp.js";
 
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });

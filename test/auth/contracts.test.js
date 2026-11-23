@@ -1,10 +1,10 @@
 // Every auth adapter against its port's contract (brief p5-hex):
 //   IdP port      googleOidc (driven through fake-idp.js, a fake Google network), fakeIdpAdapter (in memory)
 //   Verifier port sessions, devAuth
-import { googleOidc } from "../../server/auth/oidc.js";
-import { sessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { randomId } from "../../server/auth/util.js";
+import { googleOidc } from "../../server/adapters/driven/auth/oidc.js";
+import { sessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { randomId } from "../../server/core/auth/util.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 import { fakeIdpAdapter, FAKE_IDENTITY } from "./fake-idp-adapter.js";
 import { idpContract } from "./idp-contract.js";

@@ -8,7 +8,7 @@ import { exportScene, paintedBox, LIGHT } from "../../packages/core/export.js";
 import { Editor } from "../../packages/core/editor.js";
 import { itemFromElements } from "../../packages/core/library.js";
 import { opProblem } from "../../packages/protocol/envelope.js";
-import { videoKind, blobKind, checkBlob, parseByteRange, MAX_BLOB_BYTES, MAX_VIDEO_BLOB_BYTES } from "../../server/blobs/port.js";
+import { videoKind, blobKind, checkBlob, parseByteRange, MAX_BLOB_BYTES, MAX_VIDEO_BLOB_BYTES } from "../../server/ports/blobs.js";
 
 const SHA1 = "a".repeat(40);
 const sha1Hex = bytes => new Bun.CryptoHasher("sha1").update(bytes).digest("hex");

@@ -1,9 +1,9 @@
 import { test, expect } from "bun:test";
-import { devAuth } from "../../server/auth/dev.js";
-import { sessions } from "../../server/auth/session.js";
-import { authPort } from "../../server/auth/port.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy } from "../../server/auth/tenancy.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { sessions } from "../../server/adapters/driven/auth/session.js";
+import { authPort } from "../../server/ports/auth.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
 import { createBoard } from "./fixtures.js";
 import { fakeIdp } from "./fake-idp.js";
 import { fakeStore, gatewayHello } from "./fake-store.js";
@@ -95,8 +95,8 @@ test("gateway hello: verify, board and role are all awaited; unknown board and n
 // ---- Fix round (p5-authv) ----
 
 test("M1 end to end: a no-hd Google token with a third-party email can't claim an invite; gmail can", async () => {
-  const { jwksCache, verifyIdToken } = await import("../../server/auth/oidc.js");
-  const { createInvite } = await import("../../server/admin/boards.js");
+  const { jwksCache, verifyIdToken } = await import("../../server/adapters/driven/auth/oidc.js");
+  const { createInvite } = await import("../../server/core/admin/boards.js");
   const { CLIENT_ID } = await import("./fake-idp.js");
   const idp = await fakeIdp(); await idp.addKey("k1");
   const keys = jwksCache({ fetch: idp.fetch });

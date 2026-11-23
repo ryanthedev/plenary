@@ -4,10 +4,10 @@
 import { test, expect, afterAll, describe, jest } from "bun:test";
 import { join } from "node:path";
 import { SQL } from "bun";
-import { roomHost, newHolder } from "../../server/room-host.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { postgresStore } from "../../server/store/postgres.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { roomHost, newHolder } from "../../server/core/room-host.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
 import { rig, tokenOf } from "./rig.js";
@@ -73,7 +73,7 @@ const pgMaker = () => {
 };
 
 import { virtualTime, settleWith } from "./virtual.js";
-import { createLogger } from "../../server/log.js";
+import { createLogger } from "../../server/core/log.js";
 
 /**
  * A bus, a virtual clock and a SQLite Store that reads it, so the Store's lease expiry, the host's timers and its lease

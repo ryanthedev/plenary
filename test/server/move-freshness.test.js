@@ -2,17 +2,17 @@
 // told `unavailable` and closed within one re-check pass (no 60 s timer waited for), the reconnect is refused, and a person who gains access through the new Space is let in.
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
-import { createServer } from "../../server/server.js";
-import { createLogger } from "../../server/log.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { subjects } from "../../server/bus/port.js";
-import { authPort } from "../../server/auth/port.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy, roleCache } from "../../server/auth/tenancy.js";
-import { spaceService } from "../../server/auth/spaces.js";
-import { moveService } from "../../server/auth/move.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { createLogger } from "../../server/core/log.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { subjects } from "../../server/ports/bus.js";
+import { authPort } from "../../server/ports/auth.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy, roleCache } from "../../server/core/auth/tenancy.js";
+import { spaceService } from "../../server/core/auth/spaces.js";
+import { moveService } from "../../server/core/auth/move.js";
 import { announcingRegistry } from "../../server/main.js";
 import { sock } from "./rig.js";
 import { tempDir, cleanup, until } from "./helpers.js";

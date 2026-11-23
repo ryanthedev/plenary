@@ -3,8 +3,8 @@
 // burst is one synchronous run the pump cannot interleave with, on any OS and at any load. (A real socket's chunking is
 // the kernel's: 16 KB at a time on macOS loopback, 64 KB on Linux, and under load anything: a test through one hung 20 s.)
 import { test, expect } from "bun:test";
-import { gateway } from "../../server/gateway.js";
-import { memoryBus } from "../../server/bus/memory.js";
+import { gateway } from "../../server/core/gateway.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
 import { until } from "./helpers.js";
 
 const TENANT = "t-pacing0000000000", BOARD = "b-pacing0000000000";

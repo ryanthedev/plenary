@@ -3,9 +3,9 @@
 import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { join } from "node:path";
 import { start, checkInnerLimits, nodeConfig, REGISTRY_LIMIT_MS, OIDC_TIMEOUT_MS, SQLITE_BUSY_MS } from "../../server/main.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
 import { tempDir, cleanup } from "./helpers.js";
 
 setDefaultTimeout(30_000);

@@ -22,9 +22,9 @@
 
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { bootstrapTenant, normDomain, normAdmin, normContentAdmin, shown, escapeUnsafe } from "../server/admin/tenants.js";
-import { sqliteRegistry } from "../server/registry/sqlite.js";
-import { postgresRegistry } from "../server/registry/postgres.js";
+import { bootstrapTenant, normDomain, normAdmin, normContentAdmin, shown, escapeUnsafe } from "../server/core/admin/tenants.js";
+import { sqliteRegistry } from "../server/adapters/driven/registry/sqlite.js";
+import { postgresRegistry } from "../server/adapters/driven/registry/postgres.js";
 
 const USAGE = "usage: bun scripts/admin-bootstrap.js (--domain <domain> | --personal) --admin <google:sub|dev:name|email> [--admin …] [--content-admin <user>] [--content-admin-personal <user>] [--data-dir <dir>]";
 

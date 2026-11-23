@@ -4,7 +4,7 @@ import { test, expect, afterAll } from "bun:test";
 import { virtualTime } from "./virtual.js";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until, deferred } from "./helpers.js";
-import { subjects } from "../../server/bus/port.js";
+import { subjects } from "../../server/ports/bus.js";
 
 afterAll(cleanup);
 const hello = (r, name, extra = {}) => ({ t: "hello", v: 1, token: tokenOf(name), board: r.ids.board, since: 0, client: name, ...extra });

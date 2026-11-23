@@ -7,11 +7,11 @@ import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { start, redact, urlSecrets, nodeConfig, defaultNodeId } from "../../server/main.js";
-import { natsBus, natsConnectOptions } from "../../server/bus/nats.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { roomHost, remoteRooms } from "../../server/room-host.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
+import { natsBus, natsConnectOptions } from "../../server/adapters/driven/bus/nats.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
+import { roomHost, remoteRooms } from "../../server/core/room-host.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { cleanup, tempDir, sleep, until, deferred, spawnTracked } from "./helpers.js";
 

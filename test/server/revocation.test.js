@@ -3,11 +3,11 @@
 import { test, expect, afterAll } from "bun:test";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until, deferred } from "./helpers.js";
-import { subjects } from "../../server/bus/port.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
+import { subjects } from "../../server/ports/bus.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
 import { virtualTime } from "./virtual.js";
 import { makeElement } from "../../packages/core/model.js";
-import { expiryWait } from "../../server/gateway.js";
+import { expiryWait } from "../../server/core/gateway.js";
 
 afterAll(cleanup);
 const rect = (id, x = 0) => makeElement("rectangle", { id, x, y: 0, width: 10, height: 10 });

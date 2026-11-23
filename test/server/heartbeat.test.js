@@ -3,11 +3,11 @@
 // (never a stale or wrong feed), and what it costs per hosted board. All on virtual time (test/server/virtual.js): no sleeps.
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
-import { roomHost } from "../../server/room-host.js";
-import { boardFeed } from "../../server/feed.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { busBytes } from "../../server/bus/port.js";
+import { roomHost } from "../../server/core/room-host.js";
+import { boardFeed } from "../../server/core/feed.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
+import { busBytes } from "../../server/ports/bus.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
 import { tempDir, cleanup } from "./helpers.js";

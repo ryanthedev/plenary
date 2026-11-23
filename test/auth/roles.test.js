@@ -1,14 +1,14 @@
 // Roles (server/auth/roles.js, PROTOCOL.md § Roles, #50): the permission gate, the no-escalation rule, validation, the many-people confirmation,
 // delete-while-in-use, the leak rules, the announcements a role edit owes, and the HTTP routes, over the real tenancy and the memory Registry.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { rolesService, LIMITS } from "../../server/auth/roles.js";
-import { accessService } from "../../server/auth/access.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { ALLOWED_AT, MGMT_PERMS } from "../../server/auth/permissions.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { rolesService, LIMITS } from "../../server/core/auth/roles.js";
+import { accessService } from "../../server/core/auth/access.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { ALLOWED_AT, MGMT_PERMS } from "../../server/core/auth/permissions.js";
 
 let r, ten, svc, acme, globex, ann;
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });

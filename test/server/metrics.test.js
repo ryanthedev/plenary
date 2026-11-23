@@ -2,15 +2,15 @@
 // Rates and lag use injected clocks; nothing here generates load.
 import { test, expect, afterAll } from "bun:test";
 import { readFileSync } from "node:fs";
-import { prometheusMetrics, MAX_SERIES } from "../../server/metrics/prometheus.js";
-import { noopMetrics } from "../../server/metrics/port.js";
-import { metricsRoute } from "../../server/metrics-http.js";
-import { boardFeed } from "../../server/feed.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
+import { prometheusMetrics, MAX_SERIES } from "../../server/adapters/driven/metrics/prometheus.js";
+import { noopMetrics } from "../../server/ports/metrics.js";
+import { metricsRoute } from "../../server/adapters/driving/metrics-http.js";
+import { boardFeed } from "../../server/core/feed.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
 import { join } from "node:path";
-import { instrumentedStore } from "../../server/instrument.js";
-import { STORE_METHODS } from "../../server/store/port.js";
+import { instrumentedStore } from "../../server/core/instrument.js";
+import { STORE_METHODS } from "../../server/ports/store.js";
 import { start } from "../../server/main.js";
 import { rig, settled, sock } from "./rig.js";
 import { cleanup, tempDir, until } from "./helpers.js";

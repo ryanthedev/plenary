@@ -7,12 +7,12 @@ import { describe, test, expect, afterAll } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { tenancy } from "../../server/auth/tenancy.js";
-import { sessions as createSessions } from "../../server/auth/session.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { bootstrapTenant, normAdmin } from "../../server/admin/tenants.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
+import { sessions as createSessions } from "../../server/adapters/driven/auth/session.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { bootstrapTenant, normAdmin } from "../../server/core/admin/tenants.js";
 import { run as bootstrapCli, parseArgs } from "../../scripts/admin-bootstrap.js";
 
 const dir = mkdtempSync(join(tmpdir(), "plenary-personal-"));

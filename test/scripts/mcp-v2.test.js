@@ -11,14 +11,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createServer } from "../../server/server.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { authPort } from "../../server/auth/port.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { httpRoutes } from "../../server/auth/http.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { authPort } from "../../server/ports/auth.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
 import { utf8Bytes } from "../../packages/protocol/envelope.js";
 
 import {

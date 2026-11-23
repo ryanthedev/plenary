@@ -2,8 +2,8 @@
 // contract itself is known to describe the single-node bus). NATS tests skip when NATS_URL is unset; when it is
 // set, a NATS that can't be reached fails them (it never skips).
 import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
-import { memoryBus } from "../../server/bus/memory.js";
-import { natsBus, subjects, encodeMessage, decodeMessage, MAX_BUS_BYTES } from "../../server/bus/nats.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { natsBus, subjects, encodeMessage, decodeMessage, MAX_BUS_BYTES } from "../../server/adapters/driven/bus/nats.js";
 import { busContract, runTenant } from "./bus-contract.js";
 import { until, sleep, spawnTracked } from "./helpers.js";
 

@@ -1,15 +1,15 @@
 // p5-snap (F9): HTTP snapshot route (GET/HEAD /boards/:board/snapshot?ticket=...) + signed snapshot ticket
 // for large-board catch-up off the WebSocket frame path.
 import { test, expect } from "bun:test";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { authPort } from "../../server/auth/port.js";
-import { createServer } from "../../server/server.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { authPort } from "../../server/ports/auth.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
 import { Room } from "../../packages/protocol/room.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { mkdtempSync, rmSync } from "node:fs";

@@ -2,8 +2,8 @@
 // the effective permissions with their sources. The pure rule is test/auth/resolver.test.js; adapters are
 // test/auth/registry-contract.js.
 import { test, expect, beforeEach } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy, roleCache } from "../../server/auth/tenancy.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy, roleCache } from "../../server/core/auth/tenancy.js";
 
 let r, ten, acme, now = () => 1_000;
 const id = (n, domain = "acme.com") => ({ user: `google:${n}`, email: `${n}@${domain ?? "x.org"}`, domain });

@@ -3,8 +3,8 @@
 //
 //   accessRace("postgres", async () => ({ a, b, close }), { rounds })       a, b: two Registry handles on ONE store; close(): closes both
 import { describe, test, expect } from "bun:test";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { accessService } from "../../server/auth/access.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { accessService } from "../../server/core/auth/access.js";
 
 export function accessRace(name, open, { rounds = 8 } = {}) {
   describe(`access service on two ${name} handles: the last owner holds under races`, () => {

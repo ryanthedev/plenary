@@ -1,6 +1,6 @@
 // server/encode/cp-parts.js: the pure helpers behind checkpoint parts (PROTOCOL.md § Recovery, "Checkpoint parts").
 import { test, expect } from "bun:test";
-import { splitParts, headerOf, parseHeader, orphanGroups, PART_CHARS } from "../../server/encode/cp-parts.js";
+import { splitParts, headerOf, parseHeader, orphanGroups, PART_CHARS } from "../../server/adapters/support/encode/cp-parts.js";
 
 test("splitParts: parts join back to the text, none longer than the size, and no surrogate pair is cut", () => {
   const text = "a😀b".repeat(1000) + "😀";

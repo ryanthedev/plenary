@@ -1,15 +1,15 @@
 // Move board with an access diff (server/auth/move.js, PROTOCOL.md § Move board, #53): who may move where (permissions), the diff computed by the enforcing resolver, the no-leak
 // rule, the compare-and-set move, idempotency, undo, the announcement, and the HTTP routes.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { spaceService } from "../../server/auth/spaces.js";
-import { moveService } from "../../server/auth/move.js";
-import { mayMove } from "../../server/auth/resolver.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { spaceService } from "../../server/core/auth/spaces.js";
+import { moveService } from "../../server/core/auth/move.js";
+import { mayMove } from "../../server/core/auth/resolver.js";
 import { announcingRegistry } from "../../server/main.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });
 const ada = ident("ada"), max = ident("max"), kim = ident("kim", "partner.io"), root = ident("root"), zed = ident("zed");

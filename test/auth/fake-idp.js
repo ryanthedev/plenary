@@ -1,6 +1,6 @@
 // A fake Google: a local RS256 keypair, its JWKS served through an injected fetch, ID-token minting, and a token
 // endpoint. No network.
-import { b64url, utf8 } from "../../server/auth/util.js";
+import { b64url, utf8 } from "../../server/core/auth/util.js";
 
 export const CLIENT_ID = "test-client.apps.googleusercontent.com";
 

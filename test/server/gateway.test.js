@@ -25,7 +25,7 @@ test("/health answers 200 with small JSON; other paths 404; /ws without an upgra
 });
 
 test("an extra http handler serves its routes; one that throws gives 500 and the server lives", async () => {
-  const { createServer } = await import("../../server/server.js");
+  const { createServer } = await import("../../server/adapters/driving/server.js");
   const r = await rig();
   const s = createServer({ auth: {}, registry: {}, store: r.store, bus: r.bus, port: 0, http: (req, url) => { if (url.pathname === "/boom") throw new Error("boom"); if (url.pathname === "/hi") return new Response("hi"); } });
   expect(await (await fetch(s.url + "/hi")).text()).toBe("hi");
@@ -104,7 +104,7 @@ test("slow auth: ops after welcome are acked in order and numbered per connectio
 });
 
 test("rule 11: an op that arrives before its connection's welcome gets `auth` with its id, and never reaches the room", async () => {
-  const { subjects } = await import("../../server/bus/port.js");
+  const { subjects } = await import("../../server/ports/bus.js");
   // The room's replies to this gateway arrive 150 ms late, so the op behind the hello is read before the welcome.
   const r = await rig({ wrapBus: b => ({ ...b, subscribe: (subject, fn) => b.subscribe(subject, subject.includes(".gw.") ? m => setTimeout(() => fn(m), 150) : fn) }) });
   const s = await r.sock();
@@ -264,7 +264,7 @@ test("rule 1: nothing is acked or broadcast before the append resolves", async (
 
 test("the entries subject carries each entry once, after it is durable", async () => {
   const r = await rig({ host: { heartbeatMs: 50 } });   // a quick heartbeat, so a later beat comes within the test
-  const { subjects } = await import("../../server/bus/memory.js");
+  const { subjects } = await import("../../server/adapters/driven/bus/memory.js");
   const seen = [], beats = [];
   r.bus.subscribe(subjects.entries(r.ids.tenant, r.ids.board), async m => { if (!m.items) return beats.push(m); seen.push({ ...m, durableThen: await r.rawStore.lastSeq(r.ids.tenant, r.ids.board) }); });
   const c = await r.client("editor").connect();
@@ -450,7 +450,7 @@ test("a log with a gap or a foreign entry is corruption: the room refuses to sta
 // ---- fix round ----
 
 test("H1: nestedDeeperThan counts brackets outside strings, in one pass", async () => {
-  const { nestedDeeperThan } = await import("../../server/gateway.js");
+  const { nestedDeeperThan } = await import("../../server/core/gateway.js");
   const nest = n => "[".repeat(n) + "]".repeat(n);
   expect(nestedDeeperThan(nest(64), 64)).toBe(false);
   expect(nestedDeeperThan(nest(65), 64)).toBe(true);
@@ -584,7 +584,7 @@ test("M5: a v0 `transient` op is refused, not relayed and not logged; an inbox g
   expect((await r.rawStore.read(r.ids.tenant, r.ids.board, 1, 10)).map(e => e.id)).toEqual(["a:13"]);
 
   // Rule 6: the room host notices a lost inbox message by its number and sends the connection away to resend.
-  const { subjects } = await import("../../server/bus/memory.js");
+  const { subjects } = await import("../../server/adapters/driven/bus/memory.js");
   const mine = r.inbox.find(m => m.client === "a" && m.msg.t === "hello");
   await r.bus.publish(subjects.inbox(r.ids.tenant, r.ids.board), { ...mine, n: 99, msg: { t: "op", id: "a:14", sentAt: 0, stream: "notes", op: { elements: [rect("after-gap")] } } });
   expect((await a.whenClosed()).code).toBe(1013);
@@ -710,8 +710,8 @@ test("onWelcomed (Recent, PROTOCOL.md § Home): called once per welcomed connect
 });
 
 test("a welcomed connection reaches Recent through recentRecorder over a real Registry", async () => {
-  const { memoryRegistry } = await import("../../server/auth/registry.js");
-  const { recentRecorder } = await import("../../server/auth/home.js");
+  const { memoryRegistry } = await import("../../server/adapters/driven/auth/registry.js");
+  const { recentRecorder } = await import("../../server/core/auth/home.js");
   const registry = memoryRegistry();
   const r = await rig({ registry, onWelcomed: recentRecorder({ registry }) });
   const s = await r.sock(); s.send(hello(r, "editor")); await s.next(m => m.t === "welcome");

@@ -1,7 +1,7 @@
 // #66 fan-out: one live frame is encoded once and measured once, and every viewer gets exactly the bytes the per-viewer path produced.
 import { test, expect } from "bun:test";
-import { gateway } from "../../server/gateway.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { gateway } from "../../server/core/gateway.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
 import { jsonCodec } from "../../packages/protocol/codec.js";
 import { until } from "./helpers.js";
 

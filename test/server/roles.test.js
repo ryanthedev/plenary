@@ -3,15 +3,15 @@
 // by asking the hosts over the bus (`plen-hosts.open`, room-host.js remoteRooms).
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
-import { createServer } from "../../server/server.js";
-import { createLogger } from "../../server/log.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { remoteRooms } from "../../server/room-host.js";
-import { authPort } from "../../server/auth/port.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy } from "../../server/auth/tenancy.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { createLogger } from "../../server/core/log.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { remoteRooms } from "../../server/core/room-host.js";
+import { authPort } from "../../server/ports/auth.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
 import { makeElement } from "../../packages/core/model.js";
 import { sock } from "./rig.js";
 import { tempDir, cleanup, sleep, until } from "./helpers.js";

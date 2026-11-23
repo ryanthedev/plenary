@@ -1,11 +1,11 @@
 // The purge of Trash (server/trash-sweep.js, PROTOCOL.md § Trash and restore, "Purge"): off an injected clock, claim first, content through the Store port, then the Registry's rows;
 // idempotent, safe beside another node, and a partial purge resumes. Real SQLite Registry and Store; no test waits for a timer or 30 real days.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { trashSweeper } from "../../server/trash-sweep.js";
-import { TRASH } from "../../server/auth/registry-port.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { trashSweeper } from "../../server/core/trash-sweep.js";
+import { TRASH } from "../../server/ports/registry.js";
 
 const DAY = 24 * 3600_000;
 const U = "google:ada";

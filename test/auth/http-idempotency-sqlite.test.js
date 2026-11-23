@@ -4,12 +4,12 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { homeService } from "../../server/auth/home.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 
 const ORIGIN = "https://plenary.test";
 const config = { cookieKey: "k".repeat(32), postLoginUrl: ORIGIN + "/", boardUrl: ORIGIN + "/b/{board}", publicUrl: ORIGIN };

@@ -3,7 +3,7 @@
 // Delivery is awaited with `until`, not with flush alone, so a network bus passes on the same tests; `quiet()`
 // (flush, then a short wait) is how a test says "and nothing else arrived".
 import { test, expect, afterAll } from "bun:test";
-import { subjects } from "../../server/bus/memory.js";
+import { subjects } from "../../server/adapters/driven/bus/memory.js";
 import { until, sleep } from "./helpers.js";
 
 /** A fresh, valid tenant id per run, so runs sharing one NATS server can't hear each other. */

@@ -2,10 +2,10 @@
 // kill -9 or SIGSTOP a real holder. argv: holder ttlMs schema [gatewayId]. Prints "OPEN <epoch>" once it holds the board.
 // With a gatewayId: after it logs "room stopped: lease lost" it lets two macrotask turns pass, then publishes `{ conn: "__sentinel" }` on that gateway's
 // subject over its own bus connection. Same publisher, same subject, in order: whatever the stopped host sent to the gateway lands before the sentinel.
-import { roomHost } from "../../server/room-host.js";
-import { postgresStore } from "../../server/store/postgres.js";
-import { natsBus, subjects } from "../../server/bus/nats.js";
-import { createLogger } from "../../server/log.js";
+import { roomHost } from "../../server/core/room-host.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
+import { natsBus, subjects } from "../../server/adapters/driven/bus/nats.js";
+import { createLogger } from "../../server/core/log.js";
 
 const [holder, ttl, schema, gatewayId] = process.argv.slice(2);
 const later = {};   // the bus, set below; the logger only fires after the host exists

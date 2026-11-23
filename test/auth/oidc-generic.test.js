@@ -12,10 +12,10 @@ import {
   isBlockedOidcHost,
   challengeS256,
   jwksCache,
-} from "../../server/auth/oidc.js";
-import { oidcTenantBinding, tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { b64url, utf8, randomId } from "../../server/auth/util.js";
+} from "../../server/adapters/driven/auth/oidc.js";
+import { oidcTenantBinding, tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { b64url, utf8, randomId } from "../../server/core/auth/util.js";
 import { idpContract } from "./idp-contract.js";
 import { start } from "../../server/main.js";
 

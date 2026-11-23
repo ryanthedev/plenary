@@ -4,7 +4,7 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { join } from "node:path";
 import { startDevGoogle, ORIGIN, makeSafeFetch, safeFetch, FETCH_TIMEOUT_MS, STOP_SIGNALS } from "../../scripts/dev-google.js";
-import { LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
+import { LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/adapters/driving/auth-http.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 let idp, h;

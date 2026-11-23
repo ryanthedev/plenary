@@ -6,13 +6,13 @@ import {
   parseK8sQuery,
   extractFieldPath,
   redactSecrets,
-} from "../../server/live-sources/port.js";
-import { httpLiveSources } from "../../server/live-sources/http.js";
-import { memoryLiveSources } from "../../server/live-sources/memory.js";
+} from "../../server/ports/live-sources.js";
+import { httpLiveSources } from "../../server/adapters/driven/live-sources/http.js";
+import { memoryLiveSources } from "../../server/adapters/driven/live-sources/memory.js";
 import {
   handleLiveValuesRequest,
   handleLiveSourcesListRequest,
-} from "../../server/live-sources/handler.js";
+} from "../../server/adapters/driving/live-sources-http.js";
 
 describe("server/live-sources/port helpers", () => {
   test("parseK8sQuery accepts read-only API paths and shorthands, rejects traversal", () => {

@@ -1,8 +1,8 @@
 // The permission resolver (server/auth/resolver.js) and the permission tables (server/auth/permissions.js), pure: every
 // row is handed in, so these tests build contexts by hand and need no Registry.
 import { test, expect, describe } from "bun:test";
-import { resolveAccess, isUnitAdmin, isUnitMember } from "../../server/auth/resolver.js";
-import { roleDef, roleProblem, ALLOWED_AT, MGMT_PERMS, CONTENT_PERMS } from "../../server/auth/permissions.js";
+import { resolveAccess, isUnitAdmin, isUnitMember } from "../../server/core/auth/resolver.js";
+import { roleDef, roleProblem, ALLOWED_AT, MGMT_PERMS, CONTENT_PERMS } from "../../server/core/auth/permissions.js";
 
 const T = 1000;
 const tenant = { id: "t-acme", domain: "acme.com", domains: ["acme.com", "acme.io"], kind: "company", admins: ["google:root", "email:boss@acme.com"], createdAt: 0 };

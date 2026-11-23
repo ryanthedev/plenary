@@ -5,11 +5,11 @@
 import { test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { join } from "node:path";
 import { start } from "../../server/main.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { natsBus } from "../../server/bus/nats.js";
-import { subjects } from "../../server/bus/port.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { natsBus } from "../../server/adapters/driven/bus/nats.js";
+import { subjects } from "../../server/ports/bus.js";
 import { tempDir, cleanup, until } from "./helpers.js";
 
 // Failure-only ceiling for tests doing real NATS and start-up work: bun's 5 s default fails them under machine load (TECH-DEBT row 36). It fires only when
@@ -90,7 +90,7 @@ test("DW-iso: onError of a scoped bus hears the subject without the cluster pref
 test("DW-iso mixed version: a node without the id (unscoped) and one with it exchange nothing, in either direction, on any open or inbox subject", async () => {
   // One shared transport stands in for the NATS server: scoped and unscoped nodes are two views of it.
   const wire = memoryBus();
-  const scoped = (await import("../../server/bus/port.js")).scopeBus(wire, ID);
+  const scoped = (await import("../../server/ports/bus.js")).scopeBus(wire, ID);
   const got = { scoped: [], old: [] };
   const names = [subjects.open, subjects.opened("gw-1"), subjects.inbox("t-1", "b-1"), subjects.entries("t-1", "b-1")];
   for (const n of names) { scoped.subscribe(n, m => got.scoped.push(m)); wire.subscribe(n, m => got.old.push(m)); }

@@ -10,12 +10,12 @@
 // The suite uses only the public Registry methods, and refusals are matched by `err.code`, never by class.
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { IDEM, ASK } from "../../server/auth/registry-port.js";
+import { IDEM, ASK } from "../../server/ports/registry.js";
 import { mkBoard, spaceOf } from "./fixtures.js";
 
 /**
  * @param {string} name
- * @param {(o: { now: () => number }) => Promise<import("../../server/auth/registry-port.js").Registry>} makeRegistry
+ * @param {(o: { now: () => number }) => Promise<import("../../server/ports/registry.js").Registry>} makeRegistry
  * @param {{ cleanup?: (r: any) => Promise<void>|void }} [opts]
  */
 export function registryContract(name, makeRegistry, opts = {}) {

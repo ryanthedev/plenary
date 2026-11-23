@@ -4,17 +4,17 @@
 // Built-in Unit roles `content-admin` (shared) and `content-admin-personal` (both); a custom role may carry either. Nothing is ever read from a role NAME.
 // Three layers: the pure resolver, the services (no escalation, roles screen, Team path, cache), and the HTTP routes end to end (open, Home, search, trash, move, offboarding, explain).
 import { test, expect, beforeEach, describe } from "bun:test";
-import { resolveAccess, holdsTier, ownLadder } from "../../server/auth/resolver.js";
-import { roleDef, roleProblem, tierReach, TIER_ROLES, TIER_PERMS, ROLE_PERMS } from "../../server/auth/permissions.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy, roleCache } from "../../server/auth/tenancy.js";
-import { rolesService } from "../../server/auth/roles.js";
-import { accessService } from "../../server/auth/access.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { homeService } from "../../server/auth/home.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { bootstrapTenant } from "../../server/admin/tenants.js";
+import { resolveAccess, holdsTier, ownLadder } from "../../server/core/auth/resolver.js";
+import { roleDef, roleProblem, tierReach, TIER_ROLES, TIER_PERMS, ROLE_PERMS } from "../../server/core/auth/permissions.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy, roleCache } from "../../server/core/auth/tenancy.js";
+import { rolesService } from "../../server/core/auth/roles.js";
+import { accessService } from "../../server/core/auth/access.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { bootstrapTenant } from "../../server/core/admin/tenants.js";
 
 const T = 1000;
 const tenant = { id: "t-acme", domain: "acme.com", domains: ["acme.com"], kind: "company", admins: ["google:root"], createdAt: 0 };

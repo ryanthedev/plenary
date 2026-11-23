@@ -1,14 +1,14 @@
 // Issue #23: Embed boards elsewhere — read-only embed tokens, /embed/:board CSP & live WS shell,
 // /oembed 1.0 JSON endpoint, and OpenGraph / Twitter / Slack unfurl meta tags.
 import { describe, test, expect } from "bun:test";
-import { createEmbedTokens, canEmbedTokenPerform, EMBED_SCOPE, EMBED_ROLE } from "../../server/auth/embed-token.js";
+import { createEmbedTokens, canEmbedTokenPerform, EMBED_SCOPE, EMBED_ROLE } from "../../server/core/auth/embed-token.js";
 import {
   embedRoutes,
   buildFrameAncestorsDirective,
   buildEmbedCsp,
   renderUnfurlMetaTags,
-} from "../../server/embed-http.js";
-import { b64url, utf8 } from "../../server/auth/util.js";
+} from "../../server/adapters/driving/embed-http.js";
+import { b64url, utf8 } from "../../server/core/auth/util.js";
 
 const TEST_KEY = new Uint8Array(32).map((_, i) => (i * 13 + 7) & 0xff);
 const OTHER_KEY = new Uint8Array(32).map((_, i) => (i * 29 + 3) & 0xff);

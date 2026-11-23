@@ -15,8 +15,8 @@ const GARBAGE = [undefined, null, 0, 1, NaN, true, {}, [], () => "x", Symbol.for
 
 /**
  * @param {string} name
- * @param {() => Promise<{ verifier: import("../../server/auth/idp-port.js").Verifier, token: string,
- *   expected: import("../../server/auth/idp-port.js").Identity, exp?: number, now?: () => number, expire?: () => void }>} make
+ * @param {() => Promise<{ verifier: import("../../server/ports/idp.js").Verifier, token: string,
+ *   expected: import("../../server/ports/idp.js").Identity, exp?: number, now?: () => number, expire?: () => void }>} make
  */
 export function verifierContract(name, make) {
   describe(`Verifier contract: ${name}`, () => {

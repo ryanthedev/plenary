@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { cpSync } from "node:fs";
 import { rig, tokenOf, settled, roomState, client, rawSock, sock } from "./rig.js";
 import { cleanup, sleep, until, tempDir, deferred, spawnTracked } from "./helpers.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { createBreather } from "../../server/breather.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { createBreather } from "../../server/core/breather.js";
 
 afterAll(cleanup);
 const MB = 1024 * 1024;

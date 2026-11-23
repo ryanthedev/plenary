@@ -9,8 +9,8 @@
 
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { startDevGoogle, REDIRECT_URI, safeFetch, probeAuthorize } from "../../scripts/dev-google.js";
-import { GOOGLE, jwksCache } from "../../server/auth/oidc.js";
-import { LOGIN_COOKIE } from "../../server/auth/http.js";
+import { GOOGLE, jwksCache } from "../../server/adapters/driven/auth/oidc.js";
+import { LOGIN_COOKIE } from "../../server/adapters/driving/auth-http.js";
 
 const ID = process.env.GOOGLE_CLIENT_ID, SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const LIVE = process.env.PLENARY_LIVE_GOOGLE === "1" && !!ID && !!SECRET;

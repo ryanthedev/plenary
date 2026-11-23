@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { staticSite, DEFAULT_MOUNTS } from "../../server/static.js";
+import { staticSite, DEFAULT_MOUNTS } from "../../server/adapters/driving/static.js";
 
 test("the static handler serves favicon.ico from favicon.svg", async () => {
   const response = await staticSite({ mounts: DEFAULT_MOUNTS }).handle(new Request("http://localhost/favicon.ico"));

@@ -1,6 +1,6 @@
 import { test, expect, beforeAll } from "bun:test";
-import { verifyIdToken, jwksCache, challengeS256, newVerifier, googleOidc, parseJwt } from "../../server/auth/oidc.js";
-import { b64url, utf8 } from "../../server/auth/util.js";
+import { verifyIdToken, jwksCache, challengeS256, newVerifier, googleOidc, parseJwt } from "../../server/adapters/driven/auth/oidc.js";
+import { b64url, utf8 } from "../../server/core/auth/util.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 let idp, clock = { t: Date.UTC(2026, 10, 11, 12) };

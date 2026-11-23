@@ -1,6 +1,6 @@
 // encodeSliced (server/encode/sliced.js) must produce exactly JSON.stringify's text, in slices that yield.
 import { test, expect } from "bun:test";
-import { encodeSliced } from "../../server/encode/sliced.js";
+import { encodeSliced } from "../../server/adapters/support/encode/sliced.js";
 
 const seeded = seed => () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
 function gen(rng, depth) {

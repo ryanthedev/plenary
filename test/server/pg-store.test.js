@@ -4,7 +4,7 @@
 // dropped after; one client is shared by the file.
 import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
-import { postgresStore } from "../../server/store/postgres.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
 import { storeContract, entry, code, own } from "./store-contract.js";
 
 const url = process.env.DATABASE_URL;

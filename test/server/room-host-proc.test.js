@@ -3,9 +3,9 @@
 // equivalent of the stall, which always runs.
 import { test, expect, afterAll } from "bun:test";
 import { SQL } from "bun";
-import { roomHost } from "../../server/room-host.js";
-import { postgresStore } from "../../server/store/postgres.js";
-import { natsBus, subjects } from "../../server/bus/nats.js";
+import { roomHost } from "../../server/core/room-host.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
+import { natsBus, subjects } from "../../server/adapters/driven/bus/nats.js";
 import { PROTOCOL_VERSION } from "../../packages/protocol/envelope.js";
 import { makeElement } from "../../packages/core/model.js";
 import { sleep, until, spawnTracked } from "./helpers.js";

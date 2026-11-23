@@ -5,9 +5,9 @@
 import { test, expect, afterAll, describe, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
 import { start } from "../../server/main.js";
-import { postgresStore } from "../../server/store/postgres.js";
-import { natsBus } from "../../server/bus/nats.js";
-import { subjects } from "../../server/bus/port.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
+import { natsBus } from "../../server/adapters/driven/bus/nats.js";
+import { subjects } from "../../server/ports/bus.js";
 import { tempDir, cleanup, until } from "./helpers.js";
 import { sock } from "./rig.js";
 

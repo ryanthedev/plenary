@@ -1,11 +1,11 @@
 // A failed sign-in callback logs its cause (p5-googlev LOW 1): one "sign-in failed" { cause } line per refusal, a
 // fixed label only, never a code, state, token, cookie value or Google's error_description. Fake IdP, no network.
 import { test, expect, beforeAll, beforeEach } from "bun:test";
-import { httpRoutes, LOGIN_COOKIE, SIGN_IN_CAUSES } from "../../server/auth/http.js";
-import { googleOidc, verifyIdToken, CAUSES } from "../../server/auth/oidc.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
+import { httpRoutes, LOGIN_COOKIE, SIGN_IN_CAUSES } from "../../server/adapters/driving/auth-http.js";
+import { googleOidc, verifyIdToken, CAUSES } from "../../server/adapters/driven/auth/oidc.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 const ORIGIN = "https://plenary.test";

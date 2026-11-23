@@ -1,12 +1,12 @@
 // End to end through server/auth/http.js against the fake IdP (no network): sign-in, the admin API, share links.
 import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
-import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
-import { googleOidc } from "../../server/auth/oidc.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
+import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/adapters/driving/auth-http.js";
+import { googleOidc } from "../../server/adapters/driven/auth/oidc.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
 import { createBoard } from "./fixtures.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 
 const ORIGIN = "https://plenary.test";

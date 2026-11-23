@@ -1,17 +1,17 @@
 // Trash and restore (server/auth/trash.js, PROTOCOL.md § Trash and restore, #54): who may trash and restore (the `delete` permission), what a trashed board is to everyone else
 // (no role, no listing, no management, no new use of a link), the Space that takes its boards with it, the Trash list, the board-URL notice, the announcement and the HTTP routes.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy, roleCache } from "../../server/auth/tenancy.js";
-import { spaceService } from "../../server/auth/spaces.js";
-import { homeService } from "../../server/auth/home.js";
-import { trashService } from "../../server/auth/trash.js";
-import { TRASH } from "../../server/auth/registry-port.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy, roleCache } from "../../server/core/auth/tenancy.js";
+import { spaceService } from "../../server/core/auth/spaces.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { trashService } from "../../server/core/auth/trash.js";
+import { TRASH } from "../../server/ports/registry.js";
 import { announcingRegistry } from "../../server/main.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { createInvite, createLink } from "../../server/admin/boards.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { createInvite, createLink } from "../../server/core/admin/boards.js";
 
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });
 const ada = ident("ada"), max = ident("max"), kim = ident("kim", "partner.io"), root = ident("root"), zed = ident("zed");

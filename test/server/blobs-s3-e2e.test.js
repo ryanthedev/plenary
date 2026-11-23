@@ -2,7 +2,7 @@
 // different gateway (the same key and bucket, no shared disk) serves the bytes to a fresh page, which draws them. Skips without S3_ENDPOINT (S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY); `bun run test:cluster` sets them.
 import { test, expect, afterAll } from "bun:test";
 import { appClient, restoreAppGlobals } from "../web/app-client.js";
-import { s3Blobs } from "../../server/blobs/s3.js";
+import { s3Blobs } from "../../server/adapters/driven/blobs/s3.js";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, fakePng, sha1 } from "./helpers.js";
 

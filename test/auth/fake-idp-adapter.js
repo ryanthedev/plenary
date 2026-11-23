@@ -8,7 +8,7 @@
 //   await idp.finish({ code, state: begun.state, expected: begun });  // → that Identity
 //   idp.down = true;   // unreachable: finish resolves null, begin rejects
 
-import { randomId } from "../../server/auth/util.js";
+import { randomId } from "../../server/core/auth/util.js";
 
 export const FAKE_IDENTITY = { user: "fake:ann", name: "Ann", email: "ann@acme.com", domain: "acme.com" };
 

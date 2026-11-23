@@ -3,10 +3,10 @@
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
 import { inflateSync } from "node:zlib";
-import { boardFeed } from "../../server/feed.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
-import { zlibDeflate } from "../../server/compress/zlib.js";
+import { boardFeed } from "../../server/core/feed.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
+import { zlibDeflate } from "../../server/adapters/driven/compress/zlib.js";
 import { tempDir, cleanup, until } from "./helpers.js";
 
 afterAll(cleanup);

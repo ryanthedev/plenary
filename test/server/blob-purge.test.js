@@ -2,13 +2,13 @@
 // Registry and Store and the real disk Blobs, one injected clock. The restore-versus-reaper races are here.
 import { test, expect, beforeEach, afterAll } from "bun:test";
 import { join } from "node:path";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { diskBlobs } from "../../server/blobs/disk.js";
-import { trashSweeper } from "../../server/trash-sweep.js";
-import { blobReaper } from "../../server/blob-reaper.js";
-import { TRASH } from "../../server/auth/registry-port.js";
-import { BLOB_GRACE_MS } from "../../server/blobs/port.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { diskBlobs } from "../../server/adapters/driven/blobs/disk.js";
+import { trashSweeper } from "../../server/core/trash-sweep.js";
+import { blobReaper } from "../../server/core/blob-reaper.js";
+import { TRASH } from "../../server/ports/registry.js";
+import { BLOB_GRACE_MS } from "../../server/ports/blobs.js";
 import { tempDir, cleanup, fakePng, sha1 } from "./helpers.js";
 
 afterAll(cleanup);

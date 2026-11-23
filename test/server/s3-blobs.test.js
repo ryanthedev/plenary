@@ -3,8 +3,8 @@
 // is set, a store that can't be reached fails them. Env: S3_ENDPOINT, S3_BUCKET, S3_REGION, S3_ACCESS_KEY_ID,
 // S3_SECRET_ACCESS_KEY (the bucket must exist).
 import { test, expect, afterAll } from "bun:test";
-import { diskBlobs } from "../../server/blobs/disk.js";
-import { s3Blobs } from "../../server/blobs/s3.js";
+import { diskBlobs } from "../../server/adapters/driven/blobs/disk.js";
+import { s3Blobs } from "../../server/adapters/driven/blobs/s3.js";
 import { blobsContract, freshTenant } from "./blobs-contract.js";
 import { tempDir, cleanup, fakePng, sha1, until } from "./helpers.js";
 

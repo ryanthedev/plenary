@@ -15,10 +15,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { start } from "../../server/main.js";
 import { safeFetch, probeAuthorize, portBusy, REDIRECT_URI } from "../../scripts/dev-google.js";
-import { GOOGLE } from "../../server/auth/oidc.js";
-import { LOGIN_COOKIE } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { bootstrapTenant } from "../../server/admin/tenants.js";
+import { GOOGLE } from "../../server/adapters/driven/auth/oidc.js";
+import { LOGIN_COOKIE } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { bootstrapTenant } from "../../server/core/admin/tenants.js";
 import { sock } from "../server/rig.js";
 
 const ID = process.env.GOOGLE_CLIENT_ID, SECRET = process.env.GOOGLE_CLIENT_SECRET, ENV_COOKIE_KEY = process.env.COOKIE_KEY;

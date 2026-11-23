@@ -1,12 +1,12 @@
 // A personal space and its boards belong to their owner (TECH-DEBT row 67; PROTOCOL.md § Organization, § Move board): a manage-only Unit admin sees and controls nothing of a live member's personal board, with no
 // grant AND with a viewer grant the owner gave them. Route level: move (options, preview, move), trash, both grant routes, links, invites, rename. The owner and a content-access admin still can, and a viewer-granted admin only views.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { mayMove } from "../../server/auth/resolver.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { mayMove } from "../../server/core/auth/resolver.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 
 const ORIGIN = "https://plenary.test";
 let r, acme, diary, adaSp, rootSp, plain, content, ten;

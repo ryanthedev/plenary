@@ -1,16 +1,16 @@
 // Leaver offboarding (server/auth/offboard.js, PROTOCOL.md § Leaver offboarding, #55): what a leaver solely owns, per-item reassignment with defaults, who may do it
 // (`members.manage` at the Unit, the owner role grantable at the item), the removal that refuses while anything is left, and what a removed person is to everyone else.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { spaceService } from "../../server/auth/spaces.js";
-import { homeService } from "../../server/auth/home.js";
-import { offboardService } from "../../server/auth/offboard.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { spaceService } from "../../server/core/auth/spaces.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { offboardService } from "../../server/core/auth/offboard.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 import { mkBoard } from "./fixtures.js";
-import { identityKey, roleCache } from "../../server/auth/tenancy.js";
+import { identityKey, roleCache } from "../../server/core/auth/tenancy.js";
 
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n[0].toUpperCase() + n.slice(1), email: `${n}@${domain}`, domain });
 const root = ident("root"), ada = ident("ada"), sam = ident("sam"), bob = ident("bob"), cy = ident("cy"), kim = ident("kim", "partner.io"), low = ident("low");   // low: a manage-only Unit admin (no content tier)
@@ -259,7 +259,7 @@ describe("reassigning and removing", () => {
     await off.remove(root, sam.user, { to: ada.user });
     expect(await ten.tenantOf(sam)).toBe(null);
     expect((await ten.effective(sam, { type: "unit", id: acme.id })).permissions.size).toBe(0);
-    const { knownOnBoard } = await import("../../server/admin/boards.js");
+    const { knownOnBoard } = await import("../../server/core/admin/boards.js");
     expect(await knownOnBoard(r, noted, sam.user)).toBe(false);
     expect(await knownOnBoard(r, noted, bob.user)).toBe(true);
   });
@@ -275,7 +275,7 @@ describe("reassigning and removing", () => {
     expect((await ten.accessMany(sam, [noted.id])).get(noted.id)?.access.ladder ?? null).toBe(null);
   });
   test("HIGH-1: a removed person re-added to the admin list, by id or by an email: entry, manages no board (no grant PUT/DELETE) and is unknown on every board", async () => {
-    const { setGrant, knownOnBoard } = await import("../../server/admin/boards.js");
+    const { setGrant, knownOnBoard } = await import("../../server/core/admin/boards.js");
     await moveAll(ada.user);
     await off.remove(root, sam.user, { to: ada.user });
     for (const entry of [sam.user, "email:sam@acme.com"]) {

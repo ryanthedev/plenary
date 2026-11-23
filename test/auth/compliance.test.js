@@ -1,11 +1,11 @@
 // Compliance domain service & HTTP route tests (#34): per-board/tenant export & GDPR erasure.
 import { test, expect, beforeEach } from "bun:test";
-import { ComplianceError, EXPORT_SCHEMA_VERSION, exportBoardData, exportTenantData, eraseUserData } from "../../server/auth/compliance.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { ComplianceError, EXPORT_SCHEMA_VERSION, exportBoardData, exportTenantData, eraseUserData } from "../../server/core/auth/compliance.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 
 const ORIGIN = "https://plenary.test";
 const HTTP_CONFIG = {

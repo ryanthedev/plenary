@@ -1,6 +1,6 @@
 // The Store port's shared checks (server/store/port.js): what both adapters apply before touching a database.
 import { test, expect } from "bun:test";
-import { fitBytes, checkRead, checkAppend, checkCheckpoint, needTtl, needLeaseEpoch, MAX_READ, MAX_LEASE_TTL_MS, STORE_METHODS } from "../../server/store/port.js";
+import { fitBytes, checkRead, checkAppend, checkCheckpoint, needTtl, needLeaseEpoch, MAX_READ, MAX_LEASE_TTL_MS, STORE_METHODS } from "../../server/ports/store.js";
 
 const code = f => { try { f(); return "ok"; } catch (e) { return e.code; } };
 
@@ -36,7 +36,7 @@ test("checkCheckpoint, needTtl, needLeaseEpoch", () => {
 
 test("STORE_METHODS names the eighteen port methods (purgeBoard: #54; the five blob* calls: #92)", () => expect(STORE_METHODS.length).toBe(18));
 
-import { ddlColumns } from "../../server/pg/schema.js";
+import { ddlColumns } from "../../server/adapters/support/pg/schema.js";
 test("ddlColumns: the columns of a Postgres DDL string, minus table constraints, with nested parentheses", () => {
   expect(ddlColumns("tenant TEXT NOT NULL, board TEXT NOT NULL, seq BIGINT NOT NULL, PRIMARY KEY (tenant, board, seq)")).toEqual(["tenant", "board", "seq"]);
   expect(ddlColumns("id TEXT NOT NULL, singleton BOOLEAN NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton)")).toEqual(["id", "singleton"]);

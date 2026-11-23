@@ -1,11 +1,11 @@
 // The Home routes in server/auth/http.js (PROTOCOL.md § Home): authentication like every other route, the answers, and the refusals.
 import { test, expect, beforeEach } from "bun:test";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { homeService } from "../../server/auth/home.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 import { mkBoard } from "./fixtures.js";
 
 const ORIGIN = "https://plenary.test";

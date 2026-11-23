@@ -4,7 +4,7 @@ import { rig, tokenOf } from "./rig.js";
 import { until, sleep } from "./helpers.js";
 import { makeElement } from "../../packages/core/model.js";
 import { Replica } from "../../packages/protocol/replica.js";
-import { zlibDeflate } from "../../server/compress/zlib.js";
+import { zlibDeflate } from "../../server/adapters/driven/compress/zlib.js";
 import { inflateSync } from "node:zlib";
 
 /** A deterministic shape with every field a real one carries (about 430 bytes of JSON). */

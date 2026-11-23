@@ -3,11 +3,11 @@
 import { test, expect, beforeEach, afterAll } from "bun:test";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { diskBlobs } from "../../server/blobs/disk.js";
-import { blobReaper } from "../../server/blob-reaper.js";
-import { blobAccess, URL_TTL_MS } from "../../server/blob-access.js";
-import { BLOB_GRACE_MS, BLOB_PENDING_MS } from "../../server/blobs/port.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { diskBlobs } from "../../server/adapters/driven/blobs/disk.js";
+import { blobReaper } from "../../server/core/blob-reaper.js";
+import { blobAccess, URL_TTL_MS } from "../../server/core/blob-access.js";
+import { BLOB_GRACE_MS, BLOB_PENDING_MS } from "../../server/ports/blobs.js";
 import { tempDir, cleanup, fakePng, sha1, deferred } from "./helpers.js";
 
 afterAll(cleanup);

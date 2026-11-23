@@ -1,7 +1,7 @@
 // Test fixtures for the auth tests. `createBoard` is NOT the product rule (that is server/auth/spaces.js: board.create at a Space or
 // the personal space): it makes a board with an owner grant directly, as a test setup step, with no permission check. Every board lives
 // in a Space (Registry.createBoard requires one), so these helpers file a board in a per-Unit "Fixtures" Space with no general access.
-import { ROLES } from "../../server/auth/util.js";
+import { ROLES } from "../../server/core/auth/util.js";
 
 const fixtureSpaces = new WeakMap();
 /** The id of a Space (no general access, no owner) in `tenant`, made once per Registry object; for tests that only need a place for a board. */

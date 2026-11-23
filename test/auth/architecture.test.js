@@ -138,13 +138,13 @@ test("checker: allowed imports, look-alikes and unclassified files", () => {
 });
 
 test("checker: inbound, only a composition root imports an auth adapter", () => {
-  expect(one("server/registry/x.js", `import { mint } from "../auth/a.js";`)).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]: only a composition root may import adapter"]);
-  expect(one("server/registry/x.js", `import { mint } from "../auth/p.js";`)).toEqual([]);
+  expect(one("server/registry/x.js", `import { mint } from "./a.js";`)).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]: only a composition root may import adapter"]);
+  expect(one("server/registry/x.js", `import { mint } from "./p.js";`)).toEqual([]);
   expect(one("server/main.js", `import { a } from "./auth/a.js";`)).toEqual([]);
 });
 
 test("checker: a runtime import and a JSDoc type of the same file are reported separately", () => {
-  const src = `import { mint } from "../auth/a.js";\n/** @returns {import("../auth/a.js").R} */`;
+  const src = `import { mint } from "./a.js";\n/** @returns {import("./a.js").R} */`;
   const v = one("server/registry/x.js", src);
   expect(v.map(key).sort()).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]", "server/registry/x.js -> server/auth/a.js [type]"]);
 });

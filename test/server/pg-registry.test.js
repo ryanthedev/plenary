@@ -6,14 +6,14 @@
 // Skips unless DATABASE_URL is set. Each test gets its own schema, dropped after.
 import { describe, test, expect, afterAll, setDefaultTimeout } from "bun:test";
 import { SQL } from "bun";
-import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/registry/postgres.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
+import { postgresRegistry, registryTables, REGISTRY_INDEXES } from "../../server/adapters/driven/registry/postgres.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
 import { registryContract } from "../auth/registry-contract.js";
 import { accessRace } from "../auth/access-race.js";
 import { accessEquivalence } from "../auth/access-equivalence.js";
-import { tenancy } from "../../server/auth/tenancy.js";
-import { migrate, ddlColumns } from "../../server/pg/schema.js";
-import { STORE_TABLES } from "../../server/store/postgres.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
+import { migrate, ddlColumns } from "../../server/adapters/support/pg/schema.js";
+import { STORE_TABLES } from "../../server/adapters/driven/store/postgres.js";
 import { mkBoard } from "../auth/fixtures.js";
 
 const url = process.env.DATABASE_URL;

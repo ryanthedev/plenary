@@ -1,10 +1,10 @@
 // p5-load (p-audit F4, F8): the role cache and the batched lookup in server/auth/tenancy.js, the optional
 // Registry batch `linkUsesFor`, and share-link redemption no longer announcing on `grants` (server/main.js).
 import { test, expect, beforeEach } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy, roleCache, combine, identityKey, USE_CHUNK } from "../../server/auth/tenancy.js";
-import { memoryBus } from "../../server/bus/memory.js";
-import { subjects } from "../../server/bus/port.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy, roleCache, combine, identityKey, USE_CHUNK } from "../../server/core/auth/tenancy.js";
+import { memoryBus } from "../../server/adapters/driven/bus/memory.js";
+import { subjects } from "../../server/ports/bus.js";
 import { announcingRegistry } from "../../server/main.js";
 import { mkBoard } from "./fixtures.js";
 

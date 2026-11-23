@@ -3,7 +3,7 @@
 // Every test uses its own tenant ids, so adapters that share one store across tests (one bucket) stay isolated.
 // Adapter-specific checks (file layout, object keys) live in that adapter's own test file.
 import { test, expect } from "bun:test";
-import { MAX_BLOB_BYTES } from "../../server/blobs/disk.js";
+import { MAX_BLOB_BYTES } from "../../server/adapters/driven/blobs/disk.js";
 import { fakePng, sha1 } from "./helpers.js";
 
 const code = async p => { try { await p; return "resolved"; } catch (e) { return e.code ?? `threw ${e.message}`; } };

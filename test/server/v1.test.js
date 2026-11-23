@@ -4,8 +4,8 @@ import { test, expect, afterAll } from "bun:test";
 import { rig, client, tokenOf, settled, rawSock } from "./rig.js";
 import { virtualTime } from "./virtual.js";
 import { cleanup, sleep, until } from "./helpers.js";
-import { subjects } from "../../server/bus/port.js";
-import { splitEntries } from "../../server/room-host.js";
+import { subjects } from "../../server/ports/bus.js";
+import { splitEntries } from "../../server/core/room-host.js";
 import { makeElement } from "../../packages/core/model.js";
 
 afterAll(cleanup);
@@ -119,7 +119,7 @@ test("the bus cap: `.entries` batches are split under it in seq order, and an op
 
   // Over a real (small-capped) bus: a group commit of several ops goes out split; every client still gets each once.
   const cap = 40 * 1024;
-  const { memoryBus } = await import("../../server/bus/memory.js");
+  const { memoryBus } = await import("../../server/adapters/driven/bus/memory.js");
   const r = await rig({ wrapBus: () => memoryBus({ maxBytes: cap }) });
   const msgs = [];
   r.bus.subscribe(subjects.entries(r.ids.tenant, r.ids.board), m => { if (m.items) msgs.push(m); });

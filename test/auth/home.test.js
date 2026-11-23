@@ -2,11 +2,11 @@
 // listings hold only boards the person can open now (the access-leak tests), Recent / Starred / Shared / tree / search,
 // what a guest sees, the batch access check agreeing with the single-board resolver, and its statement count.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { tenancy } from "../../server/auth/tenancy.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
 import { accessEquivalence } from "./access-equivalence.js";
-import { homeService, recentRecorder, LIMITS, SHARED_PART } from "../../server/auth/home.js";
+import { homeService, recentRecorder, LIMITS, SHARED_PART } from "../../server/core/auth/home.js";
 import { mkBoard } from "./fixtures.js";
 
 let clock, r, ten, home, acme;

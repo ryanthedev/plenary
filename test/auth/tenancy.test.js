@@ -1,9 +1,9 @@
 import { test, expect, beforeEach } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy } from "../../server/auth/tenancy.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy } from "../../server/core/auth/tenancy.js";
 import { createBoard, mkBoard, spaceOf } from "./fixtures.js";
-import { isUnitAdmin } from "../../server/auth/resolver.js";
-import { createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/admin/boards.js";
+import { isUnitAdmin } from "../../server/core/auth/resolver.js";
+import { createInvite, createLink, revokeInvite, revokeLink, listInvites, listLinks, setGrant, AdminError } from "../../server/core/admin/boards.js";
 
 let clock, registry, model, acme, globex, admin, board;
 const now = () => clock.t;

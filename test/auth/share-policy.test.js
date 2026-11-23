@@ -10,13 +10,13 @@ import {
   validateSharePolicy,
   createLinkRateLimiter,
   checkLinkPolicy,
-} from "../../server/auth/share-policy.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { createLink, shareView, verifyLinkAccess } from "../../server/admin/boards.js";
+} from "../../server/core/auth/share-policy.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { createLink, shareView, verifyLinkAccess } from "../../server/core/admin/boards.js";
 
 const T0 = Date.UTC(2026, 10, 22, 12, 0, 0);
 

@@ -36,7 +36,7 @@ import { setPriority, hostname } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
-import { postgresStore } from "../server/store/postgres.js";
+import { postgresStore } from "../server/adapters/driven/store/postgres.js";
 import { client, tokenOf } from "../test/server/rig.js";
 import { sleep } from "../test/server/helpers.js";
 

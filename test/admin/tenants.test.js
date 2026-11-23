@@ -6,11 +6,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SQL } from "bun";
-import { bootstrapTenant, normAdmin, normDomain, shown } from "../../server/admin/tenants.js";
-import { isUnitAdmin } from "../../server/auth/resolver.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
-import { postgresRegistry } from "../../server/registry/postgres.js";
+import { bootstrapTenant, normAdmin, normDomain, shown } from "../../server/core/admin/tenants.js";
+import { isUnitAdmin } from "../../server/core/auth/resolver.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
+import { postgresRegistry } from "../../server/adapters/driven/registry/postgres.js";
 
 // Failure-only ceiling: the Postgres adapter creates a schema per test, which bun's 5 s default fails under machine load (TECH-DEBT row 36).
 setDefaultTimeout(30_000);

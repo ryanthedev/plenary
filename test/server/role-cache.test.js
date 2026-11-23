@@ -4,8 +4,8 @@
 import { test, expect, afterAll } from "bun:test";
 import { rig, tokenOf } from "./rig.js";
 import { cleanup, sleep, until } from "./helpers.js";
-import { subjects } from "../../server/bus/port.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
+import { subjects } from "../../server/ports/bus.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
 import { virtualTime } from "./virtual.js";
 
 afterAll(cleanup);

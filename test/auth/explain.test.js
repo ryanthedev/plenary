@@ -1,16 +1,16 @@
 // Access explanation and requests (server/auth/explain.js, access.js, spaces.js; PROTOCOL.md § Access explanation and requests, #51): the explanation comes from the
 // resolver's own Access, so it cannot drift from enforcement; it leaks nothing a caller may not see; Ask for access is idempotent and rate limited.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { accessService } from "../../server/auth/access.js";
-import { spaceService } from "../../server/auth/spaces.js";
-import { needsOf, mineOf } from "../../server/auth/explain.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { ASK } from "../../server/auth/registry-port.js";
-import { askRolesFor } from "../../server/auth/explain.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { accessService } from "../../server/core/auth/access.js";
+import { spaceService } from "../../server/core/auth/spaces.js";
+import { needsOf, mineOf } from "../../server/core/auth/explain.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { ASK } from "../../server/ports/registry.js";
+import { askRolesFor } from "../../server/core/auth/explain.js";
 
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });
 const dev = ident("dev"), pat = ident("pat"), tom = ident("tom"), root = ident("root"), kim = ident("kim", "partner.io"), eve = ident("eve");
@@ -265,7 +265,7 @@ describe("Ask for access", () => {
     expect(await r.accessRequest({ type: "board", id: board.id }, dev.user)).toMatchObject({ state: "pending" });
     await svc.setGrant(pat, "board", board.id, "user", dev.user, "editor").catch(() => {});
     // the board grant route of the admin layer closes it too
-    const { setGrant } = await import("../../server/admin/boards.js");
+    const { setGrant } = await import("../../server/core/admin/boards.js");
     await setGrant({ caller: pat, board: board.id, user: dev.user, role: "editor" }, { registry: r });
     expect(await r.accessRequest({ type: "board", id: board.id }, dev.user)).toBeNull();
   });

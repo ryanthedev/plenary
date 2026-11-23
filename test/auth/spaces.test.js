@@ -1,12 +1,12 @@
 // Spaces and Groups (server/auth/spaces.js, PROTOCOL.md § Spaces and Groups): create by permission, pickers, pages, rename, general access
 // and its announcements, and the no-leak rule, over the real tenancy and the memory Registry, then over the HTTP routes.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { spaceService, ANNOUNCE } from "../../server/auth/spaces.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { spaceService, ANNOUNCE } from "../../server/core/auth/spaces.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 
 let r, ten, svc, acme, announced;
 const ident = (n, domain = "acme.com") => ({ user: `google:${n}`, name: n, email: `${n}@${domain}`, domain });

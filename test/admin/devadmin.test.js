@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { start } from "../../server/main.js";
 import { run, parseArgs } from "../../scripts/admin-bootstrap.js";
-import { sqliteRegistry } from "../../server/registry/sqlite.js";
+import { sqliteRegistry } from "../../server/adapters/driven/registry/sqlite.js";
 
 const made = [];
 const tempDir = () => { const d = mkdtempSync(join(tmpdir(), "plenary-devadmin-")); made.push(d); return d; };

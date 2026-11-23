@@ -8,9 +8,9 @@
 // - A Store error during a look keeps the look open (TECH-DEBT row 10).
 import { test, expect, afterAll } from "bun:test";
 import { join } from "node:path";
-import { boardFeed } from "../../server/feed.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
-import { memoryBus, subjects } from "../../server/bus/memory.js";
+import { boardFeed } from "../../server/core/feed.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
+import { memoryBus, subjects } from "../../server/adapters/driven/bus/memory.js";
 import { tempDir, cleanup, until, sleep } from "./helpers.js";
 import { rig } from "./rig.js";
 

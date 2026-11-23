@@ -2,13 +2,13 @@
 // /groups, /teams, invites and links. A retry returns the first object (never a 409, never a second one), a changed request is refused, and a create
 // that committed and then failed unclearly (or a crash before the answer) is answered the same way.
 import { test, expect, beforeEach } from "bun:test";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { homeService } from "../../server/auth/home.js";
-import { devAuth } from "../../server/auth/dev.js";
-import { readLink, readInvite } from "../../server/admin/boards.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { homeService } from "../../server/core/auth/home.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
+import { readLink, readInvite } from "../../server/core/admin/boards.js";
 
 const ORIGIN = "https://plenary.test";
 const config = { cookieKey: "k".repeat(32), postLoginUrl: ORIGIN + "/", boardUrl: ORIGIN + "/b/{board}", publicUrl: ORIGIN };

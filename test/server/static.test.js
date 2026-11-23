@@ -7,8 +7,8 @@ import { connect } from "node:net";
 import { dirname, join, relative, resolve } from "node:path";
 import { rig } from "./rig.js";
 import { cleanup, tempDir } from "./helpers.js";
-import { createServer } from "../../server/server.js";
-import { staticSite, safePath, scanModule, scanHtml, denied, CSP, DEFAULT_MOUNTS } from "../../server/static.js";
+import { createServer } from "../../server/adapters/driving/server.js";
+import { staticSite, safePath, scanModule, scanHtml, denied, CSP, DEFAULT_MOUNTS } from "../../server/adapters/driving/static.js";
 
 afterAll(cleanup);
 

@@ -6,7 +6,7 @@ import { test, expect, afterAll, describe } from "bun:test";
 import { SQL } from "bun";
 import { tempDir, cleanup, until, spawnTracked } from "./helpers.js";
 import { sock } from "./rig.js";
-import { postgresStore } from "../../server/store/postgres.js";
+import { postgresStore } from "../../server/adapters/driven/store/postgres.js";
 
 afterAll(cleanup);
 // The rig's S3 (the cluster's picture storage): a cluster node refuses to start without it. Many nodes share it, which the single-gateway local-disk opt-in could not serve.

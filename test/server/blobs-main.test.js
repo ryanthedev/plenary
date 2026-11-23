@@ -3,7 +3,7 @@
 // gets the bytes back through a signed URL. Also the blob settings main.js refuses at start.
 import { test, expect, afterAll } from "bun:test";
 import { appClient, restoreAppGlobals } from "../web/app-client.js";
-import { sqliteStore } from "../../server/store/sqlite.js";
+import { sqliteStore } from "../../server/adapters/driven/store/sqlite.js";
 import { tempDir, cleanup, until, spawnTracked, fakePng, sha1 } from "./helpers.js";
 
 afterAll(() => { restoreAppGlobals(); cleanup(); });

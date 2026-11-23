@@ -1,12 +1,12 @@
 // Teams and access (server/auth/access.js, PROTOCOL.md § Teams and access, #49): Team CRUD by `team.manage`, the access page and grant writes at every scope,
 // the role picker, the last-owner rule, the no-leak rule, the announcements each change owes, and the HTTP routes, over the real tenancy and the memory Registry.
 import { test, expect, beforeEach, describe } from "bun:test";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { accessService, LIMITS } from "../../server/auth/access.js";
-import { httpRoutes } from "../../server/auth/http.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { devAuth } from "../../server/auth/dev.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { accessService, LIMITS } from "../../server/core/auth/access.js";
+import { httpRoutes } from "../../server/adapters/driving/auth-http.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { devAuth } from "../../server/adapters/driven/auth/dev.js";
 import { mkBoard } from "./fixtures.js";
 
 let r, ten, svc, acme, ann;

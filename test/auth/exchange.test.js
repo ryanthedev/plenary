@@ -2,12 +2,12 @@
 // URL fragment and an HttpOnly exchange cookie in the browser; POST /auth/exchange turns the pair into the session
 // token. No long-lived token in any URL.
 import { test, expect, beforeAll, beforeEach } from "bun:test";
-import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/auth/http.js";
-import { googleOidc } from "../../server/auth/oidc.js";
-import { sessions as makeSessions } from "../../server/auth/session.js";
-import { memoryRegistry } from "../../server/auth/registry.js";
-import { tenancy as makeTenancy } from "../../server/auth/tenancy.js";
-import { createLink } from "../../server/admin/boards.js";
+import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE } from "../../server/adapters/driving/auth-http.js";
+import { googleOidc } from "../../server/adapters/driven/auth/oidc.js";
+import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
+import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
+import { createLink } from "../../server/core/admin/boards.js";
 import { createBoard } from "./fixtures.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
 

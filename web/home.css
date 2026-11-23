@@ -1085,6 +1085,13 @@
     min-width: 44px;
   }
 
+  .home-page .home-top .theme-toggle {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+  }
+
   .home-page .adm-row {
     padding: 12px 14px;
   }
@@ -1152,6 +1159,7 @@
   .home-page .home-side .btn.home-new-board,
   .home-page .home-side .btn.home-side-add,
   .home-page .home-admin-summary,
+  .home-page .home-top .theme-toggle,
   .home-page .card .star,
   .home-page .card .card-menu .more {
     min-width: 44px;

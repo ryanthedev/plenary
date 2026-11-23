@@ -7,6 +7,7 @@
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
 import { overflowMenu, avatarEl, auditTone } from "./spaces.js";
+import { createThemeToggle } from "./theme.js";
 import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
 import { TEMPLATES } from "../../../packages/core/templates.js";
@@ -201,11 +202,12 @@ function prefillNewBoardTitle(dlg, boardTitle) {
  *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
  *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"|"listTenantMembers"|"addTenantMember"|"removeTenantMember"|"adminAudit"> | null,
  *   storage?: import("../../ports/storage.js").Storage | null,
+ *   themeCtrl?: import("./theme.js").ThemeController | null,
  *   onLogout?: (() => void) | null,
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string, links?: Array<{ href: string, text?: string }> } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null, onLogout = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null, themeCtrl = null, onLogout = null }) {
   const S = model.state, keys = keeper(), mark = keys.mark;
   let destroyed = false;
   /** @type {null|"members"|"audit"} */ let panel = null;
@@ -238,6 +240,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const main = h("main.home-main", { id: "home-main", tabindex: "-1" });
   const fabHost = h("div.home-fab-host");
   const who = h("span.home-who");
+  const themeToggle = createThemeToggle({ themeCtrl, mark });
   const logoutBtn = onLogout
     ? mark(h("button.btn.ghost.home-logout", { type: "button", "data-action": "logout", "aria-label": "Sign out", onclick: () => onLogout() }, "Sign out"), "logout")
     : null;
@@ -247,7 +250,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, brandMark(), "Plenary"),
     orgBadge,
     h("div.home-searchbox", { role: "search" }, search, h("kbd", { "aria-hidden": "true" }, "/ or ⌘K")),
-    h("span.spacer"), who, logoutBtn);
+    h("span.spacer"), themeToggle.el, who, logoutBtn);
   const home = h("div.home.home-page", { id: "home" }, top, status, mobileTabs, drawerBackdrop, h("div.home-body", {}, side, main), fabHost);
   root.replaceChildren(home);
 
@@ -794,5 +797,5 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   };
   document.addEventListener("keydown", onKey);
   render();
-  return { destroy() { destroyed = true; closeCardSheet(); unsub(); document.removeEventListener("keydown", onKey); root.replaceChildren(); } };
+  return { destroy() { destroyed = true; themeToggle.destroy(); closeCardSheet(); unsub(); document.removeEventListener("keydown", onKey); root.replaceChildren(); } };
 }

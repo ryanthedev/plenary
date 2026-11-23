@@ -20,11 +20,11 @@ const CELL = { yes: ["✓", "applies"], no: ["", "not granted"], na: ["–", "no
 
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/role-admin.js").createRolesModel>, hrefs: { home: string },
- *   signIn?: { href: string, text?: string } | null, mobileCards?: boolean | null }} o
+ *   signIn?: { href: string, text?: string } | null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null }} o
  */
-export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards = null }) {
+export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards = null, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   const keys = keeper();
   let after = null, deleting = false, saveBtn = null, discardBtn = null, controls = [];
   const nameIn = h("input.field", { type: "text", maxlength: "250", "aria-label": "Role name", oninput: e => { model.setName(e.target.value); sync(); } });
@@ -142,5 +142,5 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
   }
   model.subscribe(render);
   render();
-  return { destroy() { root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); root.replaceChildren(); } };
 }

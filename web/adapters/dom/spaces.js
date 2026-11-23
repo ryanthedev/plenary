@@ -6,6 +6,7 @@
 
 import { h, replace } from "./dom.js";
 import { keeper, announce } from "./focus.js";
+import { createThemeToggle } from "./theme.js";
 import { whyCard } from "./explain.js";
 import { startMove } from "./move.js";
 import { showTrashToast } from "./toast.js";
@@ -107,13 +108,14 @@ export function auditTone(action) {
   return "neutral";
 }
 
-/** The page chrome shared by both pages. */
-export function shell(root, hrefs) {
+/** The page chrome shared by all Workspace Admin, Space, Area, Access, Roles, Offboard, and Trash pages. */
+export function shell(root, hrefs, { themeCtrl = null } = {}) {
   const status = h("div.home-status", { role: "status", "aria-live": "polite", hidden: true });
   const main = h("main.home-main.sp-main", { id: "home-main", tabindex: "-1" });
+  const themeToggle = createThemeToggle({ themeCtrl });
   root.replaceChildren(h("div.home.sp-page", {},
-    h("header.home-top", {}, h("a.logo", { href: hrefs.home, "aria-label": "Plenary home" }, brandMark(), "Plenary"), h("span.spacer")), status, main));
-  return { status, main };
+    h("header.home-top", {}, h("a.logo", { href: hrefs.home, "aria-label": "Plenary home" }, brandMark(), "Plenary"), h("span.spacer"), themeToggle.el), status, main));
+  return { status, main, destroyTheme: themeToggle.destroy };
 }
 export function showNotice(status, model) {
   const S = model.state;
@@ -166,13 +168,13 @@ const afterRender = () => { let fn = null; return { set: f => { fn = f; }, run: 
 /**
  * @param {{ root: HTMLElement, move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null, model: ReturnType<typeof import("../../core/spaces.js").createPageModel>, dialogs: ReturnType<typeof import("./dialogs.js").createDialogs>,
  *   hrefs: { home: string, board(id: string): string, space(id: string): string, group(id: string): string, access?(type: string, id: string): string },
- *   signIn?: { href: string, text?: string } | null, access?: any, newKey?: (() => string) | null, trash?: any }} o
+ *   signIn?: { href: string, text?: string } | null, access?: any, newKey?: (() => string) | null, trash?: any, themeCtrl?: import("./theme.js").ThemeController | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null, move = null, trash = null }) {
+export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, access = null, newKey = null, move = null, trash = null, themeCtrl = null }) {
   let whyRef = null;
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   /** @type {null | { type: "title" } | { type: "board", id: string }} */
   let editing = null;
   const title = {}, cardEdits = new Map(), after = afterRender(), links = new Map(), keys = keeper();
@@ -262,13 +264,13 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
   }
   const unsub = model.subscribe(render);
   render();
-  return { destroy() { unsub(); root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); unsub(); root.replaceChildren(); } };
 }
 
 /** The Group page: its Spaces as tiles, New space, rename in place, overflow menu. */
-export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
+export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   let editing = false;
   const title = {}, after = afterRender(), keys = keeper();
   let h1 = null, shown = null, groupId = null, moreBtn = null;
@@ -319,5 +321,5 @@ export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null }) {
   }
   const unsub = model.subscribe(render);
   render();
-  return { destroy() { unsub(); root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); unsub(); root.replaceChildren(); } };
 }

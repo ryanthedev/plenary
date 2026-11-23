@@ -227,7 +227,7 @@ const ADMIN_CSS = `
 .adm-btn.danger.solid {
   background: var(--bad, #C81E1E);
   border-color: var(--bad, #C81E1E);
-  color: #FFFFFF;
+  color: var(--bad-fg, #FFFFFF);
 }
 .adm-btn.danger.solid:hover:not(:disabled) { opacity: 0.9; background: var(--bad, #C81E1E); }
 .adm-error {
@@ -235,7 +235,7 @@ const ADMIN_CSS = `
   border-radius: 10px;
   background: var(--bad-bg, #FEF2F2);
   color: var(--bad, #C81E1E);
-  border: 1px solid rgba(200, 30, 30, 0.2);
+  border: 1px solid color-mix(in srgb, var(--bad, #C81E1E) 28%, transparent);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -301,7 +301,7 @@ const ADMIN_CSS = `
   position: fixed;
   inset: 0;
   z-index: 60;
-  background: rgba(17, 17, 19, 0.45);
+  background: var(--veil, rgba(17, 17, 19, 0.45));
   display: flex;
   align-items: center;
   justify-content: center;

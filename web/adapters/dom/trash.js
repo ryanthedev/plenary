@@ -13,12 +13,12 @@ const NOTES = { forbidden: "You can't see the Trash.", "signed-out": "You are si
 
 /**
  * The Trash page: what the person may restore, where each board was, who deleted it and how many days are left.
- * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/trash.js").createTrashModel>, hrefs: { home: string }, signIn?: { href: string, text?: string }|null }} o
+ * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/trash.js").createTrashModel>, hrefs: { home: string }, signIn?: { href: string, text?: string }|null, themeCtrl?: import("./theme.js").ThemeController | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountTrashPage({ root, model, hrefs, signIn = null }) {
+export function mountTrashPage({ root, model, hrefs, signIn = null, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   let h1 = null, after = null;
   const buttons = new Map();
   const row = item => {
@@ -54,7 +54,7 @@ export function mountTrashPage({ root, model, hrefs, signIn = null }) {
     render();
   });
   render();
-  return { destroy() { unsub(); root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); unsub(); root.replaceChildren(); } };
 }
 
 /**

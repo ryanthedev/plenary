@@ -20,6 +20,7 @@ import { httpAuth, fetchAuthProviders } from "./adapters/auth/http.js";
 import { httpDevConfig } from "./adapters/auth/devconfig.js";
 import { wsNet, sameOriginWsUrl, browserInflate } from "./adapters/transport/ws.js";
 import { mountApp } from "./adapters/dom/app.js";
+import { initTheme } from "./adapters/dom/theme.js";
 import { syncCollabPort } from "./adapters/collab/sync.js";
 import { showGate, hideGate } from "./adapters/dom/gate.js";
 import { httpHome } from "./adapters/home/http.js";
@@ -50,6 +51,10 @@ import { createSession } from "./core/session.js";
 import { rememberBoard, takeReturnBoard } from "./core/roles.js";
 
 const clock = browserClock();
+const prefs = localStore();
+const q0 = new URLSearchParams(location.search);
+const theme0 = q0.get("theme");
+const themeCtrl = initTheme({ prefs, urlTheme: theme0 });
 const fetchNow = /** @type {typeof globalThis.fetch} */ ((input, init) => globalThis.fetch(input, init));
 
 // Never a blank page: the gate shows before the exchange starts (p6-hexv MEDIUM; worst case ~22 s of retries).
@@ -75,7 +80,6 @@ const picked = menuSignIn({ query: location.search, menu, storage: tabStore, clo
 const signIn = picked ?? fromCode;
 
 const q = new URLSearchParams(location.search);
-const theme0 = q.get("theme");
 const asked = /^[\w-]{1,64}$/.test(q.get("board") ?? "") ? q.get("board") : null;
 // Back from "Sign in again" (C-9): the server's login lands on its fixed page, so the board this tab left comes from
 // session storage (the board id only, once, after a fresh sign-in), and goes back into the address bar.
@@ -124,26 +128,26 @@ if (!signIn.token) {
   if (rolesPage) {
     // The Roles screen (PROTOCOL.md § Roles): the server answers 404 to a caller without roles.manage, which shows the same "not available" page.
     const model = createRolesModel({ api: httpRoles({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
-    mountRolesPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load();
+    mountRolesPage({ root, model, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load();
   } else if (offboardPage) {
     // The leaver screen (PROTOCOL.md § Leaver offboarding): a caller without members.manage gets the same "not available" page. `?offboard=<user id>` opens a person.
     const who = q.get("offboard") && q.get("offboard") !== "1" ? q.get("offboard").slice(0, 200) : null;
     const model = createOffboardModel({ api: httpOffboard({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
-    mountOffboardPage({ root, model, hrefs, signIn: signInLink, start: who }); hideGate();
+    mountOffboardPage({ root, model, hrefs, signIn: signInLink, start: who, themeCtrl }); hideGate();
   } else if (trashPage) {
     // The Trash (PROTOCOL.md § Trash and restore): what this person may restore. A caller outside a Unit gets the same "not available" page.
     const model = createTrashModel({ api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
-    mountTrashPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load();
+    mountTrashPage({ root, model, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load();
   } else if (teamId || teamsPage || accessArg) {
     // Teams, a Team, or the access page of a scope (PROTOCOL.md § Teams and access). An id the person can't open shows the same "not available" page as one that does not exist.
     const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
-    if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink }); hideGate(); model.load(); }
-    else if (teamId) { const model = createTeamModel({ api, id: teamId }); mountTeamPage({ root, model, api, hrefs, signIn: signInLink }); hideGate(); model.load(); }
-    else { const model = createAccessModel({ api, type: /** @type {"unit"|"group"|"space"|"board"} */ (accessArg[1]), id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey() }); hideGate(); model.load(); }
+    if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load(); }
+    else if (teamId) { const model = createTeamModel({ api, id: teamId }); mountTeamPage({ root, model, api, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load(); }
+    else { const model = createAccessModel({ api, type: /** @type {"unit"|"group"|"space"|"board"} */ (accessArg[1]), id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey(), themeCtrl }); hideGate(); model.load(); }
   } else if (spaceId || groupId) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
-    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink, access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey(),
+    (spaceId ? mountSpacePage : mountGroupPage)({ root, model, dialogs, hrefs, signIn: signInLink, themeCtrl, access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey(),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() },
       trash: { api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
@@ -151,7 +155,7 @@ if (!signIn.token) {
   } else {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
-      org: orgApi, onLogout,
+      org: orgApi, onLogout, themeCtrl,
       boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
@@ -192,7 +196,7 @@ if (!signIn.token) {
       });
       return session;
     },
-    net, board, me, prefs: localStore(), theme: q.get("theme"),
+    net, board, me, prefs, theme: theme0,
     // Why the pill says "View only" (PROTOCOL.md § Access explanation and requests): looked up when the pill is opened, with Ask for access.
     access: httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey(),
     // The Share dialog's calls (PROTOCOL.md § Share dialog).

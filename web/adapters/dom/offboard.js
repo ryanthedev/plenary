@@ -16,12 +16,12 @@ import { isMobileCardViewport, renderOffboardCards } from "./mobile/admin-cards.
 import { itemLabel, planLine, removeLines } from "../../core/offboard.js";
 
 /**
- * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/offboard.js").createOffboardModel>, hrefs: { home: string }, signIn?: { href: string, text?: string } | null, start?: string|null, mobileCards?: boolean | null }} o
+ * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/offboard.js").createOffboardModel>, hrefs: { home: string }, signIn?: { href: string, text?: string } | null, start?: string|null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null }} o
  *   start: a person to open at once (`?offboard=<user id>`)
  */
-export function mountOffboardPage({ root, model, hrefs, signIn = null, start = null, mobileCards = null }) {
+export function mountOffboardPage({ root, model, hrefs, signIn = null, start = null, mobileCards = null, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   let dlg = null, reviewBtn = null, removeBtn = null, h1 = null, focusTo = null;
   /** The control with this `data-fk` in the CURRENT page (a redraw replaces every node, so a held reference points at a detached one), else the heading. */
   const keeper = k => (typeof main.querySelector === "function" ? main.querySelector(`[data-fk="${k}"]`) : main.find(e => e.getAttribute?.("data-fk") === k)) ?? h1;
@@ -116,5 +116,5 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   const unsub = model.subscribe(render);
   render();
   if (start) model.open(start);
-  return { destroy() { unsub(); root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); unsub(); root.replaceChildren(); } };
 }

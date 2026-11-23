@@ -1940,7 +1940,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const core = tools.filter(t => !["image", "note", "highlighter"].includes(t.id)), extras = tools.filter(t => ["image", "note", "highlighter"].includes(t.id));
     const toggleDrawer = type => { ui.drawer = ui.drawer === type ? null : type; chromeDirty = true; };
     const toggleNotes = () => { ui.drawer = ui.drawer ? null : "notes"; chromeDirty = true; };
-    const toggleTheme = () => setTheme(ui.theme === "dark" ? "light" : "dark");
+    const toggleTheme = () => {
+      const next = ui.theme === "dark" ? "light" : "dark";
+      setTheme(next);
+      applyUserSettings({ ...userSettings, defaultTheme: next });
+    };
     const toggleGrid = () => { S.act("board", e => e.setAppState({ grid: e.grid ? 0 : 20 }), { settings: true }); chromeDirty = true; };
     const togglePanel = () => setPanel({ type: "open" });
     const toggleExport = () => openDialog("export");
@@ -2621,7 +2625,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Settings & keybindings", onclick: () => { setSheet(null, { restore: false }); openSettingsDialog(); } }, h("span.ic", {}, icon("settings", { size: 20 })), "Settings"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
-        h("button.tb", { "aria-label": "Toggle color theme", title: "Light / dark", "aria-pressed": String(ui.theme === "dark"), onclick: () => setTheme(ui.theme === "dark" ? "light" : "dark") }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark"),
+        h("button.tb", { "aria-label": "Toggle color theme", title: "Light / dark", "aria-pressed": String(ui.theme === "dark"), onclick: () => { const next = ui.theme === "dark" ? "light" : "dark"; setTheme(next); applyUserSettings({ ...userSettings, defaultTheme: next }); } }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark"),
         onLogout ? h("button.tb", { "aria-label": "Sign out", title: "Sign out", "data-action": "logout", onclick: () => { setSheet(null, { restore: false }); onLogout(); } }, h("span.ic", {}, icon("logout", { size: 20 })), "Sign out") : null));
     } else if (ui.sheet === "actions") {
       const { stream: targetStream, selected, hitEl } = resolveActionSheetSelection();

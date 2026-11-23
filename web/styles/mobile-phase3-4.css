@@ -18,7 +18,7 @@
 .mobile-meeting-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--veil, rgba(15, 23, 42, 0.45));
   z-index: 1200;
 }
 
@@ -195,7 +195,7 @@
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(15, 23, 42, 0.45);
+    background: var(--veil, rgba(15, 23, 42, 0.45));
     z-index: 1090;
   }
 
@@ -464,9 +464,9 @@
 }
 
 .meeting-pill.tone-danger {
-  background: var(--danger, #dc2626);
-  border-color: var(--danger, #dc2626);
-  color: #fff;
+  background: var(--bad, #dc2626);
+  border-color: var(--bad, #dc2626);
+  color: var(--bad-fg, #fff);
   margin-left: auto;
 }
 
@@ -509,7 +509,7 @@
 }
 
 .timer-sheet-readout.is-overtime {
-  color: var(--danger, #dc2626);
+  color: var(--bad, #dc2626);
 }
 
 .timer-presets,

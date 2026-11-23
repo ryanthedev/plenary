@@ -83,9 +83,9 @@ export function pickerView({ api, teams, rolesFor = null, onAdd, label, setTimer
 const sortRows = rows => [...rows].sort((a, b) => (a.subject.name.toLowerCase() < b.subject.name.toLowerCase() ? -1 : a.subject.name.toLowerCase() > b.subject.name.toLowerCase() ? 1 : a.subject.id < b.subject.id ? -1 : 1));
 
 /** The Teams list: search, Create (when allowed), Teams as links, Show more. */
-export function mountTeamsPage({ root, model, hrefs, signIn = null }) {
+export function mountTeamsPage({ root, model, hrefs, signIn = null, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   const keys = keeper();
   let after = null, moreBtn = null, createBtn = null;
   const q = h("input.field", { type: "search", "aria-label": "Search teams", maxlength: "100", placeholder: "Search teams" });
@@ -114,13 +114,13 @@ export function mountTeamsPage({ root, model, hrefs, signIn = null }) {
   }
   model.subscribe(render);
   render();
-  return { destroy() { root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); root.replaceChildren(); } };
 }
 
 /** One Team: rename, members (remove), add a member through the picker, delete. */
-export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker = {} }) {
+export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker = {}, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   const keys = keeper();
   let confirming = false, after = null, view = null, controls = [];
   const pend = () => { for (const c of controls) c.setAttribute("aria-disabled", "true"); };      // a change is in flight: its row controls stay in the tab order but do nothing
@@ -166,16 +166,16 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
   }
   model.subscribe(render);
   render();
-  return { destroy() { root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); root.replaceChildren(); } };
 }
 
 /**
  * The access page of a scope (unit | group | space | board): who has access and through what, change or remove a role where the server allows it, and
  * the one picker to add a person or Team.
  */
-export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {}, newKey = null }) {
+export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {}, newKey = null, themeCtrl = null }) {
   const S = model.state;
-  const { status, main } = shell(root, hrefs);
+  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
   main.setAttribute?.("class", "home-main sp-main access-main");
   const keys = keeper();
   let view = null, after = null, controls = [], ask = null, askSig = null;
@@ -272,5 +272,5 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
   }
   model.subscribe(render);
   render();
-  return { destroy() { root.replaceChildren(); } };
+  return { destroy() { destroyTheme(); root.replaceChildren(); } };
 }

@@ -2126,6 +2126,51 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         }, icon(ic, { size: 13 }), h("span.mode-tab-lab", {}, label))))
       : null;
     const showToolRail = role !== "presenter" || ui.workspaceMode === "draw";
+    const showRibbonTabs = role !== "viewer" && role !== "annotator" && ui.workspaceMode !== "present" && ui.panel.open;
+    const ribbonTabs = (() => {
+      if (!showRibbonTabs) return null;
+      const secs = panelSections(ui.panel, availableFor(S, ui.workspaceMode));
+      const activeTabId = currentActiveTab();
+      const expanded = isRibbonExpanded();
+      const tabIcon = { properties: "palette", arrange: "group", frames: "frame", animate: "play", layers: "layers", library: "stack" };
+      const tabBtns = secs.map(s => {
+        const isSel = s.id === activeTabId;
+        const isOnTab = isSel && expanded;
+        return h("button.ribbon-tab" + (isOnTab ? ".on" : ""), {
+          type: "button",
+          role: "tab",
+          "aria-selected": String(isSel),
+          "aria-label": s.title,
+          "data-tab": s.id,
+          "data-fk": `panel-tab:${s.id}`,
+          onclick: () => onRibbonTab(s.id, activeTabId),
+        }, icon(tabIcon[s.id] ?? "panel", { size: 13 }), h("span.ribbon-tab-lab", {}, s.title));
+      });
+      const toggleBtn = h("button.tb.ribbon-toggle", {
+        type: "button",
+        title: expanded ? "Collapse ribbon" : "Expand ribbon",
+        "aria-label": expanded ? "Collapse ribbon" : "Expand ribbon",
+        "aria-expanded": String(expanded),
+        "data-ribbon-toggle": "1",
+        "data-fk": "ribbon:toggle",
+        onclick: () => onToggleRibbon(),
+      }, icon(expanded ? "chevronUp" : "chevronDown", { size: 14 }), h("span.sr-only", {}, expanded ? "⌃" : "⌄"));
+      return h("div.ribbon-tabs.desk-only", {
+        role: "tablist",
+        "aria-label": "Inspector sections",
+        onkeydown: e => {
+          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+          const idx = tabBtns.indexOf(document.activeElement);
+          if (idx < 0) return;
+          e.preventDefault();
+          const next = e.key === "ArrowRight" ? tabBtns[(idx + 1) % tabBtns.length]
+            : e.key === "ArrowLeft" ? tabBtns[(idx - 1 + tabBtns.length) % tabBtns.length]
+            : e.key === "Home" ? tabBtns[0]
+            : tabBtns[tabBtns.length - 1];
+          next?.focus?.();
+        },
+      }, tabBtns, toggleBtn);
+    })();
     return [
       h("div.island.top-left", {},
         brandHref
@@ -2136,6 +2181,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         moveInfo.space ? h("span.board-space", { title: "The Space this board is in" }, "in ", moveInfo.space.name) : null,
         viewsPill),
       modeSwitcher,
+      ribbonTabs,
       showToolRail
         ? h("div.tools.desk-only.island.tool-rail", { "aria-label": "Drawing tools" }, core.map(t => toolButton(t)), extras.length ? h("span.sep") : null, extras.map(t => toolButton(t, ".new")),
             role !== "viewer" ? [h("span.sep"),
@@ -2662,6 +2708,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   };
   const isRibbonExpanded = () => {
     if (S.role === "annotator") return true;
+    syncRibbonSelection();
     const { count } = selectionInfo();
     return shouldExpandRibbon({
       selectionCount: count,
@@ -2990,6 +3037,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (ui.renamingBoard && busy(root)) return false;
     const ownsFocus = root.contains(active);
     const identity = ownsFocus && {
+      fk: active.getAttribute?.("data-fk"),
       ariaLabel: active.getAttribute?.("aria-label"),
       title: active.getAttribute?.("title"),
       role: active.getAttribute?.("role"),
@@ -3009,16 +3057,23 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const descendants = [];
     const visit = el => { for (const child of el.children) { descendants.push(child); visit(child); } };
     visit(root);
-    const same = descendants.find(el => identity.ariaLabel
-      ? el.getAttribute?.("aria-label") === identity.ariaLabel
-      : identity.title ? el.getAttribute?.("title") === identity.title : identity.role && el.getAttribute?.("role") === identity.role);
+    const same = descendants.find(el => identity.fk
+      ? el.getAttribute?.("data-fk") === identity.fk
+      : identity.ariaLabel
+        ? el.getAttribute?.("aria-label") === identity.ariaLabel
+        : identity.title ? el.getAttribute?.("title") === identity.title : identity.role && el.getAttribute?.("role") === identity.role);
     const closedMenuItem = identity.role === "menuitem" && !ui.moreOpen;
     const fallback = closedMenuItem ? descendants.find(el => el.getAttribute?.("aria-label") === "More") : null;
     (fallback ?? same)?.focus?.();
     return root;
   };
+  const ribbonTabsKey = () => {
+    if (S.role === "viewer" || S.role === "annotator" || ui.workspaceMode === "present" || !ui.panel.open) return "";
+    const secs = panelSections(ui.panel, availableFor(S, ui.workspaceMode));
+    return `${secs.map(s => s.id).join(",")}:${currentActiveTab()}:${isRibbonExpanded() ? "1" : "0"}`;
+  };
   const parts = {
-    topbar: { key: () => `${ui.workspaceMode}:${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${boardModeration().locked ? "1" : "0"}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}`, build: buildTopbar },
+    topbar: { key: () => `${ui.workspaceMode}:${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${boardModeration().locked ? "1" : "0"}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}:${ribbonTabsKey()}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || ui.workspaceMode === "present" || !ui.panel.open ? "" : `${ui.workspaceMode}:${panelKey()}`), build: buildPanel },
     drawer: { key: () => (ui.workspaceMode === "present" ? "" : ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
     timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" || ui.workspaceMode === "present" ? "" : JSON.stringify([ui.workspaceMode, ui.timelineExpanded, isNarrowPhone(), bi.marks, bi.spansSig, bi.tracksSig, bi.cuesSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t, ui.workspaceMode === "animate" ? [...B.sel].join(",") : ""]); }, build: timeline },

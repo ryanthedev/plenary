@@ -125,64 +125,124 @@ describe("web/core/ribbon (pure)", () => {
   });
 });
 
-describe("Contextual Auto-Ribbon DOM integration", () => {
-  test("collapsed by default with only 1 non-hidden active section; auto-expands on shape selection and auto-collapses on deselect", () => {
+describe("Word-Style Two-Bar Contextual Ribbon DOM integration", () => {
+  test("two-bar structure: tabs and chevron live in Bar 1 (#topbar), no separate middle tab bar in #panel, and Bar 2 collapses to 1-bar mode", () => {
     const { S, step } = setup();
+    const topbar = page.byId.topbar;
     const panel = page.byId.panel;
 
-    // Collapsed on first load with nothing selected
+    // Bar 1 (#topbar) holds the Word-style ribbon tabs and collapse/expand chevron; #panel has NO .tabs bar
+    const tablist = find(topbar, e => e.attrs?.role === "tablist" && e.attrs?.["aria-label"] === "Inspector sections");
+    expect(tablist).toBeDefined();
+    expect(find(panel, e => e.classList?.contains?.("tabs"))).toBeUndefined();
+    expect(find(panel, e => e.attrs?.["data-ribbon-toggle"] === "1")).toBeUndefined();
+
+    // Collapsed on first load with nothing selected (1-bar mode)
     expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
-    const toggle = () => find(panel, e => e.attrs?.["data-ribbon-toggle"] === "1");
+    const toggle = () => find(topbar, e => e.attrs?.["data-ribbon-toggle"] === "1");
     expect(toggle()?.textContent).toBe("⌄");
 
-    // Squish fix: in stack mode, only the active tab's .sec is visible; all other .sec have data-ribbon-hidden="true"
+    // Only the active tab's .sec is non-hidden; all other .sec have data-ribbon-hidden="true"
     const secs = findAll(panel, e => e.classList?.contains?.("sec"));
     expect(secs.length).toBeGreaterThan(1);
     const visibleSecs = secs.filter(s => s.attrs["data-ribbon-hidden"] !== "true");
     expect(visibleSecs.length).toBe(1);
     expect(visibleSecs[0].attrs["data-sec"]).toBe("properties");
 
-    // Selecting a shape auto-expands the ribbon
+    // Selecting a shape auto-expands Bar 2 (2-bar mode) and highlights Properties tab in Bar 1
     drawShape(S, "rectangle", 100, 100);
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
     expect(toggle()?.textContent).toBe("⌃");
+    const propTab = find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "properties");
+    expect(propTab?.classList.contains("on")).toBe(true);
 
-    // Deselecting auto-collapses back to the slim tab bar
+    // Deselecting auto-collapses back to 1-bar mode
     S.act("board", e => e.select([]));
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
     expect(toggle()?.textContent).toBe("⌄");
   });
 
+  test("Bar 2 renders Word-style .ribbon-group columns with multi-row .ribbon-group-rows and centered .ribbon-group-label footers", () => {
+    const { S, step } = setup();
+    const topbar = page.byId.topbar;
+    const panel = page.byId.panel;
+
+    // Select a rectangle -> Properties tab groups: Colors, Line, Shape, Text, Effects, Metadata, Actions, More
+    drawShape(S, "rectangle", 100, 100);
+    step(20);
+    const propsSec = find(panel, e => e.attrs?.["data-sec"] === "properties");
+    const propGroups = findAll(propsSec, e => e.classList?.contains?.("ribbon-group"));
+    const propLabels = propGroups.map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
+    expect(propLabels).toEqual(["Colors", "Line", "Shape", "Text", "Effects", "Metadata", "Actions", "More"]);
+
+    // Each group has .ribbon-group-rows container; Line group has 3 stacked rows (Width, Style, Sketch)
+    const lineGroup = propGroups.find(g => g.attrs?.["data-ribbon-group"] === "line");
+    const lineRows = find(lineGroup, e => e.classList?.contains?.("ribbon-group-rows"));
+    expect(lineRows).toBeDefined();
+    expect(findAll(lineRows, e => e.classList?.contains?.("ribbon-row")).length).toBe(3);
+
+    // Switch to Arrange tab -> Word-style groups (Order, Group, Rotate; plus Align & Distribute with >=2 shapes)
+    drawShape(S, "ellipse", 240, 100);
+    S.act("board", e => e.select(e.doc.live().map(x => x.id)));
+    step(20);
+    find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "arrange").click();
+    step(20);
+    const arrangeSec = find(panel, e => e.attrs?.["data-sec"] === "arrange" && e.attrs?.["data-ribbon-hidden"] !== "true");
+    const arrangeLabels = findAll(arrangeSec, e => e.classList?.contains?.("ribbon-group"))
+      .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
+    expect(arrangeLabels).toEqual(["Align", "Distribute", "Order", "Group", "Rotate"]);
+
+    // Switch to Layers tab -> Manage + Layers groups
+    find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "layers").click();
+    step(20);
+    const layersSec = find(panel, e => e.attrs?.["data-sec"] === "layers" && e.attrs?.["data-ribbon-hidden"] !== "true");
+    const layersLabels = findAll(layersSec, e => e.classList?.contains?.("ribbon-group"))
+      .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
+    expect(layersLabels).toEqual(["Manage", "Layers"]);
+
+    // Switch to Library tab -> Library + Items groups
+    find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "library").click();
+    step(20);
+    const libSec = find(panel, e => e.attrs?.["data-sec"] === "library" && e.attrs?.["data-ribbon-hidden"] !== "true");
+    const libLabels = findAll(libSec, e => e.classList?.contains?.("ribbon-group"))
+      .map(g => find(g, e => e.classList?.contains?.("ribbon-group-label"))?.textContent);
+    expect(libLabels).toEqual(["Library", "Items"]);
+  });
+
   test("escape hatches: clicking active expanded tab collapses, clicking another tab expands, and toggle button works", () => {
     const { S, step } = setup();
+    const topbar = page.byId.topbar;
     const panel = page.byId.panel;
 
     drawShape(S, "rectangle", 120, 120);
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
 
-    // Clicking the already-active expanded tab (Properties) collapses the ribbon
-    const propTab = () => find(panel, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "properties");
+    // Clicking the already-active expanded tab (Properties) in Bar 1 collapses Bar 2
+    const propTab = () => find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "properties");
     propTab().click();
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
 
-    // Clicking Layers tab expands the ribbon to Layers
-    const layersTab = () => find(panel, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "layers");
+    // Clicking Layers tab in Bar 1 expands Bar 2 to Layers
+    const layersTab = () => find(topbar, e => e.attrs?.role === "tab" && e.attrs?.["data-tab"] === "layers");
     layersTab().click();
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
     expect(find(panel, e => e.attrs?.["data-sec"] === "layers" && e.attrs?.["data-ribbon-hidden"] !== "true")).toBeDefined();
 
-    // Clicking the collapse toggle button collapses it
-    find(panel, e => e.attrs?.["data-ribbon-toggle"] === "1").click();
+    // Clicking the collapse toggle button in Bar 1 collapses it and preserves focus
+    const toggle = () => find(topbar, e => e.attrs?.["data-ribbon-toggle"] === "1");
+    toggle().focus();
+    toggle().click();
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("false");
+    expect(page.doc.activeElement).toBe(toggle());
 
     // Clicking the expand toggle button expands it again
-    find(panel, e => e.attrs?.["data-ribbon-toggle"] === "1").click();
+    toggle().click();
     step(20);
     expect(panel.attrs["data-ribbon-expanded"]).toBe("true");
   });

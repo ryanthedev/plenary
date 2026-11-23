@@ -82,8 +82,8 @@ export function contextualPropKeys({ selectionTypes = [], tool = "select", showA
 }
 
 /**
- * Determine whether the top horizontal ribbon should be expanded (showing controls)
- * or collapsed (slim 34px tab strip only).
+ * Determine whether the Bar 2 Word-style ribbon body (#panel) should be expanded
+ * (2-bar mode) or collapsed (1-bar mode: unified top bar with tabs only).
  * @param {{ selectionCount?: number, pinnedOpen?: boolean, manualCollapsed?: boolean, activeTab?: string }} [opts]
  * @returns {boolean}
  */

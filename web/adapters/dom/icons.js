@@ -135,6 +135,8 @@ export const ICONS = Object.freeze({
   ],
   chevronLeft: [["polyline", { points: "15 18 9 12 15 6" }]],
   chevronRight: [["polyline", { points: "9 18 15 12 9 6" }]],
+  chevronUp: [["polyline", { points: "18 15 12 9 6 15" }]],
+  chevronDown: [["polyline", { points: "6 9 12 15 18 9" }]],
   play: [["polygon", { points: "7 5 19 12 7 19 7 5" }]],
   pause: [
     ["rect", { x: 6, y: 5, width: 4, height: 14, rx: 1 }],

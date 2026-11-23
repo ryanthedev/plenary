@@ -144,6 +144,16 @@ export function renderPanel(root, ctx) {
   const ribbonShowAll = Boolean(ctx.ribbonShowAll);
   /** @type {any} */
   let activeColorPopover = null;
+  const ribbonRow = (lab, key, ...opts) => h("div.row.ribbon-row", {},
+    lab ? h("span.lab", {}, lab, key ? h("i", {}, key) : null) : null,
+    h("span.opts", {}, ...opts));
+  const ribbonGroup = (id, label, rows, extraCls = "") => {
+    const live = rows.filter(Boolean);
+    if (!live.length) return null;
+    return h("div.ribbon-group" + extraCls, { "data-ribbon-group": id },
+      h("div.ribbon-group-rows", {}, live),
+      h("div.ribbon-group-label", {}, label));
+  };
 
   function properties() {
     const out = [];
@@ -155,101 +165,158 @@ export function renderPanel(root, ctx) {
     const hasHiddenProps = ribbonMode
       ? contextualPropKeys({ selectionTypes: selTypes, tool: S.tool, showAll: false }).length < ALL_PROP_KEYS.length
       : false;
-    for (const [lab, key, prop, opts] of STYLE_ROWS) {
-      if (notesOnly && !NOTE_ROWS.has(prop)) continue;
-      if (allowed && !allowed.has(prop)) continue;
-      const isColor = prop === "strokeColor" || prop === "backgroundColor";
-      if (isColor && ribbonMode) {
-        const curVal = m[prop];
-        const isNone = !curVal || curVal === "transparent";
-        const popOpen = ctx.colorPicker === prop;
-        out.push(
-          h("button.c.color-pill" + (popOpen ? ".on" : ""), {
-            type: "button",
-            title: `${lab} color (${isNone ? "none" : curVal})`,
-            "aria-label": `${lab} color`,
-            "aria-haspopup": "dialog",
-            "aria-expanded": String(popOpen),
-            "data-color-popover": prop,
-            "data-fk": `color-popover:${prop}`,
-            disabled: dis,
-            onclick: ev => {
-              ev?.stopPropagation?.();
-              ctx.setColorPicker?.(popOpen ? null : prop);
-            },
-          },
-            h("span.color-pill-lab", {}, lab),
-            h("span.sw.color-pill-dot" + (isNone ? ".none" : ""), {
-              "aria-hidden": "true",
-              style: isNone ? {} : { background: curVal },
-            }),
-            h("span.color-pill-caret", { "aria-hidden": "true" }, "▾")),
-        );
-        if (popOpen) {
-          const swatches = opts.map(([, val]) => {
-            const on = m[prop] === val;
-            return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), {
-              type: "button",
-              title: val === "transparent" ? "No fill" : val,
-              "aria-label": val,
-              disabled: dis,
-              "data-fk": `chip:${prop}:${val}`,
-              style: val === "transparent" ? {} : { background: val },
-              onclick: () => style({ [prop]: val }),
-            });
-          });
-          activeColorPopover = h("div.color-popover", {
-            role: "dialog",
-            "aria-label": `${lab} color picker`,
-            "data-color-popover-panel": prop,
-            onclick: ev => ev?.stopPropagation?.(),
-          },
-            h("div.color-popover-swatches", {}, swatches),
-            createColorPicker({
-              value: m[prop] && m[prop] !== "transparent" ? m[prop] : "#3b48e8",
-              disabled: dis,
-              prefs: ctx.prefs ?? null,
-              canvas: ctx.canvas ?? null,
-              pickerState: ctx.colorPickerState ?? null,
-              onChange: hex => style({ [prop]: hex }),
-              onClose: () => ctx.setColorPicker?.(null),
-              h,
-            }));
-        }
-        continue;
-      }
-      const ctrls = opts.map(([t, val]) => {
-        if (isColor) {
+    const styleRowByProp = new Map(STYLE_ROWS.map(entry => [entry[2], entry]));
+    const buildColorPill = (lab, prop, opts) => {
+      const curVal = m[prop];
+      const isNone = !curVal || curVal === "transparent";
+      const popOpen = ctx.colorPicker === prop;
+      if (popOpen) {
+        const swatches = opts.map(([, val]) => {
           const on = m[prop] === val;
-          return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), { title: val === "transparent" ? "No fill" : val, "aria-label": val, disabled: dis, "data-fk": `chip:${prop}:${val}`, style: val === "transparent" ? {} : { background: val }, onclick: () => style({ [prop]: val }) });
-        }
-        return chip(t, isOn(m, prop, val), () => style({ [prop]: val }), `${prop} ${JSON.stringify(val)}`, false, `chip:${prop}:${JSON.stringify(val)}`);
-      });
-      if (isColor) {
-        const pickerOpen = ctx.colorPicker === prop;
-        const customBtn = h("button.sw.sw-custom" + (pickerOpen ? ".on" : ""), {
-          type: "button",
-          title: `Custom ${lab.toLowerCase()} color`,
-          "aria-label": `Custom ${lab.toLowerCase()} color`,
-          "aria-expanded": String(pickerOpen),
-          "data-custom-color": prop,
-          disabled: dis,
-          onclick: () => ctx.setColorPicker?.(pickerOpen ? null : prop),
-        }, icon("palette", { size: 13 }));
-        ctrls.push(customBtn);
+          return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), {
+            type: "button",
+            title: val === "transparent" ? "No fill" : val,
+            "aria-label": val,
+            disabled: dis,
+            "data-fk": `chip:${prop}:${val}`,
+            style: val === "transparent" ? {} : { background: val },
+            onclick: () => style({ [prop]: val }),
+          });
+        });
+        activeColorPopover = h("div.color-popover", {
+          role: "dialog",
+          "aria-label": `${lab} color picker`,
+          "data-color-popover-panel": prop,
+          onclick: ev => ev?.stopPropagation?.(),
+        },
+          h("div.color-popover-swatches", {}, swatches),
+          createColorPicker({
+            value: m[prop] && m[prop] !== "transparent" ? m[prop] : "#3b48e8",
+            disabled: dis,
+            prefs: ctx.prefs ?? null,
+            canvas: ctx.canvas ?? null,
+            pickerState: ctx.colorPickerState ?? null,
+            onChange: hex => style({ [prop]: hex }),
+            onClose: () => ctx.setColorPicker?.(null),
+            h,
+          }));
       }
-      out.push(row(lab, key, ctrls));
-      if (isColor && ctx.colorPicker === prop) {
-        out.push(createColorPicker({
-          value: m[prop] && m[prop] !== "transparent" ? m[prop] : "#3b48e8",
-          disabled: dis,
-          prefs: ctx.prefs ?? null,
-          canvas: ctx.canvas ?? null,
-          pickerState: ctx.colorPickerState ?? null,
-          onChange: hex => style({ [prop]: hex }),
-          onClose: () => ctx.setColorPicker?.(null),
-          h,
-        }));
+      return h("button.c.color-pill" + (popOpen ? ".on" : ""), {
+        type: "button",
+        title: `${lab} color (${isNone ? "none" : curVal})`,
+        "aria-label": `${lab} color`,
+        "aria-haspopup": "dialog",
+        "aria-expanded": String(popOpen),
+        "data-color-popover": prop,
+        "data-fk": `color-popover:${prop}`,
+        disabled: dis,
+        onclick: ev => {
+          ev?.stopPropagation?.();
+          ctx.setColorPicker?.(popOpen ? null : prop);
+        },
+      },
+        h("span.color-pill-lab", {}, lab),
+        h("span.sw.color-pill-dot" + (isNone ? ".none" : ""), {
+          "aria-hidden": "true",
+          style: isNone ? {} : { background: curVal },
+        }),
+        h("span.color-pill-caret", { "aria-hidden": "true" }, "▾"));
+    };
+    const buildStyleRow = (prop, labelOverride = null) => {
+      if (notesOnly && !NOTE_ROWS.has(prop)) return null;
+      if (allowed && !allowed.has(prop)) return null;
+      const entry = styleRowByProp.get(prop);
+      if (!entry) return null;
+      const [lab, key, , opts] = entry;
+      const ctrls = opts.map(([t, val]) => chip(t, isOn(m, prop, val), () => style({ [prop]: val }), `${prop} ${JSON.stringify(val)}`, false, `chip:${prop}:${JSON.stringify(val)}`));
+      return ribbonMode ? ribbonRow(labelOverride ?? lab, key, ctrls) : row(lab, key, ctrls);
+    };
+
+    if (ribbonMode) {
+      // 1. Colors group: Stroke + Fill popovers (Row 1), Opacity (Row 2)
+      const colorPills = [];
+      for (const prop of ["strokeColor", "backgroundColor"]) {
+        if (allowed && !allowed.has(prop)) continue;
+        const entry = styleRowByProp.get(prop);
+        if (entry) colorPills.push(buildColorPill(entry[0], prop, entry[3]));
+      }
+      const colorsGroup = ribbonGroup("colors", "Colors", [
+        colorPills.length ? h("div.row.ribbon-row.ribbon-color-pair", {}, h("span.opts", {}, colorPills)) : null,
+        buildStyleRow("opacity"),
+      ]);
+      if (colorsGroup) out.push(colorsGroup);
+
+      // 2. Line group: Width (Row 1), Style (Row 2), Sketch (Row 3)
+      const lineGroup = ribbonGroup("line", "Line", [
+        buildStyleRow("strokeWidth"),
+        buildStyleRow("strokeStyle"),
+        buildStyleRow("roughness"),
+      ]);
+      if (lineGroup) out.push(lineGroup);
+
+      // 3. Shape group: Pattern (Row 1), Edges (Row 2)
+      const shapeGroup = ribbonGroup("shape", "Shape", [
+        buildStyleRow("fillStyle"),
+        buildStyleRow("roundness"),
+      ]);
+      if (shapeGroup) out.push(shapeGroup);
+
+      // 4. Arrow group (when arrow/line selected or tool active or All): Arrow (Row 1), Heads (Row 2), Bends (Row 3)
+      const showArrow = !allowed || allowed.has("arrow");
+      const showHeads = !allowed || allowed.has("heads");
+      const showBends = !allowed || allowed.has("bends");
+      if (showArrow || showHeads || showBends) {
+        const arrowGroup = ribbonGroup("arrow", "Arrow", [
+          showArrow ? ribbonRow("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")) : null,
+          showHeads ? ribbonRow("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))) : null,
+          showBends ? ribbonRow("Bends", "", chip("+ bend", false, () => act(e => e.addBend())), chip("straighten", false, () => act(e => e.straighten()))) : null,
+        ]);
+        if (arrowGroup) out.push(arrowGroup);
+      }
+
+      // 5. Text group: Font (Row 1), Size (Row 2)
+      const textGroup = ribbonGroup("text", "Text", [
+        buildStyleRow("fontFamily"),
+        buildStyleRow("fontSize", "Size"),
+      ]);
+      if (textGroup) out.push(textGroup);
+    } else {
+      for (const [lab, key, prop, opts] of STYLE_ROWS) {
+        if (notesOnly && !NOTE_ROWS.has(prop)) continue;
+        const isColor = prop === "strokeColor" || prop === "backgroundColor";
+        const ctrls = opts.map(([t, val]) => {
+          if (isColor) {
+            const on = m[prop] === val;
+            return h("button.sw" + (val === "transparent" ? ".none" : "") + (on ? ".on" : ""), { title: val === "transparent" ? "No fill" : val, "aria-label": val, disabled: dis, "data-fk": `chip:${prop}:${val}`, style: val === "transparent" ? {} : { background: val }, onclick: () => style({ [prop]: val }) });
+          }
+          return chip(t, isOn(m, prop, val), () => style({ [prop]: val }), `${prop} ${JSON.stringify(val)}`, false, `chip:${prop}:${JSON.stringify(val)}`);
+        });
+        if (isColor) {
+          const pickerOpen = ctx.colorPicker === prop;
+          const customBtn = h("button.sw.sw-custom" + (pickerOpen ? ".on" : ""), {
+            type: "button",
+            title: `Custom ${lab.toLowerCase()} color`,
+            "aria-label": `Custom ${lab.toLowerCase()} color`,
+            "aria-expanded": String(pickerOpen),
+            "data-custom-color": prop,
+            disabled: dis,
+            onclick: () => ctx.setColorPicker?.(pickerOpen ? null : prop),
+          }, icon("palette", { size: 13 }));
+          ctrls.push(customBtn);
+        }
+        out.push(row(lab, key, ctrls));
+        if (isColor && ctx.colorPicker === prop) {
+          out.push(createColorPicker({
+            value: m[prop] && m[prop] !== "transparent" ? m[prop] : "#3b48e8",
+            disabled: dis,
+            prefs: ctx.prefs ?? null,
+            canvas: ctx.canvas ?? null,
+            pickerState: ctx.colorPickerState ?? null,
+            onChange: hex => style({ [prop]: hex }),
+            onClose: () => ctx.setColorPicker?.(null),
+            h,
+          }));
+        }
       }
     }
     if (!notesOnly) {
@@ -287,12 +354,20 @@ export function renderPanel(root, ctx) {
           onchange: e => applyEffects({ clipShape: e.currentTarget.value }),
           onkeydown: k => k.stopPropagation(),
         }, CLIP_SHAPES.map(shape => h("option", { value: shape, selected: m.clipShape === shape }, shape)));
-        out.push(
-          h("div.effects-sec", { "data-effects": "1" },
-            h("div.hint", { style: { margin: "8px 0 4px" } }, "Effects"),
-            row("Blend", "", blendSel),
-            row("Mask", "", clipSel)),
-        );
+        if (ribbonMode) {
+          out.push(ribbonGroup("effects", "Effects", [
+            h("div.effects-sec", { "data-effects": "1" },
+              ribbonRow("Blend", "", blendSel),
+              ribbonRow("Mask", "", clipSel)),
+          ]));
+        } else {
+          out.push(
+            h("div.effects-sec", { "data-effects": "1" },
+              h("div.hint", { style: { margin: "8px 0 4px" } }, "Effects"),
+              row("Blend", "", blendSel),
+              row("Mask", "", clipSel)),
+          );
+        }
       }
       const singleEl = selNonLabels.length === 1 ? selNonLabels[0] : null;
       const showMeta = Boolean(
@@ -431,56 +506,64 @@ export function renderPanel(root, ctx) {
         bindMetaInput(runbookInput);
         const safeRunbookUrl = curMeta?.runbookUrl ? validateRunbookUrl(curMeta.runbookUrl) : null;
         const runbookLink = safeRunbookUrl
-          ? h("div.row", { style: { marginTop: "4px" } },
-            h("span.lab", {}, ""),
-            h("span.opts", {},
-              h("a.c.meta-runbook-link", {
-                href: safeRunbookUrl,
-                target: "_blank",
-                rel: "noopener noreferrer",
-                "data-meta-link": "runbook",
-                "data-fk": "meta:open-runbook",
-                title: `Open ${safeRunbookUrl}`,
-                style: touchSheet ? { minHeight: "44px", display: "inline-flex", alignItems: "center" } : undefined,
-              }, "Open runbook ↗")))
+          ? h("a.c.meta-runbook-link", {
+            href: safeRunbookUrl,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            "data-meta-link": "runbook",
+            "data-fk": "meta:open-runbook",
+            title: `Open ${safeRunbookUrl}`,
+            style: touchSheet ? { minHeight: "44px", display: "inline-flex", alignItems: "center" } : undefined,
+          }, "Open runbook ↗")
           : null;
-        out.push(
-          h("div.meta-sec", { "data-meta-section": "1" },
-            h("div.hint", { style: { margin: "8px 0 4px" } }, "Metadata"),
-            row("Owner", "", ownerInput),
-            row("Service", "", serviceInput),
-            row("Runbook", "", runbookInput),
-            runbookLink,
-            errEl),
-        );
-      }
-      const showArrow = !allowed || allowed.has("arrow");
-      const showHeads = !allowed || allowed.has("heads");
-      const showBends = !allowed || allowed.has("bends");
-      if (showArrow || showHeads || showBends) {
-        if (!ribbonMode) {
-          out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));
-        }
-        if (showArrow) {
-          out.push(row("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
-        }
-        if (showHeads) {
-          out.push(row("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))));
-        }
-        if (showBends) {
-          out.push(row("Bends", "", chip("+ bend", false, () => act(e => e.addBend())), chip("straighten", false, () => act(e => e.straighten()))));
+        if (ribbonMode) {
+          out.push(ribbonGroup("meta", "Metadata", [
+            h("div.meta-sec", { "data-meta-section": "1" },
+              ribbonRow("Owner", "", ownerInput),
+              ribbonRow("Service", "", serviceInput),
+              ribbonRow("Runbook", "", runbookInput, runbookLink),
+              errEl),
+          ]));
+        } else {
+          out.push(
+            h("div.meta-sec", { "data-meta-section": "1" },
+              h("div.hint", { style: { margin: "8px 0 4px" } }, "Metadata"),
+              row("Owner", "", ownerInput),
+              row("Service", "", serviceInput),
+              row("Runbook", "", runbookInput),
+              runbookLink ? h("div.row", { style: { marginTop: "4px" } }, h("span.lab", {}, ""), h("span.opts", {}, runbookLink)) : null,
+              errEl),
+          );
         }
       }
-      if (ribbonMode && (hasHiddenProps || ribbonShowAll)) {
-        out.push(h("button.c.ribbon-all-btn" + (ribbonShowAll ? ".on" : ""), {
-          type: "button",
-          title: ribbonShowAll ? "Return to contextual properties" : "Show all properties",
-          "aria-label": ribbonShowAll ? "Contextual properties" : "Show all properties",
-          "aria-pressed": String(ribbonShowAll),
-          "data-ribbon-all": "1",
-          "data-fk": "ribbon:show-all",
-          onclick: () => ctx.onToggleRibbonAll?.(),
-        }, ribbonShowAll ? "Contextual" : "All ⋯"));
+      if (!ribbonMode) {
+        out.push(h("div.hint", { style: { margin: "8px 0 4px" } }, "With an arrow selected (or the Arrow tool):"));
+        out.push(row("Arrow", "", chip("sharp", m.arrowType === "sharp", () => style({ elbowed: false, roundness: null })), chip("curve", m.arrowType === "curve", () => style({ elbowed: false, roundness: { type: 2 } })), chip("elbow", m.arrowType === "elbow", () => style({ elbowed: true }), "elbowed: routed around shapes")));
+        out.push(row("Heads", "", HEADS.map(([t, s0, e0]) => chip(t, m.heads[0] === s0 && m.heads[1] === e0, () => style({ startArrowhead: s0, endArrowhead: e0 })))));
+        out.push(row("Bends", "", chip("+ bend", false, () => act(e => e.addBend())), chip("straighten", false, () => act(e => e.straighten()))));
+      } else {
+        // Actions group (when elements are selected)
+        if (m.count >= 1) {
+          const actionsGroup = ribbonGroup("actions", "Actions", [
+            ribbonRow("", "", chip("Group", false, () => act(e => e.group()), "Group (⌘G)", false, "prop-act:group"), chip("Ungroup", false, () => act(e => e.ungroup()), "Ungroup (⌘⇧G)", false, "prop-act:ungroup")),
+            ribbonRow("", "", chip("Duplicate", false, () => act(e => e.cloneSelection(20, 20)), "Duplicate (⌘D)", false, "prop-act:dup"), chip("Lock", false, () => act(e => e.toggleLock()), "Lock (⌘⇧L)", false, "prop-act:lock")),
+            ribbonRow("", "", chip("Delete", false, () => act(e => e.deleteIds([...e.sel])), "Delete (⌫)", false, "prop-act:del")),
+          ]);
+          if (actionsGroup) out.push(actionsGroup);
+        }
+        if (hasHiddenProps || ribbonShowAll) {
+          out.push(ribbonGroup("more", "More", [
+            h("button.c.ribbon-all-btn" + (ribbonShowAll ? ".on" : ""), {
+              type: "button",
+              title: ribbonShowAll ? "Return to contextual properties" : "Show all properties",
+              "aria-label": ribbonShowAll ? "Contextual properties" : "Show all properties",
+              "aria-pressed": String(ribbonShowAll),
+              "data-ribbon-all": "1",
+              "data-fk": "ribbon:show-all",
+              onclick: () => ctx.onToggleRibbonAll?.(),
+            }, ribbonShowAll ? "Contextual" : "All ⋯"),
+          ], ".ribbon-group-util"));
+        }
       }
     }
     return out;
@@ -489,6 +572,70 @@ export function renderPanel(root, ctx) {
   const bodies = {
     properties,
     arrange: () => {
+      if (ribbonMode) {
+        const groups = [];
+        if (m.count >= 2) {
+          const alignBtn = (t, w) => h("button.c", {
+            type: "button",
+            title: `Align ${t}`,
+            "aria-label": `Align ${t}`,
+            "data-align": w,
+            "data-fk": `arrange:align:${w}`,
+            disabled: dis,
+            onclick: () => act(e => e.alignSelection(w)),
+          }, t);
+          groups.push(ribbonGroup("align", "Align", [
+            ribbonRow("", "", alignBtn("Left", "left"), alignBtn("Center X", "hcenter"), alignBtn("Right", "right")),
+            ribbonRow("", "", alignBtn("Top", "top"), alignBtn("Center Y", "vcenter"), alignBtn("Bottom", "bottom")),
+          ]));
+          groups.push(ribbonGroup("distribute", "Distribute", [
+            m.count >= 3
+              ? ribbonRow("", "",
+                h("button.c", {
+                  type: "button",
+                  title: "Distribute horizontally",
+                  "aria-label": "Distribute horizontally",
+                  "data-distribute": "h",
+                  "data-fk": "arrange:dist:h",
+                  disabled: dis,
+                  onclick: () => act(e => e.distributeSelection("h")),
+                }, "Horizontal"),
+                h("button.c", {
+                  type: "button",
+                  title: "Distribute vertically",
+                  "aria-label": "Distribute vertically",
+                  "data-distribute": "v",
+                  "data-fk": "arrange:dist:v",
+                  disabled: dis,
+                  onclick: () => act(e => e.distributeSelection("v")),
+                }, "Vertical"))
+              : null,
+            ribbonRow("", "",
+              h("button.c", {
+                type: "button",
+                title: "Tidy selection into neat row, column, or grid",
+                "aria-label": "Tidy selection",
+                "data-action": "tidy",
+                "data-fk": "arrange:tidy",
+                disabled: dis,
+                onclick: () => act(e => e.tidySelection()),
+              }, "Tidy")),
+          ]));
+        }
+        groups.push(ribbonGroup("order", "Order", [
+          ribbonRow("", "", chip("Front", false, () => act(e => e.reorder("front")), "front"), chip("Forward", false, () => act(e => e.reorder("forward")), "forward")),
+          ribbonRow("", "", chip("Backward", false, () => act(e => e.reorder("backward")), "backward"), chip("Back", false, () => act(e => e.reorder("back")), "back")),
+        ]));
+        groups.push(ribbonGroup("group", "Group", [
+          ribbonRow("", "", chip("group", false, () => act(e => e.group()), "Group (⌘G)"), chip("ungroup", false, () => act(e => e.ungroup()), "Ungroup (⌘⇧G)")),
+          ribbonRow("", "", chip("dup", false, () => act(e => e.cloneSelection(20, 20)), "Duplicate (⌘D)"), chip("lock", false, () => act(e => e.toggleLock()), "Lock (⌘⇧L)")),
+        ]));
+        groups.push(ribbonGroup("rotate", "Rotate", [
+          ribbonRow("", "", chip("-15°", false, () => act(e => e.rotateBy(-15)), "Rotate -15°"), chip("+15°", false, () => act(e => e.rotateBy(15)), "Rotate +15°")),
+          ribbonRow("", "", chip("+90°", false, () => act(e => e.rotateBy(90)), "Rotate +90°"), chip("0°", false, () => act(e => e.resetRotation()), "Reset rotation")),
+        ]));
+        return groups.filter(Boolean);
+      }
       const rows = [];
       if (m.count >= 2) {
         rows.push(
@@ -555,6 +702,17 @@ export function renderPanel(root, ctx) {
       const fs = listNamedFrames(B.doc);
       const goFrame = id => { if (ctx.onJumpFrame) ctx.onJumpFrame(id); else S.goToFrame(id); ctx.onChange(); };
       const stepFrame = d => { if (ctx.onStepFrame) ctx.onStepFrame(d); else S.stepFrame(d); };
+      if (ribbonMode) {
+        return [
+          ribbonGroup("frames-nav", "Navigate", [
+            ribbonRow("", "", chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => stepFrame(1), "PgDn", true)),
+            ribbonRow("", "", chip("all", false, () => S.fit(), "Fit everything (⇧1)", true)),
+          ]),
+          ribbonGroup("frames-list", "Frames", [
+            h("div.ribbon-grid", {}, fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => goFrame(f.id) }, h("span.dim", {}, String(i + 1)), " ", f.rawName || `Frame ${i + 1}`))),
+          ], ".ribbon-group-scroll"),
+        ].filter(Boolean);
+      }
       return [
         ...fs.map((f, i) => h("button.list-row" + (B.frameAt === f.id ? ".on" : ""), { "data-fk": `frame:${f.id}`, onclick: () => goFrame(f.id) }, h("span.dim", {}, String(i + 1)), " ", f.rawName || `Frame ${i + 1}`)),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {}, chip([icon("chevronLeft", { size: 14 }), " prev"], false, () => stepFrame(-1), "PgUp", true), chip(["next ", icon("chevronRight", { size: 14 })], false, () => stepFrame(1), "PgDn", true), chip("all", false, () => S.fit(), "Fit everything (⇧1)", true))),
@@ -563,7 +721,8 @@ export function renderPanel(root, ctx) {
     animate: () => {
       const selEl = B.selected().filter(e => !isLabel(e))[0] ?? null;
       if (!selEl) {
-        return [h("div.hint", { "data-anim-empty": "1" }, "Select a shape or clip on the timeline to edit its effect and timing.")];
+        const hint = h("div.hint", { "data-anim-empty": "1" }, "Select a shape or clip on the timeline to edit its effect and timing.");
+        return ribbonMode ? [ribbonGroup("anim-empty", "Animation", [hint])] : [hint];
       }
       const anim = selEl.customData?.anim ?? null;
       const cur = anim?.preset ?? null;
@@ -614,6 +773,48 @@ export function renderPanel(root, ctx) {
           onclick: () => S.act("board", ed => ed.clearAnimation()),
         }, "×")
         : null;
+
+      if (ribbonMode) {
+        const effectRows = [ribbonRow("Effect", "", h("div.anim-effect-row", {}, presetSel, clearBtn))];
+        const timingRows = [];
+        if (anim && !anim.keys) {
+          const easingSel = h("select.anim-sel", {
+            "aria-label": "Easing curve",
+            "data-anim-field": "easing",
+            "data-fk": "anim:easing",
+            disabled: dis,
+            value: curEasing,
+            onchange: e => S.act("board", ed => ed.updateAnimation({ easing: e.currentTarget.value })),
+            onkeydown: k => k.stopPropagation(),
+          }, EASING_META.map(ea => h("option", { value: ea.id, selected: curEasing === ea.id }, ea.label)));
+          const numField = (label, val, step, min, prop) => h("label.anim-num", {},
+            h("span", {}, label),
+            h("input", {
+              type: "number",
+              min: String(min),
+              step: String(step),
+              value: String(val),
+              "data-anim-field": prop,
+              "data-fk": `anim:${prop}`,
+              disabled: dis,
+              onchange: e => S.act("board", ed => ed.updateAnimation({ [prop]: Number(e.currentTarget.value) })),
+              onkeydown: k => k.stopPropagation(),
+            }));
+          effectRows.push(ribbonRow("Easing", "", easingSel));
+          timingRows.push(
+            h("div.anim-fields", {},
+              numField("Delay ms", curStart, 50, 0, "start"),
+              numField("Dur ms", curDur, 50, 50, "duration")),
+            ribbonRow("Repeat", "", chip(curLoop ? "Loop on" : "Loop off", curLoop, () => S.act("board", ed => ed.updateAnimation({ loop: !curLoop })), "Repeat inside clip duration (off = single cycle)", false, "anim:loop")),
+          );
+        } else if (anim?.keys) {
+          timingRows.push(h("div.hint", {}, "Keyframed clip — adjust timing on the timeline."));
+        }
+        return [
+          ribbonGroup("anim-effect", "Effect", effectRows),
+          timingRows.length ? ribbonGroup("anim-timing", "Timing", timingRows) : null,
+        ].filter(Boolean);
+      }
 
       const out = [
         row("Effect", "", h("div.anim-effect-row", {}, presetSel, clearBtn)),
@@ -680,24 +881,41 @@ export function renderPanel(root, ctx) {
             onclick: () => ctx.onResetLocalView?.(),
           }, "Show all layers"))
         : null;
+      const layerItems = ls.map(l => {
+        const eff = localById?.get(l.id);
+        const isSolo = Boolean(eff?.solo);
+        const locallyHidden = Boolean(localView?.active && eff && !eff.effectiveVisible);
+        return h("div.list-row" + (B.activeLayer === l.id ? ".on" : "") + (locallyHidden ? ".local-hidden" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
+          h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
+          h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
+          h("button.tb.solo-btn" + (isSolo ? ".on" : ""), { type: "button", title: isSolo ? "Exit solo layer (local)" : "Solo layer (local only)", "aria-label": isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`, "aria-pressed": String(isSolo), "data-fk": `layer:${l.id}:solo`, "data-solo-layer": l.id, onclick: ev => { ev.stopPropagation(); ctx.onSoloLayer?.(l.id); } }, "S"),
+          h("span", { title: "Double-click to rename", ondblclick: ev => {
+            ev.stopPropagation(); if (dis) return;
+            const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
+              onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
+            ev.currentTarget.replaceWith(input); input.focus(); input.select();
+          } }, l.name || "Layer"),
+          h("span.n", {}, String(count(l.id))));
+      });
+      if (ribbonMode) {
+        return [
+          ribbonGroup("layers-actions", "Manage", [
+            ribbonRow("", "", chip([icon("plus", { size: 14 }), " New layer"], false, () => lact(e => e.addLayer()), "New layer")),
+            ribbonRow("", "",
+              chip(icon("arrowUp", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
+              chip(icon("arrowDown", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, -1)), "Move down"),
+              chip(icon("moveToLayer", { size: 14 }), false, () => S.act("board", e => e.moveToLayer(B.activeLayer)), "Move the selection to this layer"),
+              chip(icon("trash", { size: 14 }), false, () => lact(e => e.deleteLayer(B.activeLayer)), "Delete layer (its shapes move down)")),
+          ]),
+          resetBanner ? ribbonGroup("layers-filter", "Filter", [resetBanner]) : null,
+          ribbonGroup("layers-list", "Layers", [
+            h("div.ribbon-grid", { role: "list", "aria-label": "Layers" }, layerItems),
+          ], ".ribbon-group-scroll"),
+        ].filter(Boolean);
+      }
       return [
         resetBanner,
-        h("div", { role: "list", "aria-label": "Layers" }, ls.map(l => {
-          const eff = localById?.get(l.id);
-          const isSolo = Boolean(eff?.solo);
-          const locallyHidden = Boolean(localView?.active && eff && !eff.effectiveVisible);
-          return h("div.list-row" + (B.activeLayer === l.id ? ".on" : "") + (locallyHidden ? ".local-hidden" : ""), { role: "listitem", "aria-label": `Layer: ${l.name || "Layer"}`, "data-fk": `layer:${l.id}:row`, tabindex: "-1", onclick: () => { B.activeLayer = l.id; B.changed(); ctx.onChange(); } },
-            h("button.tb", { title: l.visible ? "Hide" : "Show", "aria-label": l.visible ? "Hide layer" : "Show layer", disabled: dis, "data-fk": `layer:${l.id}:visible`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { visible: !l.visible })); } }, icon(l.visible ? "eye" : "eyeOff", { size: 14 })),
-            h("button.tb", { title: l.locked ? "Unlock" : "Lock", "aria-label": l.locked ? "Unlock layer" : "Lock layer", disabled: dis, "data-fk": `layer:${l.id}:lock`, onclick: ev => { ev.stopPropagation(); lact(e => e.updateLayer(l.id, { locked: !l.locked })); } }, icon(l.locked ? "lock" : "unlock", { size: 14 })),
-            h("button.tb.solo-btn" + (isSolo ? ".on" : ""), { type: "button", title: isSolo ? "Exit solo layer (local)" : "Solo layer (local only)", "aria-label": isSolo ? `Exit solo for ${l.name || "Layer"}` : `Solo ${l.name || "Layer"}`, "aria-pressed": String(isSolo), "data-fk": `layer:${l.id}:solo`, "data-solo-layer": l.id, onclick: ev => { ev.stopPropagation(); ctx.onSoloLayer?.(l.id); } }, "S"),
-            h("span", { title: "Double-click to rename", ondblclick: ev => {
-              ev.stopPropagation(); if (dis) return;
-              const input = h("input.rename", { value: l.name ?? "", maxLength: 80, onkeydown: k => { k.stopPropagation(); if (k.key === "Enter") input.blur(); if (k.key === "Escape") { input.value = l.name ?? ""; input.blur(); } },
-                onblur: () => { const n = input.value.trim(); if (n && n !== l.name) lact(e => e.updateLayer(l.id, { name: n })); ctx.onChange(); } });
-              ev.currentTarget.replaceWith(input); input.focus(); input.select();
-            } }, l.name || "Layer"),
-            h("span.n", {}, String(count(l.id))));
-        })),
+        h("div", { role: "list", "aria-label": "Layers" }, layerItems),
         h("div.row", { style: { marginTop: "6px" } }, h("span.opts", {},
           chip(icon("plus", { size: 14 }), false, () => lact(e => e.addLayer()), "New layer"),
           chip(icon("arrowUp", { size: 14 }), false, () => lact(e => e.moveLayer(B.activeLayer, 1)), "Move up"),
@@ -716,28 +934,44 @@ export function renderPanel(root, ctx) {
         const next = addToLibrary(items, packItems);
         if (next.length !== items.length) ctx.setLibrary(next);
       };
+      const k8sBtn = h("button.c" + (k8sInstalled ? ".on" : ""), {
+        type: "button",
+        title: k8sInstalled ? "Kubernetes pack installed" : "Install Kubernetes vector icon pack",
+        "aria-label": "Install Kubernetes pack",
+        "data-icon-pack": "kubernetes",
+        "data-fk": "lib:pack:kubernetes",
+        style: touchBtnStyle,
+        onclick: () => installPack("kubernetes"),
+      }, "＋ Kubernetes pack");
+      const cloudBtn = h("button.c" + (cloudInstalled ? ".on" : ""), {
+        type: "button",
+        title: cloudInstalled ? "Cloud pack installed" : "Install Cloud & Architecture vector icon pack",
+        "aria-label": "Install Cloud pack",
+        "data-icon-pack": "cloud",
+        "data-fk": "lib:pack:cloud",
+        style: touchBtnStyle,
+        onclick: () => installPack("cloud"),
+      }, "＋ Cloud pack");
+      const libNodes = items.map((it, i) => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, "data-fk": `lib:${it.id ?? i}`, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")));
+      if (ribbonMode) {
+        return [
+          ribbonGroup("library-actions", "Library", [
+            ribbonRow("", "", chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)")),
+            ribbonRow("", "", k8sBtn, cloudBtn),
+          ]),
+          ribbonGroup("library-items", "Items", [
+            items.length
+              ? h("div.lib.ribbon-grid", {}, libNodes)
+              : h("div.hint", {}, "Empty. Select shapes and save them, install an icon pack, or drop a .excalidrawlib."),
+          ], ".ribbon-group-scroll"),
+        ].filter(Boolean);
+      }
       return [
-        h("div.lib", {}, items.map((it, i) => h("button.item", { title: `Insert ${it.name ?? "item"}`, disabled: dis, "data-fk": `lib:${it.id ?? i}`, onclick: () => S.act("board", e => e.insertLibraryItem(it)) }, h("b", {}, String(it.elements.filter(e => !isLabel(e)).length)), h("span", {}, it.name ?? "item")))),
+        h("div.lib", {}, libNodes),
         h("div.row", { style: touchSheet ? { marginTop: "8px", minWidth: "0", maxWidth: "100%" } : { marginTop: "8px" } }, h("span.opts", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {},
           chip("+ save selection", false, () => { const it = B.libraryItem(); if (it) ctx.setLibrary(addToLibrary(items, [it])); }, "libraryItem(name)"),
-          h("button.c" + (k8sInstalled ? ".on" : ""), {
-            type: "button",
-            title: k8sInstalled ? "Kubernetes pack installed" : "Install Kubernetes vector icon pack",
-            "aria-label": "Install Kubernetes pack",
-            "data-icon-pack": "kubernetes",
-            "data-fk": "lib:pack:kubernetes",
-            style: touchBtnStyle,
-            onclick: () => installPack("kubernetes"),
-          }, "＋ Kubernetes pack"),
-          h("button.c" + (cloudInstalled ? ".on" : ""), {
-            type: "button",
-            title: cloudInstalled ? "Cloud pack installed" : "Install Cloud & Architecture vector icon pack",
-            "aria-label": "Install Cloud pack",
-            "data-icon-pack": "cloud",
-            "data-fk": "lib:pack:cloud",
-            style: touchBtnStyle,
-            onclick: () => installPack("cloud"),
-          }, "＋ Cloud pack"))),
+          k8sBtn,
+          cloudBtn)),
         h("div.hint", {}, items.length ? "Click an item to insert it. Drop a .excalidrawlib to add." : "Empty. Select shapes and save them, install an icon pack, or drop a .excalidrawlib."),
       ];
     },
@@ -755,36 +989,23 @@ export function renderPanel(root, ctx) {
   const activeTabId = tabs
     ? (secs.find(s => s.active)?.id ?? secs[0]?.id)
     : (secs.some(s => s.id === state.tab) ? state.tab : secs[0]?.id);
-  const toggleBtn = ribbonMode
-    ? h("button.tb.ribbon-toggle", {
-        type: "button",
-        title: ribbonExpanded ? "Collapse ribbon" : "Expand ribbon",
-        "aria-label": ribbonExpanded ? "Collapse ribbon" : "Expand ribbon",
-        "aria-expanded": String(ribbonExpanded),
-        "data-ribbon-toggle": "1",
-        "data-fk": "ribbon:toggle",
-        onclick: () => ctx.onToggleRibbon?.(),
-      }, ribbonExpanded ? "⌃" : "⌄")
-    : null;
-  out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" },
-    secs.map(s => {
-      const isSel = s.id === activeTabId;
-      const isOnTab = isSel && (ctx.inSheet || ribbonExpanded);
-      return h("button" + (isOnTab ? ".on" : ""), {
-        type: "button",
-        role: "tab",
-        "aria-selected": String(isSel),
-        "aria-label": s.title,
-        "data-tab": s.id,
-        "data-fk": `panel-tab:${s.id}`,
-        style: touchBtnStyle,
-        onclick: () => {
-          if (ribbonMode && ctx.onRibbonTab) ctx.onRibbonTab(s.id, activeTabId);
-          else ctx.setState({ type: "tab", id: s.id });
-        },
-      }, s.title);
-    }),
-    toggleBtn));
+  // In desktop ribbon mode, tabs + collapse chevron live in Bar 1 (#topbar) — NO middle tab bar in #panel.
+  if (!ribbonMode) {
+    out.push(h("div.tabs", { role: "tablist", "aria-label": "Inspector sections" },
+      secs.map(s => {
+        const isSel = s.id === activeTabId;
+        return h("button" + (isSel ? ".on" : ""), {
+          type: "button",
+          role: "tab",
+          "aria-selected": String(isSel),
+          "aria-label": s.title,
+          "data-tab": s.id,
+          "data-fk": `panel-tab:${s.id}`,
+          style: touchBtnStyle,
+          onclick: () => ctx.setState({ type: "tab", id: s.id }),
+        }, s.title);
+      })));
+  }
   for (const s of secs) {
     if (!s.active) continue;
     const ribbonHidden = ribbonMode && s.id !== activeTabId;

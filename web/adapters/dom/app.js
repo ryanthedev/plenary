@@ -43,6 +43,7 @@ import { createVideoOverlay } from "./video-overlay.js";
 import { createEmbedOverlay } from "./embed-overlay.js";
 import { consumePendingTemplate } from "./home.js";
 import { createContextMenu, buildCanvasMenuItems } from "./context-menu.js";
+import { createRadialHub } from "./radial-hub.js";
 import { createLongPressTracker, buildMobileSelectionActions, renderSelectionActionSheet, renderRenameBoardSheet } from "./mobile-sheets.js";
 import { createViewsMenu } from "./views-menu.js";
 import { createSettingsDialog } from "./settings-dialog.js";
@@ -2124,6 +2125,34 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   const pillTitle = cls => pillTitleFor({ cls, status: S.status, viewer: S.effective === "viewer", readOnly: S.readOnly });
 
+  const radialHub = createRadialHub({
+    getRole: () => S.role,
+    getStyle: () => {
+      const ed = activeEditor();
+      return ed ? propsModel(ed) : { strokeColor: "#3B48E8", strokeWidth: 2 };
+    },
+    canEdit: () => S.may() && S.role !== "viewer",
+    onSelectSlot: (slotId, opener) => {
+      if (slotId === "views") { openViewsMenu(opener ?? null); return; }
+      if (slotId === "settings") { settingsDialog.open({ opener: opener ?? null }); return; }
+      if (slotId === "animate") { setWorkspaceMode(ui.workspaceMode === "animate" ? "draw" : "animate"); return; }
+      if (slotId === "properties" || slotId === "layers" || slotId === "library") {
+        if (isPhone()) {
+          setPanel({ type: "tab", id: slotId });
+          setSheet("panel", { opener: opener ?? null });
+        } else {
+          if (!ui.panel.open) setPanel({ type: "open", open: true });
+          setPanel({ type: "tab", id: slotId });
+        }
+        chromeDirty = true;
+      }
+    },
+    onStylePatch: patch => {
+      S.act(activeStream(), e => e.setStyle(patch));
+      chromeDirty = true;
+    },
+  });
+
   function hud() {
     const B = S.eds.board, bi = boardInfo(B.doc), fs = bi.frames, i = fs.findIndex(f => f.id === B.frameAt), may = S.may();
     if (S.role === "presenter" && ui.workspaceMode === "present") {
@@ -2316,15 +2345,18 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         h("button.tb", { disabled: !canRedo, title: "Redo", "aria-label": "Redo", "data-action": "redo", onclick: () => S.act(activeStream(), e => e.redo()) }, h("span.ic", {}, icon("redo", { size: 18 })))) : null,
       S.role !== "viewer" ? h("div.grp.phone-only", {}, h("button.tb", { title: "Fit everything", "aria-label": "Fit everything", onclick: () => S.fit() }, h("span.ic", {}, icon("fit", { size: 18 })))) : null,
     ];
-    // The emote bar and the phones' one emote button: the collab UI's live nodes (moved in once, then kept).
+    // The emote bar, mobile emote button, and Concepts-inspired radial hub.
     replace($("#hudBL"), bl);
     if (collab) {
       if (collab.parts.emotes.parentNode !== $("#hudBC")) replace($("#hudBC"), collab.parts.emotes);
-      if (collab.parts.emoteButton.parentNode !== $("#hudBR")) replace($("#hudBR"), collab.parts.emoteButton);
+      const brNodes = [collab.parts.emoteButton, radialHub.el];
+      const br = $("#hudBR");
+      if (br.children.length !== brNodes.length || br.children[0] !== brNodes[0] || br.children[1] !== brNodes[1]) replace(br, brNodes);
     } else {
       replace($("#hudBC"), []);
-      replace($("#hudBR"), []);
+      if (radialHub.el.parentNode !== $("#hudBR")) replace($("#hudBR"), radialHub.el);
     }
+    radialHub.refresh();
   }
 
   function timeline() {

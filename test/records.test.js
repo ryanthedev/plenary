@@ -152,3 +152,21 @@ test("a replica shows its own comment at once; a refused record op only leaves t
   w.send(com, "notes", { elements: [{ id: "n", version: 1, versionNonce: 1 }] }); w.settle();       // a commenter writes no notes in v1
   expect(w.room.streams.notes.getAny("n")).toBe(null);
 });
+
+test("Records accepts all-hands poll and Q&A actions alongside comment threads without altering thread snapshots", () => {
+  const r = new Records();
+  expect(r.check({ do: "thread", id: "t1", anchor: point, text: "hello" }, "uc", "commenter")).toBeNull();
+  expect(r.apply({ do: "thread", id: "t1", anchor: point, text: "hello" }, "uc", 1, "Cy")).toBe(true);
+  expect(Object.keys(r.toJSON())).toEqual(["threads"]);
+
+  expect(r.check({ do: "poll.create", id: "p1", question: "Ready?", options: ["Yes", "No"] }, "ue", "editor")).toBeNull();
+  expect(r.apply({ do: "poll.create", id: "p1", question: "Ready?", options: ["Yes", "No"] }, "ue", 2, "Ed")).toBe(true);
+  expect(r.apply({ do: "poll.vote", pollId: "p1", optionIndex: 0 }, "uc", 3, "Cy")).toBe(true);
+  expect(r.apply({ do: "qa.ask", id: "q1", text: "Any ETA?" }, "uc", 4, "Cy")).toBe(true);
+  expect(r.apply({ do: "qa.upvote", questionId: "q1" }, "ua", 5, "Ann")).toBe(true);
+
+  const snap = JSON.parse(JSON.stringify(r.toJSON()));
+  const restored = new Records(snap);
+  expect(restored.toJSON()).toEqual(r.toJSON());
+  expect(restored.chars).toBe(r.chars);
+});

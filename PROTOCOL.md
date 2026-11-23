@@ -853,10 +853,28 @@ record.
 | `resolve` / `reopen` | `id` (thread) | owner, editor, annotator, commenter | sets `resolved: { by, name, at }` / clears it; repeating is a no-op |
 | `move` | `id` (thread), `anchor` | thread author, owner, editor | re-anchors |
 | `react` | `id` (comment), `emoji`, `on` (bool) | owner, editor, annotator, commenter | sets or unsets (comment, user, emoji); repeating is a no-op |
+| `poll.create` | `id`, `question`, `options`, `anonymous?` | owner, editor | creates a live poll (2–10 options, each ≤ 120 chars; question ≤ 240 chars) |
+| `poll.vote` | `pollId` (or `id`), `optionIndex` | owner, editor, annotator, commenter | records or changes the user's single vote (latest wins); votes after close are no-ops |
+| `poll.close` | `pollId` (or `id`) | poll creator, owner, editor | closes the poll; repeating is a no-op |
+| `qa.ask` | `id`, `text`, `anonymous?` | owner, editor, annotator, commenter | submits an audience question (≤ 500 chars) |
+| `qa.upvote` | `questionId` (or `id`), `on?` (bool) | owner, editor, annotator, commenter | toggles (or sets when `on` is given) the user's single upvote on a question |
+| `qa.answer` | `questionId` (or `id`), `answered?` (bool, default `true`) | owner, editor | marks a question answered or unanswered; repeating is a no-op |
 
 - **Anchor:** `{ point: {x, y} }` or `{ stream: "board" | "notes", element, x, y }`. An element anchor follows the
   element; if it's deleted, clients show the thread at `x, y` marked detached. The room doesn't check the element
   exists (it may not yet).
+- **Live polls & Audience Q&A (`#16`) and Anonymous Mode (`#15`):** implemented in the pure leaf module
+  `packages/protocol/allhands.js` and validated in `packages/protocol/records.js`:
+  - **Live polls:** `poll.create` requires 2–10 non-empty options (each ≤ 120 chars) and a non-empty question (≤ 240 chars);
+    at most 500 polls per board. `poll.vote` enforces strict 1-vote-per-user deduplication (latest vote wins, changing vote
+    updates counts cleanly); votes arriving after `poll.close` are accepted no-ops and ignored in tallies.
+  - **Audience Q&A:** `qa.ask` requires non-empty text (≤ 500 chars); at most 2,000 questions per board. `qa.upvote`
+    enforces 1-upvote-per-user toggle deduplication (or explicit `on: true|false`). `rankQuestions` sorts deterministically
+    by `(answered asc, upvotes desc, seq asc)`.
+  - **Anonymous mode (`#15`):** `maskAuthor(item, { anonymous, viewerUserId, revealed })` masks `author` and `authorName`
+    (and `by`/`name` when present) to deterministic `"Anonymous"` while `anonymous && !revealed`, sets `isMine: true` when
+    `viewerUserId` matches the real author so authors still recognize their own submissions, and reveals real authors cleanly
+    once `revealed: true`.
 - **No-ops are accepted, logged and acked.** A repeated `resolve`, `reopen` or `react`, a `delete` of something
   already deleted, and any `reply`, `edit`, `react`, `resolve`, `reopen` or `move` on a **dead target** (a deleted
   comment or a hidden thread) get a `seq` and an `ack` like any op and change nothing (a no-op `reply` doesn't

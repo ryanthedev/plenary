@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // @ts-check
-// Plenary Agent CLI v2: interact with a Plenary server's HTTP Admin API and Protocol v1.1 WebSocket rooms.
+// Plenary Agent CLI v3: interact with a Plenary server's HTTP Admin API and Protocol v1.1 WebSocket rooms.
 //
 // Auth: PLENARY_URL and PLENARY_TOKEN env vars, or --url / --token flags.
 // Output: JSON to stdout by default; errors to stderr. Exit 0 = ok, 2 = usage error, 1 = runtime/API error.
@@ -25,8 +25,8 @@ Global options:
 
 Commands:
   list-boards
-  create-board            [--title <title>] [--member-role <editor|annotator|commenter|viewer|null>]
-  create-share-link       --board <id> [--role <editor|annotator|viewer>] [--expires-at <ms>]
+  create-board            [--title <title>] [--member-role <editor|annotator|commenter|viewer|null>] [--space <id>]
+  create-share-link       --board <id> [--role <editor|annotator|viewer>] [--expires-at <ms>] [--passcode <4..128 chars>] [--no-download]
   get-audit               [--board <id>] [--scope <board|tenant>] [--limit <n>] [--before <cursor>]
   read-board              --board <id>
   add-elements            --board <id> (--elements <json> | --file <path>) [--stream <board|notes>]
@@ -40,8 +40,14 @@ Commands:
   add-mermaid             --board <id> (--source <mermaid> | --file <path>) [--x <n>] [--y <n>] [--layer <id>] [--elbow]
   add-note                --board <id> --text <text> [--x <n>] [--y <n>] [--width <n>] [--height <n>] [--color <hex>]
   add-comment             --board <id> --text <text> [--x <n>] [--y <n>] [--thread <id>] [--element <id>] [--stream <board|notes>]
+  set-moderation          --board <id> [--locked <true|false>] [--muted-users <u1,u2|json>]
+  manage-versions         --board <id> --action <list|create|get|delete> [--label <label>] [--version-id <id>]
+  manage-spaces           --action <list_home|create_area|create_space|trash_board|restore_board> [--name <name>] [--group <id>] [--general <editor|annotator|commenter|viewer|null>] [--board <id>] [--from <spaceId>]
+  manage-org              --action <list_members|add_member|remove_member|list_roles> [--tenant-id <id>] [--email <email>]
+  export-compliance-data  [--scope <board|tenant>] [--board <id>] [--tenant-id <id>]
+  gdpr-erase-user         --user-id <id> --confirm [--tenant-id <id>]
 
-Aliases: snake_case command names (e.g. list_boards, read_board, update_elements) are also accepted.`;
+Aliases: snake_case command names (e.g. list_boards, read_board, set_moderation) are also accepted.`;
 
 const COMMAND_ALIASES = {
   "list-boards": "list_boards",
@@ -76,9 +82,21 @@ const COMMAND_ALIASES = {
   "add_note": "add_note",
   "add-comment": "add_comment",
   "add_comment": "add_comment",
+  "set-moderation": "set_moderation",
+  "set_moderation": "set_moderation",
+  "manage-versions": "manage_versions",
+  "manage_versions": "manage_versions",
+  "manage-spaces": "manage_spaces",
+  "manage_spaces": "manage_spaces",
+  "manage-org": "manage_org",
+  "manage_org": "manage_org",
+  "export-compliance-data": "export_compliance_data",
+  "export_compliance_data": "export_compliance_data",
+  "gdpr-erase-user": "gdpr_erase_user",
+  "gdpr_erase_user": "gdpr_erase_user",
 };
 
-const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant", "--loop", "--clear"]);
+const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant", "--loop", "--clear", "--no-download", "--confirm"]);
 
 /**
  * Parse CLI argv into `{ help, command, flags, positional }`.
@@ -222,6 +240,8 @@ export async function runCli(
         if (flags["member-role"] !== undefined) {
           opts.memberRole = flags["member-role"] === "null" ? null : flags["member-role"];
         }
+        if (flags.space !== undefined) opts.space = flags.space;
+        if (flags["tenant-id"] !== undefined) opts.tenant = flags["tenant-id"];
         result = await client.createBoard(opts);
         break;
       }
@@ -229,6 +249,8 @@ export async function runCli(
         if (!board) throw new CliUsageError("create-share-link requires --board <id>");
         const opts = { board, role: flags.role ?? "viewer" };
         if (flags["expires-at"] !== undefined) opts.expiresAt = parseIntOpt(flags["expires-at"], "--expires-at");
+        if (flags.passcode !== undefined) opts.passcode = flags.passcode;
+        if (flags["no-download"] !== undefined) opts.noDownload = Boolean(flags["no-download"]);
         result = await client.createShareLink(opts);
         break;
       }
@@ -388,6 +410,71 @@ export async function runCli(
         if (flags.element !== undefined) opts.element = flags.element;
         if (flags.stream !== undefined) opts.stream = flags.stream;
         result = await client.addComment(opts);
+        break;
+      }
+      case "set_moderation": {
+        if (!board) throw new CliUsageError("set-moderation requires --board <id>");
+        const opts = { board };
+        if (flags.locked !== undefined) opts.locked = parseBoolOpt(flags.locked, "--locked");
+        if (flags["muted-users"] !== undefined) {
+          opts.mutedUsers = flags["muted-users"] === "" ? [] : parseListOrJson(flags["muted-users"], "--muted-users");
+        }
+        if (opts.locked === undefined && opts.mutedUsers === undefined) {
+          throw new CliUsageError("set-moderation requires --locked <true|false> and/or --muted-users <u1,u2|json>");
+        }
+        result = await client.setModeration(opts);
+        break;
+      }
+      case "manage_versions": {
+        if (!board) throw new CliUsageError("manage-versions requires --board <id>");
+        const action = flags.action ?? (flags.board ? positional[0] : positional[1]);
+        if (!action) throw new CliUsageError("manage-versions requires --action <list|create|get|delete>");
+        const opts = { board, action };
+        if (flags.label !== undefined) opts.label = flags.label;
+        if (flags["version-id"] !== undefined) opts.versionId = flags["version-id"];
+        else if (flags.id !== undefined) opts.versionId = flags.id;
+        result = await client.manageVersions(opts);
+        break;
+      }
+      case "manage_spaces": {
+        const action = flags.action ?? positional[0];
+        if (!action) throw new CliUsageError("manage-spaces requires --action <list_home|create_area|create_space|trash_board|restore_board>");
+        const opts = { action };
+        if (flags.name !== undefined) opts.name = flags.name;
+        if (flags.group !== undefined) opts.group = flags.group === "null" ? null : flags.group;
+        if (flags.general !== undefined) opts.general = flags.general === "null" ? null : flags.general;
+        if (flags.board !== undefined) opts.board = flags.board;
+        if (flags.from !== undefined) opts.from = flags.from;
+        result = await client.manageSpaces(opts);
+        break;
+      }
+      case "manage_org": {
+        const action = flags.action ?? positional[0];
+        if (!action) throw new CliUsageError("manage-org requires --action <list_members|add_member|remove_member|list_roles>");
+        const opts = { action };
+        if (flags["tenant-id"] !== undefined) opts.tenant = flags["tenant-id"];
+        if (flags.email !== undefined) opts.email = flags.email;
+        result = await client.manageOrg(opts);
+        break;
+      }
+      case "export_compliance_data": {
+        const opts = {};
+        if (flags.scope !== undefined) opts.scope = flags.scope;
+        if (flags.board !== undefined) opts.board = flags.board;
+        if (flags["tenant-id"] !== undefined) opts.tenant = flags["tenant-id"];
+        result = await client.exportComplianceData(opts);
+        break;
+      }
+      case "gdpr_erase_user": {
+        const userId = flags["user-id"] ?? positional[0];
+        if (!userId) throw new CliUsageError("gdpr-erase-user requires --user-id <id> --confirm");
+        const extraArgs = flags["user-id"] !== undefined ? positional : positional.slice(1);
+        if (extraArgs.length > 0) {
+          throw new CliUsageError(`unexpected argument '${extraArgs[0]}' for gdpr-erase-user (use --confirm or --confirm=true)`);
+        }
+        const opts = { userId, confirm: flags.confirm === true };
+        if (flags["tenant-id"] !== undefined) opts.tenant = flags["tenant-id"];
+        result = await client.gdprEraseUser(opts);
         break;
       }
     }

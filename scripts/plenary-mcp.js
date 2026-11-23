@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
 // @ts-check
-// Plenary MCP Server v2 (JSON-RPC 2.0 over stdio).
-// Exposes Plenary HTTP Admin API & Protocol v1.1 board operations as 16 MCP tools.
+// Plenary MCP Server v3 (JSON-RPC 2.0 over stdio).
+// Exposes Plenary HTTP Admin API & Protocol v1.1 board operations as 22 MCP tools.
 // Never writes non-JSON-RPC output to stdout; diagnostics go to stderr only.
 
 import { createPlenaryClient, PlenaryError } from "./plenary-client.js";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 export const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
-export const SERVER_INFO = { name: "plenary-mcp", version: "0.2.0" };
+export const SERVER_INFO = { name: "plenary-mcp", version: "0.3.0" };
 export const MAX_LINE_BYTES = 16 * 1024 * 1024; // 16 MiB cap on a single JSON-RPC line
 
 const ANIM_SCHEMA = {
@@ -76,13 +76,15 @@ export const TOOLS = [
           enum: ["editor", "annotator", "commenter", "viewer", null],
           description: "Default role for workspace members (default 'viewer'; null for no automatic access).",
         },
+        space: { type: "string", description: "Optional Space ID to create the board in." },
+        tenant: { type: "string", description: "Optional Tenant ID." },
       },
       additionalProperties: false,
     },
   },
   {
     name: "create_share_link",
-    description: "Create a share link for a Plenary board with a specified role and optional expiry.",
+    description: "Create a share link for a Plenary board with a specified role, optional expiry, optional passcode (4..128 chars), and optional noDownload policy.",
     inputSchema: {
       type: "object",
       properties: {
@@ -95,6 +97,16 @@ export const TOOLS = [
         expiresAt: {
           type: ["number", "null"],
           description: "Optional expiry timestamp in Unix epoch milliseconds.",
+        },
+        passcode: {
+          type: ["string", "null"],
+          minLength: 4,
+          maxLength: 128,
+          description: "Optional passcode (4..128 chars) required to redeem the share link.",
+        },
+        noDownload: {
+          type: "boolean",
+          description: "When true, disables export/download for viewers redeeming this link.",
         },
       },
       required: ["board"],
@@ -419,6 +431,114 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "set_moderation",
+    description: "Set all-hands audience moderation state ({ locked?, mutedUsers? }) in appState.herdr.moderation over Protocol v1.1 WebSocket.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID." },
+        locked: { type: "boolean", description: "When true, blocks non-moderator audience writes (annotator/commenter)." },
+        mutedUsers: {
+          type: "array",
+          items: { type: "string", minLength: 1, maxLength: 128 },
+          maxItems: 200,
+          description: "List of muted user IDs (max 200, unique, 1..128 chars each).",
+        },
+      },
+      required: ["board"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "manage_versions",
+    description: "List, create (capturing synced board scene + label), get, or delete named board version snapshots against /boards/:board/versions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board: { type: "string", description: "Board ID." },
+        action: {
+          type: "string",
+          enum: ["list", "create", "get", "delete"],
+          description: "Version history action to perform.",
+        },
+        label: { type: "string", minLength: 1, maxLength: 120, description: "Snapshot label (required for create, 1..120 chars)." },
+        versionId: { type: "string", description: "Version ID (required for get and delete)." },
+      },
+      required: ["board", "action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "manage_spaces",
+    description: "Manage Plenary workspace home, areas (groups), spaces, and board trash/restore lifecycle.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["list_home", "create_area", "create_space", "trash_board", "restore_board"],
+          description: "Space/lifecycle action to perform.",
+        },
+        name: { type: "string", minLength: 1, maxLength: 200, description: "Area or space name (required for create_area and create_space)." },
+        group: { type: ["string", "null"], description: "Optional Area (group) ID for create_space." },
+        general: {
+          type: ["string", "null"],
+          enum: ["editor", "annotator", "commenter", "viewer", null],
+          description: "Optional general access role for create_area or create_space (null = invite-only).",
+        },
+        board: { type: "string", description: "Board ID (required for trash_board and restore_board)." },
+        from: { type: "string", description: "Optional current Space ID for trash_board (auto-resolved from board metadata if omitted)." },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "manage_org",
+    description: "Manage organization members and inspect workspace roles (list_members, add_member, remove_member, list_roles).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["list_members", "add_member", "remove_member", "list_roles"],
+          description: "Organization management action to perform.",
+        },
+        tenant: { type: "string", description: "Optional tenant ID (auto-resolved to caller's admin tenant if omitted)." },
+        email: { type: "string", description: "Member email address (required for add_member and remove_member)." },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "export_compliance_data",
+    description: "Export redacted compliance data for a single board (scope='board') or the entire tenant (scope='tenant', tenant admin).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: ["board", "tenant"], description: "Export scope: 'board' or 'tenant' (defaults to 'board' if board is provided, else 'tenant')." },
+        board: { type: "string", description: "Board ID (required when scope='board')." },
+        tenant: { type: "string", description: "Optional tenant ID." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "gdpr_erase_user",
+    description: "Irreversibly erase a user's personal data under GDPR (POST /admin/gdpr/erase). Requires explicit confirm: true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        userId: { type: "string", description: "Target user ID to erase (e.g. 'google:123' or 'dev:bob')." },
+        tenant: { type: "string", description: "Optional tenant ID (defaults to caller's admin tenant)." },
+        confirm: { type: "boolean", description: "Must be explicitly set to true to authorize irreversible GDPR erasure." },
+      },
+      required: ["userId", "confirm"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const TOOL_NAMES = new Set(TOOLS.map(t => t.name));
@@ -449,6 +569,12 @@ export async function executeTool(client, name, args = {}, { signal } = {}) {
     case "add_mermaid": return client.addMermaid(withSig);
     case "add_note": return client.addNote(withSig);
     case "add_comment": return client.addComment(withSig);
+    case "set_moderation": return client.setModeration(withSig);
+    case "manage_versions": return client.manageVersions(withSig);
+    case "manage_spaces": return client.manageSpaces(withSig);
+    case "manage_org": return client.manageOrg(withSig);
+    case "export_compliance_data": return client.exportComplianceData(withSig);
+    case "gdpr_erase_user": return client.gdprEraseUser(withSig);
     default: throw new PlenaryError(`Unknown tool: ${name}`, { code: "unknown-tool" });
   }
 }

@@ -4,7 +4,7 @@ import { test, expect, afterEach } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { FakeElement, installDom, textOf, byClass } from "./collab/fake-dom.js";
-import { mountHome } from "../../web/adapters/dom/home.js";
+import { mountHome, PENDING_TEMPLATE_KEY, consumePendingTemplate } from "../../web/adapters/dom/home.js";
 import { createDialogs } from "../../web/adapters/dom/dialogs.js";
 import { createHomeModel } from "../../web/core/home.js";
 import { virtualClock } from "../../web/adapters/clock/virtual.js";
@@ -39,6 +39,7 @@ const BASE_DATA = {
 afterEach(() => {
   delete globalThis.document;
   delete globalThis.Node;
+  delete globalThis.sessionStorage;
 });
 
 async function setup(data = BASE_DATA, extra = {}) {
@@ -74,12 +75,18 @@ async function setup(data = BASE_DATA, extra = {}) {
   return { root, model, clock, dialogCalls, mounted };
 }
 
-test("#119 template strip: renders 4 templates on Home, opens New board with prefilled title via real createDialogs, hides for guests and other views", async () => {
+test("#119 template strip: renders 5 rich templates on Home, opens New board with prefilled title and stores pending templateId via real createDialogs, hides for guests and other views", async () => {
   const dom = installDom();
   const root = dom.root;
   globalThis.document.addEventListener = () => {};
   globalThis.document.removeEventListener = () => {};
   globalThis.Node = Object.getPrototypeOf(FakeElement);
+  const store = new Map();
+  globalThis.sessionStorage = /** @type {any} */ ({
+    getItem: k => store.get(k) ?? null,
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: k => store.delete(k),
+  });
   const clock = virtualClock({ t0: 1_000_000 });
   const created = [];
   const spacesApi = {
@@ -114,25 +121,48 @@ test("#119 template strip: renders 4 templates on Home, opens New board with pre
   const strip = root.find(e => e.getAttribute("data-home-templates") === "true");
   expect(strip).toBeTruthy();
   const tpls = strip.findAll(e => e.hasClass("home-tpl-card"));
-  expect(tpls.map(e => e.getAttribute("data-template"))).toEqual(["blank", "architecture", "deck", "retro"]);
+  expect(tpls.map(e => e.getAttribute("data-template"))).toEqual([
+    "blank",
+    "plenary-tour",
+    "architecture",
+    "presentation",
+    "retro",
+  ]);
   expect(tpls.map(e => textOf(e.find(x => x.hasClass("home-tpl-title"))))).toEqual([
     "Blank Board",
-    "Architecture Diagram",
+    "Plenary Interactive Tour",
+    "System Architecture",
     "Presentation Deck",
-    "Retro / Sticky Notes",
+    "Team Retro",
   ]);
 
-  // Clicking Architecture Diagram opens New board dialog with pre-filled title and submits cleanly
-  tpls[1].click();
+  // Clicking System Architecture opens New board dialog with pre-filled title, records pending templateId, and submits cleanly
+  tpls[2].click();
   await new Promise(r => setTimeout(r, 0));
+  expect(JSON.parse(store.get(PENDING_TEMPLATE_KEY))).toEqual({ templateId: "architecture", createdAt: 1_000_000 });
   const dlg = root.find(e => e.getAttribute("role") === "dialog");
   expect(dlg).toBeTruthy();
   const titleInput = dlg.find(e => e.tagName === "INPUT" && e.getAttribute("aria-label") === "Title");
-  expect(titleInput.value).toBe("Architecture Diagram");
+  expect(titleInput.value).toBe("System Architecture");
   dlg.find(e => e.tagName === "FORM").dispatch("submit");
   await new Promise(r => setTimeout(r, 0));
-  expect(created).toEqual([{ title: "Architecture Diagram", key: "tpl-key-1" }]);
+  expect(created).toEqual([{ title: "System Architecture", key: "tpl-key-1" }]);
   expect(navigated).toEqual(["?board=b-tpl"]);
+  expect(consumePendingTemplate(globalThis.sessionStorage, 1_005_000)).toBe("architecture");
+  expect(consumePendingTemplate(globalThis.sessionStorage, 1_005_000)).toBeNull();
+
+  // Cancelling a template dialog clears the pending template seed immediately
+  tpls[1].click();
+  await new Promise(r => setTimeout(r, 0));
+  expect(store.has(PENDING_TEMPLATE_KEY)).toBe(true);
+  const cancelBtn = root.find(e => e.getAttribute("role") === "dialog").findAll(e => e.tagName === "BUTTON").find(b => textOf(b) === "Cancel");
+  cancelBtn.click();
+  expect(store.has(PENDING_TEMPLATE_KEY)).toBe(false);
+
+  // Clicking Blank Board leaves pending template clear
+  tpls[0].click();
+  await new Promise(r => setTimeout(r, 0));
+  expect(store.get(PENDING_TEMPLATE_KEY)).toBeUndefined();
 
   // Switching to Starred hides the template strip
   root.find(e => e.getAttribute("data-fk") === "nav:starred").click();

@@ -86,6 +86,13 @@
     "const helper = { \"test/a/helper.js\": [\"export const url = process.env.DATABASE_URL;\"] };",
     "expect(run([\"env\", \"--dir\", dir]).stdout.toString()).toContain(`S3_SECRET_ACCESS_KEY=${rig.blobs.secretKey}`);"
   ],
+  "test/deploy/self-host-kit.test.js": [
+    "expect(compose).toContain(\"DATABASE_URL:\");",
+    "expect(compose).toContain(\"NATS_URL:\");",
+    "\"DATABASE_URL\",",
+    "\"NATS_URL\",",
+    "\"S3_ENDPOINT\","
+  ],
   "test/server/dev-menu.test.js": [
     "const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: \"0\", LOG_LEVEL: \"warn\", DATABASE_URL: \"postgres://x@127.0.0.1:1/p\", NATS_URL: \"nats://127.0.0.1:1\", COOKIE_KEY: \"c\".repeat(32), PLENARY_BLOBS: \"local-disk\", PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });",
     "const app = await start({ PLENARY_DATA_DIR: tempDir(), PORT: \"0\", LOG_LEVEL: \"warn\", DATABASE_URL: \"postgres://x@127.0.0.1:1/p\", NATS_URL: \"nats://127.0.0.1:1\", COOKIE_KEY: \"c\".repeat(32), PLENARY_BLOBS: \"local-disk\", PLENARY_DEV_TOKENS: TOK }, { adapters, write: l => lines.push(l) });"

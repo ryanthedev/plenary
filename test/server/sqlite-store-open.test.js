@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-const MOD = new URL("../../server/store/sqlite.js", import.meta.url).pathname;
+const MOD = new URL("../../server/adapters/driven/store/sqlite.js", import.meta.url).pathname;
 const dir = mkdtempSync(join(tmpdir(), "pl-store-open-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 

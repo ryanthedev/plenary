@@ -79,7 +79,7 @@ test("no adapter-only member leaks into core: only adapters, composition roots a
   const hits = [], files = listFiles(["server", "packages"]);
   expect(files.length).toBeGreaterThan(20);
   for (const f of files) {
-    if (/^server\/(store|registry|bus|blobs|pg)\//.test(f) || f === "server/main.js") continue;
+    if (/^server\/adapters\/(driven|support)\//.test(f) || f === "server/main.js") continue;
     const text = readFileSync(join(ROOT, f), "utf8");
     for (const m of used) if (new RegExp(`\\.${m}\\(`).test(text)) hits.push(`${f}: .${m}(`);
   }

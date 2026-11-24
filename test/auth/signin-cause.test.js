@@ -263,8 +263,8 @@ test("verifyIdToken: a throwing `why` changes no verdict; every cause either fil
   for (const c of SIGN_IN_CAUSES) expect(c).toMatch(/^[a-z0-9_:<>]{1,40}$/);
   // The causes in the source match the lists, both ways (p5-tidyv V5): a new refusal must be added to a list on
   // purpose, and a list holds no label the code never logs.
-  const src = await Bun.file(new URL("../../server/auth/oidc.js", import.meta.url)).text();
-  const http = await Bun.file(new URL("../../server/auth/http.js", import.meta.url)).text();
+  const src = await Bun.file(new URL("../../server/adapters/driven/auth/oidc.js", import.meta.url)).text();
+  const http = await Bun.file(new URL("../../server/adapters/driving/auth-http.js", import.meta.url)).text();
   const fromOidc = sourceLabels(src, ["no"]);
   const fromHttp = sourceLabels(http, ["fail", "failed"]);
   expect(fromOidc).toContain("bad_token_response");   // a ternary label

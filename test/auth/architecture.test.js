@@ -26,37 +26,46 @@ const ROOT = join(import.meta.dir, "..", "..");
 
 /** @type {Record<string, "port"|"core"|"adapter"|"driving">} */
 export const CLASSES = {
-  "server/auth/registry-port.js": "port",    // Registry typedefs, mint, RegistryError
-  "server/auth/idp-port.js": "port",         // Identity, the IdP port (begin/finish), the Verifier port
-  "server/auth/port.js": "port",             // the Auth port (verify, role) and authPort, composed over injected verifiers + tenancy
-  "server/auth/util.js": "core",             // roles, base64url, ids: pure helpers
-  "server/auth/tenancy.js": "core",          // role resolution over the Registry port
-  "server/auth/resolver.js": "core",         // the permission resolver: pure union of every source, with sources (domain logic)
-  "server/auth/permissions.js": "core",      // permissions, built-in roles, role clipping per scope (domain data, pure)
-  "server/auth/access.js": "core",          // Teams and access at a scope (PROTOCOL.md § Teams and access)
-  "server/auth/explain.js": "core",         // the access explanation: sources, needs, owners, Ask state (PROTOCOL.md § Access explanation and requests)
-  "server/auth/roles.js": "core",           // Roles: custom roles and the permission matrix (PROTOCOL.md § Roles)
-  "server/auth/spaces.js": "core",           // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
-  "server/auth/trash.js": "core",           // trash and restore a board or Space, the Trash list and the board-URL notice (PROTOCOL.md § Trash and restore)
-  "server/auth/offboard.js": "core",        // leaver offboarding: the list, per-item reassignment and the removal (PROTOCOL.md § Leaver offboarding)
-  "server/auth/move.js": "core",             // move a board: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)
-  "server/auth/home.js": "core",             // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
-  "server/auth/versions.js": "core",         // board version history & named snapshots (#19)
-  "server/auth/compliance.js": "core",       // per-board/tenant data export & GDPR user erasure (#34)
-  "server/auth/share-policy.js": "core",     // share link policy: scrypt passcodes, expiry, noDownload (#37)
-  "server/admin/boards.js": "core",          // admin use cases over the Registry port
-  "server/admin/tenants.js": "core",         // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)
-  "server/auth/registry.js": "adapter",      // in-memory Registry
-  "server/auth/oidc.js": "adapter",          // Google OIDC (IdP port)
-  "server/auth/session.js": "adapter",       // session tokens (Verifier port, plus issue())
-  "server/auth/dev.js": "adapter",           // dev tokens (Verifier port)
-  "server/auth/http.js": "driving",          // HTTP routes
+  "server/ports/registry.js": "port",        // Registry typedefs, mint, RegistryError
+  "server/ports/idp.js": "port",             // Identity, the IdP port (begin/finish), the Verifier port
+  "server/ports/auth.js": "port",            // the Auth port (verify, role) and authPort, composed over injected verifiers + tenancy
+  "server/ports/entra-directory.js": "port", // Entra ID directory sync port
+  "server/core/ids.js": "core",              // server id validation & PortError (shared with core/auth/embed-token and driving/embed-http)
+  "server/core/log.js": "core",              // structured JSON logger (shared with driving/embed-http)
+  "server/core/auth/util.js": "core",        // roles, base64url, ids: pure helpers
+  "server/core/auth/tenancy.js": "core",     // role resolution over the Registry port
+  "server/core/auth/resolver.js": "core",    // the permission resolver: pure union of every source, with sources (domain logic)
+  "server/core/auth/permissions.js": "core", // permissions, built-in roles, role clipping per scope (domain data, pure)
+  "server/core/auth/access.js": "core",      // Teams and access at a scope (PROTOCOL.md § Teams and access)
+  "server/core/auth/explain.js": "core",     // the access explanation: sources, needs, owners, Ask state (PROTOCOL.md § Access explanation and requests)
+  "server/core/auth/roles.js": "core",       // Roles: custom roles and the permission matrix (PROTOCOL.md § Roles)
+  "server/core/auth/spaces.js": "core",      // Spaces and Groups: pages, pickers, create, rename, general access (PROTOCOL.md § Spaces and Groups)
+  "server/core/auth/trash.js": "core",       // trash and restore a board or Space, the Trash list and the board-URL notice (PROTOCOL.md § Trash and restore)
+  "server/core/auth/offboard.js": "core",    // leaver offboarding: the list, per-item reassignment and the removal (PROTOCOL.md § Leaver offboarding)
+  "server/core/auth/move.js": "core",        // move a board: options, the access diff, the compare-and-set move (PROTOCOL.md § Move board)
+  "server/core/auth/home.js": "core",        // the Home screen's read side over the Registry port + tenancy (PROTOCOL.md § Home)
+  "server/core/auth/versions.js": "core",    // board version history & named snapshots (#19)
+  "server/core/auth/compliance.js": "core",  // per-board/tenant data export & GDPR user erasure (#34)
+  "server/core/auth/share-policy.js": "core",// share link policy: scrypt passcodes, expiry, noDownload (#37)
+  "server/core/auth/embed-token.js": "core", // HMAC-signed read-only board embed tokens (#23)
+  "server/core/auth/entra-sync.js": "core",  // Microsoft Entra ID group -> Plenary Teams sync (#87)
+  "server/core/admin/boards.js": "core",     // admin use cases over the Registry port
+  "server/core/admin/tenants.js": "core",    // bootstrapTenant over the Registry port (its CLI root: scripts/admin-bootstrap.js)
+  "server/adapters/driven/auth/registry.js": "adapter",     // in-memory Registry
+  "server/adapters/driven/auth/oidc.js": "adapter",         // Google / Microsoft / generic OIDC (IdP port)
+  "server/adapters/driven/auth/session.js": "adapter",      // session tokens (Verifier port, plus issue())
+  "server/adapters/driven/auth/dev.js": "adapter",          // dev tokens (Verifier port)
+  "server/adapters/driven/auth/entra-graph.js": "adapter",  // Microsoft Graph Entra directory adapter (#87)
+  "server/adapters/driven/auth/entra-memory.js": "adapter", // in-memory Entra directory adapter (#87)
+  "server/adapters/driving/auth-http.js": "driving",        // auth HTTP routes
+  "server/adapters/driving/entra-sync-http.js": "driving",  // Entra group sync HTTP routes (#87)
+  "server/adapters/driving/embed-http.js": "driving",       // board embed & oEmbed HTTP routes (#23)
 };
-const SCOPE = ["server/auth", "server/admin"];
+const SCOPE = ["server/core/auth", "server/core/admin", "server/adapters/driven/auth", "server/auth", "server/admin"];
 const COMPOSITION_ROOTS = ["server/main.js"];
 
 
-const inScope = p => SCOPE.some(d => p.startsWith(d + "/"));
+const inScope = (p, classes = CLASSES) => (p in classes) || SCOPE.some(d => p.startsWith(d + "/"));
 
 /**
  * The rule as a pure function.
@@ -70,17 +79,17 @@ export function violations(files, classes, roots = COMPOSITION_ROOTS) {
   for (const { path, src } of files) {
     let targets;
     try { targets = importsOf(path, src); } catch (e) { out.push(e.message); continue; }
-    if (inScope(path)) {
+    if (inScope(path, classes)) {
       if (!classes[path]) { out.push(`${path}: unclassified (add it to CLASSES)`); continue; }
       for (const { to, kind } of targets) {
         const k = `${path} -> ${to} [${kind}]`;
-        if (!inScope(to)) out.push(`${k}: reaches outside server/auth and server/admin`);
+        if (!inScope(to, classes)) out.push(`${k}: reaches outside server/auth and server/admin`);
         else if (!classes[to]) out.push(`${k}: imports an unclassified path (extensionless? add it to CLASSES)`);
         else if (bad(to)) out.push(`${k}: ${classes[path]} imports ${classes[to]}`);
       }
     } else if (!roots.includes(path)) {
       for (const { to, kind } of targets)
-        if (inScope(to) && (bad(to) || !classes[to])) out.push(`${path} -> ${to} [${kind}]: only a composition root may import ${classes[to] ?? "an unclassified path"}`);
+        if (inScope(to, classes) && (bad(to) || !classes[to])) out.push(`${path} -> ${to} [${kind}]: only a composition root may import ${classes[to] ?? "an unclassified path"}`);
     }
   }
   return out;
@@ -138,13 +147,13 @@ test("checker: allowed imports, look-alikes and unclassified files", () => {
 });
 
 test("checker: inbound, only a composition root imports an auth adapter", () => {
-  expect(one("server/registry/x.js", `import { mint } from "./a.js";`)).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]: only a composition root may import adapter"]);
-  expect(one("server/registry/x.js", `import { mint } from "./p.js";`)).toEqual([]);
+  expect(one("server/registry/x.js", `import { mint } from "../auth/a.js";`)).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]: only a composition root may import adapter"]);
+  expect(one("server/registry/x.js", `import { mint } from "../auth/p.js";`)).toEqual([]);
   expect(one("server/main.js", `import { a } from "./auth/a.js";`)).toEqual([]);
 });
 
 test("checker: a runtime import and a JSDoc type of the same file are reported separately", () => {
-  const src = `import { mint } from "./a.js";\n/** @returns {import("./a.js").R} */`;
+  const src = `import { mint } from "../auth/a.js";\n/** @returns {import("../auth/a.js").R} */`;
   const v = one("server/registry/x.js", src);
   expect(v.map(key).sort()).toEqual(["server/registry/x.js -> server/auth/a.js [runtime]", "server/registry/x.js -> server/auth/a.js [type]"]);
 });
@@ -176,7 +185,7 @@ const WRITES = /\bregistry\s*\.\s*(createBoard|createSpace|createGroup|rename|up
 const writesOrgDirectly = src => WRITES.test(src);
 
 test("the HTTP adapter calls no Space, Group or board write on the Registry: the core service owns them", () => {
-  const src = readFileSync(join(ROOT, "server/auth/http.js"), "utf8").replace(/\/\/.*$/gm, "").replace(/\/\*[^]*?\*\//g, "");
+  const src = readFileSync(join(ROOT, "server/adapters/driving/auth-http.js"), "utf8").replace(/\/\/.*$/gm, "").replace(/\/\*[^]*?\*\//g, "");
   expect(writesOrgDirectly(src)).toBe(false);
   expect(src).toMatch(/spaces\.createBoard\(/);
 });
@@ -184,8 +193,8 @@ test("planted: a route that writes the Registry itself is caught; the service fi
   expect(writesOrgDirectly("await registry.createSpace({ tenant })")).toBe(true);
   expect(writesOrgDirectly("await registry.rename({ type: 'space' }, n)")).toBe(true);
   expect(writesOrgDirectly("await spaces.createBoard(who, b)")).toBe(false);
-  expect(CLASSES["server/auth/spaces.js"]).toBe("core");
-  expect(CLASSES["server/auth/access.js"]).toBe("core");
-  expect(violations([{ path: "server/auth/spaces.js", src: `import { x } from "./http.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports driving")]));
-  expect(violations([{ path: "server/auth/spaces.js", src: `import { x } from "./registry.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports adapter")]));
+  expect(CLASSES["server/core/auth/spaces.js"]).toBe("core");
+  expect(CLASSES["server/core/auth/access.js"]).toBe("core");
+  expect(violations([{ path: "server/core/auth/spaces.js", src: `import { x } from "../../adapters/driving/auth-http.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports driving")]));
+  expect(violations([{ path: "server/core/auth/spaces.js", src: `import { x } from "../../adapters/driven/auth/registry.js";` }], CLASSES)).toEqual(expect.arrayContaining([expect.stringContaining("core imports adapter")]));
 });

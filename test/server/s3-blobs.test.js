@@ -60,7 +60,7 @@ st("s3: only a missing key is null; a missing bucket or bad credentials throw", 
 
 /** Runs a snippet in a fresh bun with `env` set at start (Bun's S3 client reads env when the process starts). */
 const inFreshBun = async (env, body) => {
-  const script = `import { s3Blobs } from ${JSON.stringify(new URL("../../server/blobs/s3.js", import.meta.url).pathname)};
+  const script = `import { s3Blobs } from ${JSON.stringify(new URL("../../server/adapters/driven/blobs/s3.js", import.meta.url).pathname)};
     const base = { endpoint: "http://127.0.0.1:1", bucket: "b", region: "us-east-1", accessKeyId: "k", secretAccessKey: "s" };
     try { ${body} } catch (e) { console.log("ERR " + (e.code ?? e.message)); }`;
   const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(AWS|S3)_/.test(k)));

@@ -276,7 +276,7 @@ describe("sqlite registry", () => {
     const t = await r.createTenant({ domain: null });
     const board = await mkBoard(r, { tenant: t.id });
     const ROUNDS = 40;
-    const mod = resolve(import.meta.dir, "../../server/registry/sqlite.js");
+    const mod = resolve(import.meta.dir, "../../server/adapters/driven/registry/sqlite.js");
     const child = user => `
       import { sqliteRegistry } from ${JSON.stringify(mod)};
       const r = sqliteRegistry({ path: ${JSON.stringify(path)}, fullfsync: false, busyTimeoutMs: 20000 });

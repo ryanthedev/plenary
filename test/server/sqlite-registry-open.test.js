@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-const MOD = new URL("../../server/registry/sqlite.js", import.meta.url).pathname;
+const MOD = new URL("../../server/adapters/driven/registry/sqlite.js", import.meta.url).pathname;
 const dir = mkdtempSync(join(tmpdir(), "pl-reg-open-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 

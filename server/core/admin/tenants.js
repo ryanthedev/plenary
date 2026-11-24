@@ -18,7 +18,8 @@
 // A bare address (`alice@acme.com`) is taken as email:<addr>. Emails are lower-cased. Control characters are refused.
 
 import { normEmail, verifiedEmail, isTenantAdminRecord } from "../auth/util.js";
-import { AdminError } from "./boards.js";
+import { AdminError, liveAdmin } from "./boards.js";
+import { DIRECTORY, RegistryError } from "../../ports/registry.js";
 
 /** @typedef {import("../../ports/registry.js").Registry} Registry */
 /** @typedef {import("../../ports/registry.js").Tenant} Tenant */
@@ -297,34 +298,401 @@ export async function listTenants({ caller }, { tenancy }) {
   };
 }
 
-const liveTenantAdmin = async (registry, t, caller) => Boolean(t && isTenantAdminRecord(t, caller) && !(await registry.memberState?.(t.id, caller.user))?.removed);
+const liveTenantAdmin = (registry, t, caller) => liveAdmin(registry, t, caller);
 const plainUserName = id => String(id).replace(/^[a-z]+:/, "");
+/** @param {string|null|undefined} role @returns {"none"|"shared"|"personal"} */
+const contentTierOf = role => (role === "content-admin-personal" ? "personal" : role === "content-admin" ? "shared" : "none");
+const tenantDomainsOf = t => (Array.isArray(t.domains) && t.domains.length ? t.domains : (t.domain ? [t.domain] : []));
+const emailMatchesTenantDomain = (t, email) => {
+  const domains = tenantDomainsOf(t);
+  if (!domains.length) return true;
+  const at = email.lastIndexOf("@");
+  return at > 0 && domains.includes(email.slice(at + 1));
+};
 
 /**
- * GET /tenants/:tenant/members — org admins only; 404 for unknown tenant, 403 for non-admin.
- * Returns human-friendly admin identifiers (stripped `email:` addresses and non-`google:`/`microsoft:` ids) and
- * signed-in organization directory members without leaking raw internal `google:<sub>` / `microsoft:<oid>` ids.
- * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string }} req
+ * GET /tenants/:tenant/members — live org admins only; 404 for unknown tenant, 403 for non-admin.
+ * Supports `?q=&role=&after=&limit=` cursor pagination over `reg_members`, returning `user`, `name`, `email`,
+ * `isAdmin`, `contentTier`, and `removed` on each directory row, plus `nextCursor`, `pendingAdmins`, `admins`, and `members`.
+ * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string, q?: string|null, role?: string|null, after?: string|null, limit?: number|string|null }} req
  * @param {{ registry: Registry }} deps
  */
-export async function listTenantMembers({ caller, tenant }, { registry }) {
+export async function listTenantMembers({ caller, tenant, q = null, role = null, after = null, limit = null }, { registry }) {
   if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
   const t = await registry.tenant(tenant);
   if (!t) throw new AdminError("not-found", "no such tenant");
   if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
+
+  const roleFilter = role == null || role === "" ? "all" : String(role);
+  if (!DIRECTORY.roles.includes(roleFilter)) throw new AdminError("bad-request", "bad role filter");
+  if (q != null && (typeof q !== "string" || q.length > 100 || q.includes("\0"))) throw new AdminError("bad-request", "bad query");
+  let lim;
+  if (limit != null && limit !== "") {
+    const n = Number(limit);
+    if (!Number.isInteger(n) || n < 1) throw new AdminError("bad-request", "bad limit");
+    lim = Math.min(DIRECTORY.page.max, n);
+  }
+
   const members = await registry.tenantMembers(t.id);
   const emailAdmins = t.admins.filter(a => a.startsWith("email:")).map(a => a.slice(6));
   const otherAdmins = t.admins.filter(a => !a.startsWith("email:") && !a.startsWith("google:") && !a.startsWith("microsoft:"));
   const admins = [...new Set([...emailAdmins, ...otherAdmins])];
-  const rawDirectory = typeof registry.findMembers === "function"
-    ? await registry.findMembers(t.id, { limit: 50 })
-    : [];
-  const directory = rawDirectory.map(m => ({
+
+  let page;
+  if (typeof registry.membersPage === "function") {
+    try {
+      page = await registry.membersPage(t.id, {
+        q: q || null,
+        role: /** @type {"all"|"admin"|"member"|"removed"} */ (roleFilter),
+        after: after || null,
+        limit: lim,
+      });
+    } catch (e) {
+      if (/^registry: bad /.test(String(e?.message ?? ""))) throw new AdminError("bad-request", String(e.message));
+      throw e;
+    }
+  } else {
+    const raw = typeof registry.findMembers === "function" ? await registry.findMembers(t.id, { q: q || null, limit: lim ?? 50 }) : [];
+    page = { items: raw.map(m => ({ ...m, removed: false, updatedAt: null })), nextCursor: null };
+  }
+
+  /** @type {Map<string, "none"|"shared"|"personal">} */
+  const tierByUser = new Map();
+  if (typeof registry.scopedGrants === "function") {
+    const unitGrants = await registry.scopedGrants({ type: "unit", id: t.id });
+    for (const g of unitGrants) {
+      if (g.subject.type !== "user") continue;
+      const tier = contentTierOf(g.role);
+      if (tier !== "none") tierByUser.set(g.subject.id, tier);
+    }
+  }
+
+  const directory = page.items.map(m => ({
+    user: m.user,
     name: m.name || m.email || plainUserName(m.user),
     email: m.email ?? null,
     isAdmin: isTenantAdminRecord(t, { user: m.user, email: m.email, domain: t.domain }),
+    contentTier: tierByUser.get(m.user) ?? "none",
+    removed: Boolean(m.removed),
   }));
-  return { members, admins, directory };
+
+  // Pending admins: `email:` entries in `t.admins` with no live signed-in member matching that email.
+  const liveEmailsSeen = new Set(page.items.filter(m => !m.removed && m.email).map(m => normEmail(m.email)));
+  /** @type {string[]} */
+  const pendingAdmins = [];
+  for (const em of [...new Set(emailAdmins)]) {
+    if (liveEmailsSeen.has(em)) continue;
+    let matched = false;
+    if (typeof registry.findMembers === "function") {
+      const hits = await registry.findMembers(t.id, { q: em, limit: 10 });
+      matched = hits.some(h => normEmail(h.email) === em);
+    }
+    if (!matched) pendingAdmins.push(em);
+  }
+
+  return { members, admins, pendingAdmins, directory, nextCursor: page.nextCursor };
+}
+
+/**
+ * POST /tenants/:tenant/admins — live Unit admins only (never custom role `members.manage`).
+ * Promotes an existing live member by `userId` or `email`, or pre-provisions a domain email (`email:<addr>`) before first sign-in.
+ * Rejects external emails on domain tenants (400) and offboarded/removed users (409 removed).
+ * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string, userId?: unknown, email?: unknown }} req
+ * @param {{ registry: Registry, now?: () => number }} deps
+ */
+export async function promoteTenantAdmin({ caller, tenant, userId, email }, { registry, now = Date.now }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
+
+  const hasUserId = userId !== undefined && userId !== null && userId !== "";
+  const hasEmail = email !== undefined && email !== null && email !== "";
+  if (hasUserId === hasEmail) throw new AdminError("bad-request", "provide exactly one of userId or email");
+
+  if (hasUserId) {
+    if (typeof userId !== "string" || CONTROL.test(userId)) throw new AdminError("bad-request", "bad userId");
+    let norm;
+    try { norm = normAdmin(userId); } catch (e) { throw new AdminError("bad-request", e.message); }
+    if (norm.startsWith("email:")) throw new AdminError("bad-request", "use the email field to add an admin by email");
+    const state = await registry.memberState?.(t.id, norm);
+    if (state?.removed) throw new AdminError("removed", "cannot promote an offboarded member");
+    if (t.domain !== null && state?.email) {
+      const em = normEmail(state.email);
+      if (em && !emailMatchesTenantDomain(t, em)) {
+        throw new AdminError("bad-request", "external email cannot be promoted on a domain workspace");
+      }
+    }
+    const already = t.admins.includes(norm);
+    await registry.addTenantAdmin(t.id, norm);
+    if (!already) {
+      await recordAudit(registry, {
+        tenant: t.id,
+        board: null,
+        actor: caller.user,
+        action: "tenant.admin.add",
+        target: norm,
+        detail: { member: norm, pending: false },
+        at: now(),
+      });
+    }
+    return { member: norm, pending: false };
+  }
+
+  if (typeof email !== "string" || CONTROL.test(email)) throw new AdminError("bad-request", "bad email");
+  const e = normEmail(email);
+  if (!e || e.length > 320 || !MEMBER_EMAIL.test(e)) throw new AdminError("bad-request", "bad email");
+  if (t.domain !== null && !emailMatchesTenantDomain(t, e)) {
+    throw new AdminError("bad-request", `email is not on workspace domain ${t.domain}`);
+  }
+
+  // Check if a directory member with this email already exists (live or removed).
+  let liveMatch = null;
+  let removedMatch = null;
+  if (typeof registry.membersPage === "function") {
+    const [activeRes, removedRes] = await Promise.all([
+      registry.membersPage(t.id, { q: e, role: "all", limit: 100 }),
+      registry.membersPage(t.id, { q: e, role: "removed", limit: 100 }),
+    ]);
+    liveMatch = activeRes.items.find(m => normEmail(m.email) === e) ?? null;
+    removedMatch = removedRes.items.find(m => normEmail(m.email) === e) ?? null;
+  }
+  if (!liveMatch && removedMatch) throw new AdminError("removed", "cannot promote an offboarded member");
+
+  const entry = liveMatch ? liveMatch.user : "email:" + e;
+  const pending = !liveMatch;
+  const already = t.admins.includes(entry);
+  await registry.addTenantAdmin(t.id, entry);
+  if (!already) {
+    await recordAudit(registry, {
+      tenant: t.id,
+      board: null,
+      actor: caller.user,
+      action: "tenant.admin.add",
+      target: entry,
+      detail: { member: entry, email: e, pending },
+      at: now(),
+    });
+  }
+  return { member: entry, email: e, pending };
+}
+
+/**
+ * DELETE /tenants/:tenant/admins/:member — live Unit admins only.
+ * Atomically removes all admin entries for the target (both `userId` and `email:` when linked), refusing
+ * with `409 last-admin` if doing so would leave 0 live admins. Announces revocation and emits `tenant.admin.remove`.
+ * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string, member: unknown }} req
+ * @param {{ registry: Registry, announce?: (unit: { id: string }, scope: { type: string, id: string }, o?: { revoke?: boolean }) => void, now?: () => number }} deps
+ */
+export async function demoteTenantAdmin({ caller, tenant, member }, { registry, announce = () => {}, now = Date.now }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
+
+  if (typeof member !== "string" || !member.trim() || member.length > 320 || CONTROL.test(member)) {
+    throw new AdminError("bad-request", "bad member");
+  }
+  const raw = member.trim();
+  let target = raw;
+  if (raw.startsWith("email:")) {
+    const e = normEmail(raw.slice(6));
+    if (!e || !EMAIL.test(e)) throw new AdminError("bad-request", "bad email");
+    target = "email:" + e;
+  } else if (!raw.includes(":") && EMAIL.test(raw)) {
+    target = "email:" + normEmail(raw);
+  }
+
+  let removed;
+  try {
+    removed = await registry.removeTenantAdmin(t.id, target);
+  } catch (e) {
+    if (e instanceof RegistryError && e.code === "last-admin") {
+      throw new AdminError("last-admin", "cannot remove the last live tenant admin");
+    }
+    if (/^registry: bad /.test(String(e?.message ?? ""))) throw new AdminError("bad-request", String(e.message));
+    throw e;
+  }
+  if (!removed) throw new AdminError("not-found", "admin not found");
+
+  announce(t, { type: "unit", id: t.id }, { revoke: true });
+  await recordAudit(registry, {
+    tenant: t.id,
+    board: null,
+    actor: caller.user,
+    action: "tenant.admin.remove",
+    target,
+    detail: { member: target },
+    at: now(),
+  });
+}
+
+/**
+ * GET /tenants/:tenant/members/:user/summary — live Unit admins only.
+ * Effective access summary for the Admin UI User Detail Drawer (bounded to 100 grants).
+ * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string, user: string }} req
+ * @param {{ registry: Registry }} deps
+ */
+export async function getTenantMemberSummary({ caller, tenant, user }, { registry }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
+  if (typeof user !== "string" || !user || user.length > 200 || /[\0\n]/.test(user)) {
+    throw new AdminError("bad-request", "bad user");
+  }
+
+  const state = await registry.memberState?.(t.id, user) ?? null;
+  const inAdmins = t.admins.includes(user);
+  if (!state && !inAdmins) throw new AdminError("not-found", "member not found");
+
+  const unitRole = typeof registry.scopedGrant === "function"
+    ? await registry.scopedGrant({ type: "unit", id: t.id }, { type: "user", id: user })
+    : null;
+
+  // Teams in this tenant that the user belongs to.
+  const allTeams = typeof registry.teams === "function" ? await registry.teams(t.id) : [];
+  /** @type {{ id: string, name: string }[]} */
+  const teams = [];
+  for (const tm of allTeams) {
+    const members = await registry.teamMembers(tm.id);
+    if (members.includes(user)) teams.push({ id: tm.id, name: tm.name });
+  }
+
+  // Scoped grants held by this user in this tenant (bounded to 100).
+  const rawScopes = typeof registry.scopesOf === "function"
+    ? (await registry.scopesOf({ type: "user", id: user }, { limit: 100 })).scopes
+    : [];
+  /** @type {{ scopeType: string, scopeId: string, scopeName: string, role: string }[]} */
+  const grants = [];
+  for (const sc of rawScopes) {
+    if (grants.length >= 100) break;
+    if (sc.type === "unit") {
+      if (sc.id !== t.id) continue;
+      grants.push({ scopeType: "unit", scopeId: sc.id, scopeName: t.name ?? t.domain ?? "Workspace", role: sc.role });
+    } else if (sc.type === "group") {
+      const g = await registry.group(sc.id);
+      if (!g || g.tenant !== t.id) continue;
+      grants.push({ scopeType: "group", scopeId: g.id, scopeName: g.name, role: sc.role });
+    } else if (sc.type === "space") {
+      const sp = await registry.space(sc.id);
+      if (!sp || sp.tenant !== t.id) continue;
+      grants.push({ scopeType: "space", scopeId: sp.id, scopeName: sp.name, role: sc.role });
+    } else if (sc.type === "board") {
+      const b = await registry.board(sc.id);
+      if (!b || b.tenant !== t.id) continue;
+      grants.push({ scopeType: "board", scopeId: b.id, scopeName: b.title || "Untitled", role: sc.role });
+    }
+  }
+
+  return {
+    user,
+    name: state?.name || state?.email || plainUserName(user),
+    email: state?.email ?? null,
+    isAdmin: isTenantAdminRecord(t, { user, email: state?.email ?? null, domain: t.domain }),
+    contentTier: contentTierOf(unitRole),
+    removed: Boolean(state?.removed),
+    teams,
+    grants,
+  };
+}
+
+/**
+ * GET /tenants/:tenant/spaces-overview — live Unit admins only.
+ * Lists all Areas (Groups) and Spaces in the Workspace (metadata only, no private board content).
+ * @param {{ caller: import("../../ports/idp.js").Identity, tenant: string }} req
+ * @param {{ registry: Registry }} deps
+ */
+export async function listTenantSpacesOverview({ caller, tenant }, { registry }) {
+  if (typeof tenant !== "string" || !tenant) throw new AdminError("not-found", "no such tenant");
+  const t = await registry.tenant(tenant);
+  if (!t) throw new AdminError("not-found", "no such tenant");
+  if (!(await liveTenantAdmin(registry, t, caller))) throw new AdminError("forbidden", "not allowed");
+
+  const [groups, liveSpaces, trashedRes] = await Promise.all([
+    registry.groups(t.id),
+    registry.spaces(t.id),
+    typeof registry.trashedSpaces === "function" ? registry.trashedSpaces(t.id, { limit: 200 }) : Promise.resolve({ spaces: [], next: null }),
+  ]);
+
+  const groupById = new Map(groups.map(g => [g.id, g]));
+  /** @type {Map<string, any>} */
+  const spaceById = new Map();
+  for (const sp of liveSpaces) spaceById.set(sp.id, { ...sp, _trashedBoardCount: null });
+  for (const sp of trashedRes.spaces ?? []) {
+    if (!spaceById.has(sp.id)) spaceById.set(sp.id, { ...sp, _trashedBoardCount: sp.boards ?? 0 });
+  }
+  const allSpaces = [...spaceById.values()];
+
+  /** @type {Set<string>} */
+  const ownerIds = new Set();
+  /** @type {Map<string, string[]>} */
+  const groupOwnerIds = new Map();
+  for (const g of groups) {
+    const gs = await registry.scopedGrants({ type: "group", id: g.id });
+    const ids = [...new Set(gs.filter(x => x.role === "owner" && x.subject.type === "user").map(x => x.subject.id))];
+    groupOwnerIds.set(g.id, ids);
+    for (const id of ids) ownerIds.add(id);
+  }
+
+  /** @type {Map<string, { owners: string[], boardCount: number }>} */
+  const spaceMeta = new Map();
+  for (const sp of allSpaces) {
+    const gs = await registry.scopedGrants({ type: "space", id: sp.id });
+    const ids = new Set(gs.filter(x => x.role === "owner" && x.subject.type === "user").map(x => x.subject.id));
+    if (sp.owner) ids.add(sp.owner);
+    const list = [...ids];
+    for (const id of list) ownerIds.add(id);
+    let boardCount = sp._trashedBoardCount;
+    if (boardCount == null) {
+      const bPage = await registry.boardsIn({ type: "space", id: sp.id }, { limit: 1000, withTrashed: false });
+      boardCount = bPage.ids.length;
+    }
+    spaceMeta.set(sp.id, { owners: list, boardCount });
+  }
+
+  // Batch-resolve owner display names & emails from directory.
+  /** @type {Map<string, { name: string|null, email: string|null }>} */
+  const profileById = new Map();
+  const idList = [...ownerIds];
+  for (let i = 0; i < idList.length; i += 200) {
+    const rows = await registry.membersAmong(t.id, idList.slice(i, i + 200));
+    for (const r of rows) profileById.set(r.user, { name: r.name, email: r.email });
+  }
+  const toOwner = id => {
+    const p = profileById.get(id);
+    return { user: id, name: p?.name || p?.email || plainUserName(id), email: p?.email ?? null };
+  };
+
+  const areas = groups.map(g => {
+    const owners = (groupOwnerIds.get(g.id) ?? []).map(toOwner);
+    return {
+      id: g.id,
+      name: g.name,
+      generalAccess: g.generalRole ?? null,
+      ownerCount: owners.length,
+      owners,
+    };
+  });
+
+  const spaces = allSpaces.map(sp => {
+    const meta = spaceMeta.get(sp.id) ?? { owners: [], boardCount: 0 };
+    const owners = meta.owners.map(toOwner);
+    return {
+      id: sp.id,
+      name: sp.name,
+      kind: sp.kind,
+      areaId: sp.group ?? null,
+      areaName: sp.group ? (groupById.get(sp.group)?.name ?? null) : null,
+      ownerCount: owners.length,
+      owners,
+      generalAccess: sp.generalRole ?? null,
+      boardCount: meta.boardCount,
+      trashed: sp.trashedAt != null,
+    };
+  });
+
+  return { areas, spaces };
 }
 
 /**

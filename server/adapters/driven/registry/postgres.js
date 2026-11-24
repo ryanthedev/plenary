@@ -72,7 +72,7 @@
 // owns that pool) or `sql` (a Bun SQL client you own). `schema` names the Postgres schema. Never reads env.
 
 import { SQL } from "bun";
-import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../../../ports/registry.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, DIRECTORY, resolveAdminRemoval, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../../../ports/registry.js";
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../../../core/auth/util.js";
 import { needSchema, migrate, assertShapes, missing, ensureColumn } from "../../support/pg/schema.js";
 
@@ -450,6 +450,29 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       await write(async tx => {
         if (!(await one(tx, `SELECT 1 AS x FROM ${T} WHERE id = $1`, [tenant]))) throw new Error("registry: no such tenant");
         await tx.unsafe(`INSERT INTO ${A} (tenant, member) VALUES ($1, $2) ON CONFLICT (tenant, member) DO NOTHING`, [tenant, String(user)]);
+      });
+    },
+    async removeTenantAdmin(tenant, member) {
+      ready();
+      if (!key(tenant)) throw new Error("registry: no such tenant");
+      if (!key(member) || !member) throw new Error("registry: bad member");
+      return write(async tx => {
+        if (!(await one(tx, `SELECT id FROM ${T} WHERE id = $1 FOR UPDATE`, [tenant]))) throw new Error("registry: no such tenant");
+        const admins = (await tx.unsafe(`SELECT member FROM ${A} WHERE tenant = $1 ORDER BY n`, [tenant])).map(r => r.member);
+        const userIds = new Set(), emails = new Set();
+        for (const entry of [...admins, member]) {
+          if (entry.startsWith("email:")) { const e = normEmail(entry.slice(6)); if (e) emails.add(e); }
+          else userIds.add(entry);
+        }
+        const memberRows = (await tx.unsafe(
+          `SELECT member AS "user", email, removed_at IS NOT NULL AS removed FROM ${MB} WHERE tenant = $1 AND (member = ANY($2::text[]) OR (email IS NOT NULL AND lower(trim(email)) = ANY($3::text[])))`,
+          [tenant, [...userIds], [...emails]],
+        )).map(r => ({ user: r.user, email: r.email, removed: !!r.removed }));
+        const { toRemove, blocked } = resolveAdminRemoval(admins, memberRows, member);
+        if (blocked) throw new RegistryError("last-admin", "cannot remove the last live tenant admin");
+        if (toRemove.length === 0) return false;
+        await tx.unsafe(`DELETE FROM ${A} WHERE tenant = $1 AND member = ANY($2::text[])`, [tenant, toRemove]);
+        return true;
       });
     },
     async addTenantMember(tenant, email) {
@@ -1268,6 +1291,31 @@ export async function postgresRegistry({ url, sql, max, schema = "public", now =
       const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
       return await db.unsafe(`SELECT member AS "user", name, email FROM ${MB} WHERE tenant = $1 AND removed_at IS NULL AND ($2::text IS NULL OR ${fold("coalesce(name, '')")} LIKE $2 ESCAPE '\\'
         OR ${fold("coalesce(email, '')")} LIKE $2 ESCAPE '\\' OR ${fold("member")} LIKE $2 ESCAPE '\\') ORDER BY coalesce(name, member) COLLATE "C", member COLLATE "C" LIMIT $3`, [tenant, like, n]);
+    },
+    async membersPage(tenant, { q: term = null, role = "all", after = null, limit } = {}) {
+      ready();
+      const r = role ?? "all";
+      if (!DIRECTORY.roles.includes(r)) throw new Error("registry: bad role");
+      const like = likeOf(term), cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, DIRECTORY.page.default, DIRECTORY.page.max);
+      if (!key(tenant)) return { items: [], nextCursor: null };
+      const fold = c => `translate(${c}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
+      const rows = await db.unsafe(
+        `SELECT m.member AS "user", m.name, m.email, m.removed_at FROM ${MB} m
+         WHERE m.tenant = $1
+           AND ($2::text IS NULL OR m.member COLLATE "C" > $2 COLLATE "C")
+           AND ($3::text IS NULL OR ${fold("coalesce(m.name, '')")} LIKE $3 ESCAPE '\\' OR ${fold("coalesce(m.email, '')")} LIKE $3 ESCAPE '\\' OR ${fold("m.member")} LIKE $3 ESCAPE '\\')
+           AND (($4 = 'removed' AND m.removed_at IS NOT NULL)
+             OR ($4 = 'all' AND m.removed_at IS NULL)
+             OR ($4 = 'admin' AND m.removed_at IS NULL AND EXISTS (SELECT 1 FROM ${A} a WHERE a.tenant = m.tenant AND (a.member = m.member OR (m.email IS NOT NULL AND a.member = 'email:' || lower(trim(m.email))))))
+             OR ($4 = 'member' AND m.removed_at IS NULL AND NOT EXISTS (SELECT 1 FROM ${A} a WHERE a.tenant = m.tenant AND (a.member = m.member OR (m.email IS NOT NULL AND a.member = 'email:' || lower(trim(m.email)))))))
+         ORDER BY m.member COLLATE "C" ASC LIMIT $5`,
+        [tenant, cur, like, r, n + 1],
+      );
+      const page = rows.slice(0, n);
+      return {
+        items: page.map(x => ({ user: x.user, name: x.name, email: x.email, removed: x.removed_at != null, updatedAt: x.removed_at != null ? Number(x.removed_at) : null })),
+        nextCursor: rows.length > n ? page[n - 1].user : null,
+      };
     },
     async setScopedGrant({ scope, subject, role }) {
       ready();

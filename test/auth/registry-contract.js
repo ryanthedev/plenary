@@ -252,6 +252,80 @@ export function registryContract(name, makeRegistry, opts = {}) {
       await expect(r.addTenantAdmin("t-nope00000000", "google:ann")).rejects.toThrow();
     });
 
+    test("removeTenantAdmin: atomic dual-entry dedup, last-live-admin guard, and pending email removal", async () => {
+      const t = await r.createTenant({ domain: "acme.com", admins: ["google:alice", "email:alice@acme.com", "email:pending@acme.com"] });
+      await r.touchMember(t.id, { user: "google:alice", name: "Alice", email: "alice@acme.com" });
+
+      // Pending email: admin does NOT count as a live admin that can keep the workspace unlocked.
+      await expect(r.removeTenantAdmin(t.id, "google:alice")).rejects.toMatchObject({ code: "last-admin" });
+      await expect(r.removeTenantAdmin(t.id, "email:alice@acme.com")).rejects.toMatchObject({ code: "last-admin" });
+      expect((await r.tenant(t.id)).admins).toEqual(["google:alice", "email:alice@acme.com", "email:pending@acme.com"]);
+
+      // Removing a pending email: entry itself is always allowed.
+      expect(await r.removeTenantAdmin(t.id, "email:pending@acme.com")).toBe(true);
+      expect((await r.tenant(t.id)).admins).toEqual(["google:alice", "email:alice@acme.com"]);
+
+      // A removed member in admins does NOT count as a live admin.
+      await r.touchMember(t.id, { user: "google:gone", name: "Gone", email: "gone@acme.com" });
+      await r.removeMember({ tenant: t.id, user: "google:gone", by: "google:alice" });
+      await r.addTenantAdmin(t.id, "google:gone");
+      await expect(r.removeTenantAdmin(t.id, "google:alice")).rejects.toMatchObject({ code: "last-admin" });
+
+      // Adding a second live admin (even with dual entries) allows removing Alice, and removes BOTH of Alice's entries.
+      await r.touchMember(t.id, { user: "google:bob", name: "Bob", email: "bob@acme.com" });
+      await r.addTenantAdmin(t.id, "google:bob");
+      await r.addTenantAdmin(t.id, "email:bob@acme.com");
+      expect(await r.removeTenantAdmin(t.id, "google:alice")).toBe(true);
+      expect((await r.tenant(t.id)).admins).toEqual(["google:gone", "google:bob", "email:bob@acme.com"]);
+
+      // Removing a non-admin returns false; Bob is now the last live admin (dual-entry dedup!).
+      expect(await r.removeTenantAdmin(t.id, "google:alice")).toBe(false);
+      await expect(r.removeTenantAdmin(t.id, "google:bob")).rejects.toMatchObject({ code: "last-admin" });
+      await expect(r.removeTenantAdmin(t.id, "email:bob@acme.com")).rejects.toMatchObject({ code: "last-admin" });
+
+      // Unknown tenant and bad member reject.
+      await expect(r.removeTenantAdmin("t-nope00000000", "google:bob")).rejects.toThrow();
+      await expect(r.removeTenantAdmin(t.id, "")).rejects.toThrow();
+    });
+
+    test("membersPage: cursor pagination, q search, role filters (all/admin/member/removed), and bounds", async () => {
+      const t = await r.createTenant({ domain: "acme.com", admins: ["google:u1", "email:u2@acme.com"] });
+      await r.touchMember(t.id, { user: "google:u1", name: "Ada Lovelace", email: "u1@acme.com" });
+      await r.touchMember(t.id, { user: "google:u2", name: "Bob Builder", email: "u2@acme.com" });
+      await r.touchMember(t.id, { user: "google:u3", name: "Carol Chen", email: "u3@acme.com" });
+      await r.touchMember(t.id, { user: "google:u4", name: "Dave Departed", email: "u4@acme.com" });
+      await r.removeMember({ tenant: t.id, user: "google:u4", by: "google:u1" });
+
+      // Paginate active ("all") members by user id
+      const p1 = await r.membersPage(t.id, { limit: 2 });
+      expect(p1.items.map(i => i.user)).toEqual(["google:u1", "google:u2"]);
+      expect(p1.items.every(i => i.removed === false && "updatedAt" in i)).toBe(true);
+      expect(p1.nextCursor).toBe("google:u2");
+
+      const p2 = await r.membersPage(t.id, { after: p1.nextCursor, limit: 2 });
+      expect(p2.items.map(i => i.user)).toEqual(["google:u3"]);
+      expect(p2.nextCursor).toBeNull();
+
+      // Role filters
+      const admins = await r.membersPage(t.id, { role: "admin" });
+      expect(admins.items.map(i => i.user)).toEqual(["google:u1", "google:u2"]);
+      const members = await r.membersPage(t.id, { role: "member" });
+      expect(members.items.map(i => i.user)).toEqual(["google:u3"]);
+      const removed = await r.membersPage(t.id, { role: "removed" });
+      expect(removed.items.map(i => i.user)).toEqual(["google:u4"]);
+      expect(removed.items[0].removed).toBe(true);
+      expect(typeof removed.items[0].updatedAt).toBe("number");
+
+      // Case-insensitive search q on name/email
+      const qRes = await r.membersPage(t.id, { q: "CAROL" });
+      expect(qRes.items.map(i => i.user)).toEqual(["google:u3"]);
+
+      // Unknown tenant and validation errors
+      expect(await r.membersPage("t-nope00000000")).toEqual({ items: [], nextCursor: null });
+      await expect(r.membersPage(t.id, { role: /** @type {any} */ ("bogus") })).rejects.toThrow(/bad role/);
+      await expect(r.membersPage(t.id, { after: "bad\ncursor" })).rejects.toThrow(/bad cursor/);
+    });
+
     // ---- boards ----
 
     test("createBoard: minted id b- + 16, defaults title '' and memberRole viewer; board(id) reads it back", async () => {

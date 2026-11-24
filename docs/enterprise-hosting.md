@@ -139,7 +139,7 @@ For hardened clusters, separate schema ownership (`plenary_owner`) from runtime 
 
 ## 3. OIDC & Google Workspace SSO Reference
 
-Plenary supports **either** Generic OIDC **or** Google Workspace SSO (do not configure both simultaneously; `server/main.js` refuses to start if both are set).
+Plenary supports **simultaneous multi-provider SSO**: you can enable **Google Workspace**, **Microsoft Entra ID**, and **Generic OIDC** individually or all at the same time. Enabled providers are advertised at `GET /auth/providers`, selected via `GET /auth/login?provider=google|microsoft|oidc`, and share a single `OIDC_REDIRECT_URI` (matching `PUBLIC_URL`'s origin).
 
 ### Generic OIDC (Okta, Keycloak, Authentik, Pocket ID, Auth0, Entra ID)
 - Uses OIDC Discovery (`/.well-known/openid-configuration`), Authorization Code Flow with **PKCE (`S256`)**, and JWKS (`RS256`/`ES256`) verification.
@@ -151,8 +151,15 @@ Plenary supports **either** Generic OIDC **or** Google Workspace SSO (do not con
 - Full provider-by-provider setup examples live in `docs/self-hosting-oidc.md`.
 
 ### Google Workspace SSO
-- Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_URL`, `OIDC_REDIRECT_URI`, and `COOKIE_KEY` (leave `OIDC_ISSUER_URL` unset).
-- Uses Google's verified Workspace `hd` claim for tenant isolation.
+- Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `PUBLIC_URL`, `OIDC_REDIRECT_URI`, and `COOKIE_KEY` (can run alongside Generic OIDC and/or Microsoft Entra ID).
+- Uses Google's verified Workspace `hd` claim for tenant isolation. Set `PLENARY_TRUST_VERIFIED_EMAIL=1` only if you want verified non-consumer emails on Google accounts without `hd` to map to a domain organization (the 11 consumer domains in `CONSUMER_MAIL_DOMAINS`, such as `gmail.com`, are always excluded).
+
+### Microsoft Entra ID (Native OIDC & Group Sync Status)
+- **Live Entra ID OIDC sign-in:** Set `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, `PUBLIC_URL`, `OIDC_REDIRECT_URI`, and `COOKIE_KEY`, plus optional `MICROSOFT_TENANT_ID` (`common` default, `organizations`, `consumers`, or a tenant GUID).
+- **Group gating vs. Graph sync:**
+  - ID-token group gating (`OIDC_ALLOWED_GROUPS` + `OIDC_GROUPS_CLAIM`) is **live today** when Entra is configured via Generic OIDC (`OIDC_ISSUER_URL`).
+  - Microsoft Graph → Plenary Teams directory sync (`server/adapters/driven/auth/entra-graph.js` and `server/adapters/driving/entra-sync-http.js`) is implemented and unit-tested (`test/server/entra-sync.test.js`) as composable server modules, and is **not yet auto-mounted** in `server/main.js` (no Entra Graph sync environment variables are read by `server/main.js`).
+- **Passing variables in Helm / Compose:** Pass `MICROSOFT_*`, `PLENARY_TRUST_VERIFIED_EMAIL`, and `PLENARY_AUTO_PROVISION_DOMAIN_ORGS` via Helm `extraEnv` (`deploy/helm/plenary/values.yaml`) or Compose `environment:` / `deploy/.env`.
 
 ---
 
@@ -276,13 +283,13 @@ Every variable read by `server/main.js`:
 | `S3_SESSION_TOKEN` | unset | No | Optional temporary STS session token. |
 | `PLENARY_BLOBS` | unset | Single-GW HA | Set to `local-disk` only for a single-gateway cluster without S3 (mutually exclusive with `S3_ENDPOINT`). |
 
-### Authentication (OIDC or Google Workspace SSO — Pick One)
+### Authentication (Multi-Provider SSO: Google, Microsoft Entra ID & Generic OIDC)
 | Variable | Default | Required | Description |
 | --- | --- | --- | --- |
-| `OIDC_ISSUER_URL` | unset | Generic OIDC | HTTPS OIDC issuer base URL. |
+| `OIDC_ISSUER_URL` | unset | Generic OIDC | HTTPS OIDC issuer base URL (may run alongside Google and Microsoft). |
 | `OIDC_CLIENT_ID` | unset | Generic OIDC | OIDC client ID. |
 | `OIDC_CLIENT_SECRET` | unset | Generic OIDC | OIDC client secret. |
-| `OIDC_REDIRECT_URI` | `http://localhost:8080/auth/callback` | Prod | Callback URL registered at the IdP (must match `PUBLIC_URL` origin). |
+| `OIDC_REDIRECT_URI` | `http://localhost:8080/auth/callback` | Prod | Callback URL registered at the IdP (must match `PUBLIC_URL` origin). Shared across all active SSO providers. |
 | `OIDC_SCOPES` | `openid email profile` | No | Space-separated OIDC scopes. |
 | `OIDC_DISPLAY_NAME` | `SSO` | No | Provider/tenant display name. |
 | `OIDC_TENANT_SLUG` | derived from issuer | No | Explicit slug for `oidc:<slug>` tenancy. |
@@ -291,16 +298,23 @@ Every variable read by `server/main.js`:
 | `OIDC_ALLOWED_GROUPS` | unset | No | Comma-separated IdP groups required to sign in. |
 | `OIDC_GROUPS_CLAIM` | `groups` | No | ID token claim name inspected for `OIDC_ALLOWED_GROUPS`. |
 | `OIDC_ADMIN_USERS` | unset | No | Comma-separated OIDC `sub` values granted Unit admin on startup. |
-| `OIDC_ALLOW_UNVERIFIED_EMAIL` | `0` | No | Set `1` only for IdPs (e.g. Entra ID) omitting `email_verified`. |
+| `OIDC_ALLOW_UNVERIFIED_EMAIL` | `0` | No | Set `1` only for IdPs (e.g. Generic OIDC Entra ID) omitting `email_verified`. |
 | `OIDC_ALLOW_HTTP_LOCALHOST` | `0` in prod | No | Set `1` only for local dev HTTP IdPs. |
-| `GOOGLE_CLIENT_ID` | unset | Google SSO | Google Workspace OAuth client ID (mutually exclusive with `OIDC_ISSUER_URL`). |
+| `GOOGLE_CLIENT_ID` | unset | Google SSO | Google Workspace OAuth client ID (may run alongside Generic OIDC and Microsoft). |
 | `GOOGLE_CLIENT_SECRET` | unset | Google SSO | Google Workspace OAuth client secret. |
+| `MICROSOFT_CLIENT_ID` | unset | Microsoft SSO | Microsoft Entra ID App Registration Application (client) ID (may run alongside Google and Generic OIDC). |
+| `MICROSOFT_CLIENT_SECRET` | unset | Microsoft SSO | Microsoft Entra ID client secret value. |
+| `MICROSOFT_TENANT_ID` | `common` | No | `common`, `organizations`, `consumers`, or a specific Entra tenant GUID (`UUID`). |
+| `PLENARY_TRUST_VERIFIED_EMAIL` | `false` | No | Set `1` or `true` to derive an org `domain` from verified non-consumer emails on Google (without `hd`) and personal Microsoft MSA accounts (excludes 11 consumer mail domains in `CONSUMER_MAIL_DOMAINS`). |
+| `PLENARY_AUTO_PROVISION_DOMAIN_ORGS` | `1` | No | Set `0` to disable automatic tenant creation (and initial admin assignment) on first verified `google:` or `microsoft:` corporate domain sign-in. |
+
+> **Helm / Compose note:** Until dedicated keys are added to `deploy/helm/plenary/values.yaml` and `deploy/docker-compose.enterprise.yml`, pass `MICROSOFT_*`, `PLENARY_TRUST_VERIFIED_EMAIL`, and `PLENARY_AUTO_PROVISION_DOMAIN_ORGS` via Helm `extraEnv` or Compose `environment:` / `deploy/.env`.
 
 ### Observability & Tuning
 | Variable | Default | Required | Description |
 | --- | --- | --- | --- |
 | `PLENARY_METRICS_TOKEN` | unset | No | ≥ 16-char RFC 6750 Bearer token enabling `GET /metrics` (Prometheus text). Unset = 404. |
-| `PLENARY_REQUEST_DEADLINE_MS` | `8000` | No | Per-request HTTP deadline in ms (must stay above 5000 ms Registry limit). |
+| `PLENARY_REQUEST_DEADLINE_MS` | `8000` | No | Per-request HTTP deadline in ms (must exceed `5000 ms` on single-node SQLite `SQLITE_BUSY_MS`, and `queueTimeoutMs + 5000 + 1000` — `> 7050 ms` at the default `queueTimeoutMs = 1050 ms` — in Postgres HA cluster mode). |
 | `PLENARY_MAX_CONNS_PER_USER` | `64` | No | Maximum concurrent WebSocket connections per user. |
 | `PLENARY_BLOB_QUOTA_BYTES` | `10737418240` (10 GiB) | No | Per-tenant blob storage quota in bytes. |
 | `PLENARY_BLOB_REAP_MS` | `600000` (10 min) | No | Gateway unreferenced-blob reaper interval in ms (`1000`–`86400000`). |

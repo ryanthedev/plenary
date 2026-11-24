@@ -21,7 +21,7 @@ import { hashPasscode, validateSharePolicy, checkLinkPolicy } from "../auth/shar
 
 export class AdminError extends Error {
   /**
-   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"|"with-space"|"space-in-trash"|"purged"|"would-escalate"|"limit"|"personal"|"bad-recipient"|"is-admin"|"still-owns"|"superseded"} code
+   * @param {"forbidden"|"bad-request"|"not-found"|"last-owner"|"last-admin"|"removed"|"unknown-person"|"bad-role"|"too-large"|"in-use"|"confirm-required"|"rate-limited"|"moved"|"with-space"|"space-in-trash"|"purged"|"would-escalate"|"limit"|"personal"|"bad-recipient"|"is-admin"|"still-owns"|"superseded"} code
    * @param {string} [message]
    * @param {{ cause?: unknown, data?: Record<string, any> }} [extra]  `data`: fields the HTTP answer adds (`in-use`, `confirm-required`)
    */

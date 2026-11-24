@@ -103,7 +103,7 @@ import { versionService } from "../../core/auth/versions.js";
 import { ComplianceError, exportBoardData, exportTenantData, eraseUserData } from "../../core/auth/compliance.js";
 import { createLinkRateLimiter } from "../../core/auth/share-policy.js";
 import { AdminError, listBoards, createBoard, updateBoard, deleteBoard, createInvite, listInvites, readInvite, revokeInvite, createLink, listLinks, readLink, revokeLink, verifyLinkAccess, setGrant, shareView, listBoardAudit, listTenantAudit } from "../../core/admin/boards.js";
-import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember, provisionDomainTenant } from "../../core/admin/tenants.js";
+import { createPersonalTenant, listTenants, listTenantMembers, addTenantMember, removeTenantMember, promoteTenantAdmin, demoteTenantAdmin, getTenantMemberSummary, listTenantSpacesOverview, provisionDomainTenant } from "../../core/admin/tenants.js";
 
 const defaultLinkRateLimiter = createLinkRateLimiter();
 
@@ -537,7 +537,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
   }
 
   // ---- routes ----
-  const admin = { registry, tenancy, now };
+  const admin = { registry, tenancy, now, announce: spaces.announceChange };
   async function redeemLinkHttp(who, linkId, passcode) {
     const checked = await verifyLinkAccess({ link: linkId, passcode }, { registry, now, rateLimiter: linkRateLimiter });
     if ("code" in checked) {
@@ -627,9 +627,16 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
       },
     }],
     ["/tenants/:tenant/members", {
-      GET: async (req, p) => {
+      GET: async (req, p, url) => {
         const who = await caller(req);
-        return json(200, await listTenantMembers({ caller: who, tenant: p.tenant }, admin));
+        return json(200, await listTenantMembers({
+          caller: who,
+          tenant: p.tenant,
+          q: url.searchParams.get("q"),
+          role: url.searchParams.get("role"),
+          after: url.searchParams.get("after"),
+          limit: url.searchParams.get("limit"),
+        }, admin));
       },
       POST: async (req, p) => {
         const who = await caller(req);
@@ -637,11 +644,37 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
         return json(201, await addTenantMember({ caller: who, tenant: p.tenant, email: b.email }, admin));
       },
     }],
+    ["/tenants/:tenant/members/:user/summary", {
+      GET: async (req, p) => {
+        const who = await caller(req);
+        return json(200, await getTenantMemberSummary({ caller: who, tenant: p.tenant, user: p.user }, admin));
+      },
+    }],
     ["/tenants/:tenant/members/:email", {
       DELETE: async (req, p) => {
         const who = await caller(req);
         await removeTenantMember({ caller: who, tenant: p.tenant, email: p.email }, admin);
         return json(204);
+      },
+    }],
+    ["/tenants/:tenant/admins", {
+      POST: async (req, p) => {
+        const who = await caller(req);
+        const b = await body(req, ["userId", "email"]);
+        return json(201, await promoteTenantAdmin({ caller: who, tenant: p.tenant, userId: b.userId, email: b.email }, admin));
+      },
+    }],
+    ["/tenants/:tenant/admins/:member", {
+      DELETE: async (req, p) => {
+        const who = await caller(req);
+        await demoteTenantAdmin({ caller: who, tenant: p.tenant, member: p.member }, admin);
+        return json(204);
+      },
+    }],
+    ["/tenants/:tenant/spaces-overview", {
+      GET: async (req, p) => {
+        const who = await caller(req);
+        return json(200, await listTenantSpacesOverview({ caller: who, tenant: p.tenant }, admin));
       },
     }],
     ["/admin/audit", { GET: async (req, url) => {
@@ -1067,7 +1100,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
         if (e.code === "with-space" || e.code === "space-in-trash" || e.code === "purged" || e.code === "would-escalate") return err(409, e.code);
         if (e.code === "unknown-person" || e.code === "bad-role" || e.code === "bad-recipient") return err(400, e.code);
         if (/** @type {string} */ (e.code) === "bad-passcode" || /** @type {string} */ (e.code) === "invalid") return err(400, e.code, { message: String(e.message).slice(0, 200) });
-        if (e.code === "still-owns" || e.code === "is-admin" || e.code === "personal") return err(409, e.code);
+        if (e.code === "still-owns" || e.code === "is-admin" || e.code === "last-admin" || e.code === "removed" || e.code === "personal") return err(409, e.code);
         if (e.code === "rate-limited") { const s = e.data?.retryAfter ?? null; return err(429, "rate-limited", { retryAfter: s }, s == null ? undefined : { "retry-after": String(s) }); }
       }
       if (e?.code === "removed") return err(403, "forbidden");   // a create racing a removal (the Registry refused in its own step)

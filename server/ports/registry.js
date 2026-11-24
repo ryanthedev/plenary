@@ -64,17 +64,17 @@
 // Every method is async. Ids are server-minted over [a-z0-9-] (no ".", "*", ">"), never a domain name, so they
 // are safe in bus subjects (PROTOCOL.md § Bus). Mint them with `mint` below, so every adapter shares the format.
 
-import { randomId } from "../core/auth/util.js";
+import { randomId, normEmail } from "../core/auth/util.js";
 
 /** The method names of the Registry port (the typedef below, in order; `batch` ones included). test/server/adapter-surface.test.js checks every adapter against it. */
 export const REGISTRY_METHODS = Object.freeze([
-  "createTenant", "addTenantDomain", "tenant", "tenantByDomain", "listPersonalTenants", "addTenantAdmin", "tenantAdminsAmong",
+  "createTenant", "addTenantDomain", "tenant", "tenantByDomain", "listPersonalTenants", "addTenantAdmin", "removeTenantAdmin", "tenantAdminsAmong",
   "addTenantMember", "removeTenantMember", "isTenantMember", "tenantMembers", "tenantsForMember", "tenantsForAdmin",
   "createBoard", "updateBoard", "deleteBoard", "listBoards", "listBoardsFor", "boardsForUser",
   "createGroup", "group", "groups", "createSpace", "space",
   "spaces", "ensurePersonalSpace", "personalSpace", "createTeam", "renameTeam", "deleteTeam", "teamsPage",
   "teamsAmong", "teamMembersPage", "scopedGrant", "scopedGrantsPage", "touchMember", "membersAmong",
-  "findMembers", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
+  "findMembers", "membersPage", "team", "teams", "setTeamMember", "teamMembers", "setScopedGrant",
   "rename", "updateScope", "spacesIn", "scopedGrants", "createRole", "deleteRole",
   "roleUsage", "memberCount", "updateRole", "role", "roles", "accessContexts",
   "accessContext", "boardsIn", "scopesOf", "personalScopesOf", "board", "moveBoard", "trashBoard", "restoreBoard", "trashSpace", "restoreSpace", "trashedBoards", "trashedSpaces", "trashDue", "purgeClaim", "purgeBoard", "purgeSpace", "setGrant", "grant",
@@ -145,6 +145,7 @@ export const mint = {
  *   tenantByDomain(domain: string): Promise<Tenant|null>,
  *   listPersonalTenants(): Promise<Tenant[]>,
  *   addTenantAdmin(tenant: string, user: string): Promise<void>,
+ *   removeTenantAdmin(tenant: string, member: string): Promise<boolean>,   // atomic: deduplicates userId + email: entries for the target, rejects code "last-admin" if removing a live admin would leave 0 live admins (pending email: entries may always be removed), deletes all matching entries for the target; returns true if any entry was removed
  *   addTenantMember(tenant: string, email: string): Promise<{ added: boolean }>,
  *   removeTenantMember(tenant: string, email: string): Promise<boolean>,
  *   isTenantMember(tenant: string, email: string): Promise<boolean>,
@@ -185,6 +186,7 @@ export const mint = {
  *   touchMember(tenant: string, o: { user: string, name?: string|null, email?: string|null }): Promise<void>,   // never clears a removal. The member directory: records a Unit member seen at sign-in (the code exchange) or on Home; writes only when the row is new or its name/email changed
  *   membersAmong(tenant: string, users: string[]): Promise<{ user: string, name: string|null, email: string|null, removed: boolean }[]>,   // those of `users` (at most 200) in the Unit's directory
  *   findMembers(tenant: string, o?: { q?: string|null, limit?: number }): Promise<{ user: string, name: string|null, email: string|null }[]>,   // never a removed person   // directory search by ASCII-folded substring of name, email or user id; by name then id; default 20, cap 50
+ *   membersPage(tenant: string, o?: { q?: string|null, role?: "all"|"admin"|"member"|"removed", after?: string|null, limit?: number }): Promise<{ items: { user: string, name: string|null, email: string|null, removed: boolean, updatedAt: number|null }[], nextCursor: string|null }>,   // cursor-paginated, server-side searchable directory by user id; default 50, cap 100
  *   team(id: string): Promise<Team|null>,
  *   teams(tenant: string): Promise<Team[]>,
  *   setTeamMember(team: string, user: string, member: boolean): Promise<void>,
@@ -323,6 +325,81 @@ export const searchQuery = q => { const t = typeof q === "string" ? q.trim() : "
 
 /** Teams (PROTOCOL.md § Teams and access): page sizes of the Team and grant listings, the directory search, and the cap a Team's `size` is counted to. */
 export const TEAMS = { page: { default: 50, max: 200 }, find: { default: 20, max: 50 }, sizeCap: 1000, among: 200 };
+/** Paginated workspace member directory (`membersPage`): default/max page size and valid role filters. */
+export const DIRECTORY = Object.freeze({ page: { default: 50, max: 100 }, roles: ["all", "admin", "member", "removed"] });
+
+/**
+ * Pure last-live-admin + dual-entry deduplication check shared by every Registry adapter's atomic `removeTenantAdmin`.
+ * Given all current `admins` entries for a tenant, relevant `memberRows` from `reg_members`, and the `target` string
+ * (`userId` or `email:<addr>`), returns:
+ *   - `toRemove`: all entries in `admins` belonging to `target` (both `userId` and `email:<lowerEmail>` when linked)
+ *   - `blocked`: true iff removing `toRemove` would leave 0 distinct live admins (removing a pending-only `email:` entry is never blocked)
+ * @param {string[]} admins
+ * @param {{ user: string, email: string|null, removed: boolean }[]} memberRows
+ * @param {string} target
+ * @returns {{ toRemove: string[], blocked: boolean }}
+ */
+export function resolveAdminRemoval(admins, memberRows, target) {
+  /** @type {Map<string, { user: string, email: string|null, removed: boolean }>} */
+  const byUser = new Map();
+  /** @type {Map<string, { user: string, email: string|null, removed: boolean }[]>} */
+  const byEmail = new Map();
+  for (const r of memberRows) {
+    const em = normEmail(r.email);
+    const norm = { user: r.user, email: em, removed: Boolean(r.removed) };
+    byUser.set(r.user, norm);
+    if (em) {
+      const list = byEmail.get(em) ?? [];
+      list.push(norm);
+      byEmail.set(em, list);
+    }
+  }
+
+  /** @type {Set<string>} */
+  const targetEntries = new Set([target]);
+  if (target.startsWith("email:")) {
+    const em = normEmail(target.slice(6));
+    if (em) {
+      targetEntries.add("email:" + em);
+      for (const r of byEmail.get(em) ?? []) targetEntries.add(r.user);
+    }
+  } else {
+    const row = byUser.get(target);
+    if (row?.email) targetEntries.add("email:" + row.email);
+  }
+
+  const toRemove = admins.filter(a => targetEntries.has(a));
+  if (toRemove.length === 0) return { toRemove: [], blocked: false };
+
+  // Removing a pending-only `email:` entry (no non-email entry removed, and no live directory member with that email)
+  // does not reduce the live admin count, so it is always allowed.
+  const targetIsPendingOnly = toRemove.every(a => {
+    if (!a.startsWith("email:")) return false;
+    const em = normEmail(a.slice(6));
+    return !(em && (byEmail.get(em) ?? []).some(r => !r.removed));
+  });
+  if (targetIsPendingOnly) return { toRemove, blocked: false };
+
+  const removeSet = new Set(toRemove);
+  /** @type {Set<string>} */
+  const liveCanonical = new Set();
+  for (const a of admins) {
+    if (removeSet.has(a)) continue;
+    if (!a.startsWith("email:")) {
+      const row = byUser.get(a);
+      if (row?.removed) continue;
+      liveCanonical.add(a);
+    } else {
+      const em = normEmail(a.slice(6));
+      if (!em) continue;
+      for (const r of byEmail.get(em) ?? []) {
+        if (!r.removed) liveCanonical.add(r.user);
+      }
+    }
+  }
+
+  return { toRemove, blocked: liveCanonical.size === 0 };
+}
 /** The `q` of a Team or directory search: null/empty = no filter; else trimmed, at most 100 chars, no NUL. Returns the LIKE pattern (ASCII-folded, wildcards literal) or null. */
 export function likeOf(q) {
   if (q == null) return null;

@@ -18,7 +18,7 @@
 // `user`; insertion order is an explicit `n` column (Postgres: BIGSERIAL / identity), upserts use ON CONFLICT.
 
 import { Database } from "bun:sqlite";
-import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../../../ports/registry.js";
+import { RegistryError, batchScopes, mint, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, DIRECTORY, resolveAdminRemoval, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../../../ports/registry.js";
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../../../core/auth/util.js";
 import { assertShapes, onBusyRetry } from "../../support/sqlite/schema.js";
 
@@ -236,6 +236,8 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     adminsAmong: db.query("SELECT DISTINCT member FROM reg_tenant_admins WHERE member IN (SELECT value FROM json_each(?))"),
     adminN: db.query("SELECT coalesce(max(n), 0) + 1 AS n FROM reg_tenant_admins WHERE tenant = ?"),
     insAdmin: db.query("INSERT INTO reg_tenant_admins (tenant, member, n) VALUES (?, ?, ?) ON CONFLICT (tenant, member) DO NOTHING"),
+    delAdmin: db.query("DELETE FROM reg_tenant_admins WHERE tenant = ? AND member = ?"),
+    dirAllForAdmins: db.query("SELECT member AS user, email, removed_at IS NOT NULL AS removed FROM reg_members WHERE tenant = ?1 AND (member IN (SELECT value FROM json_each(?2)) OR (email IS NOT NULL AND lower(trim(email)) IN (SELECT value FROM json_each(?3))))"),
     insTenantMember: db.query("INSERT INTO reg_tenant_members (tenant, email, added_at) VALUES (?, ?, ?) ON CONFLICT (tenant, email) DO NOTHING"),
     delTenantMember: db.query("DELETE FROM reg_tenant_members WHERE tenant = ? AND email = ?"),
     listTenantMembers: db.query("SELECT email FROM reg_tenant_members WHERE tenant = ? ORDER BY email ASC"),
@@ -300,6 +302,14 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
     removedAmong: db.query("SELECT member FROM reg_members WHERE tenant = ? AND removed_at IS NOT NULL AND member IN (SELECT value FROM json_each(?)) ORDER BY member"),
     dirFind: db.query(`SELECT member AS user, name, email FROM reg_members WHERE tenant = ?1 AND removed_at IS NULL AND (?2 IS NULL OR name LIKE ?2 ESCAPE '\\' OR email LIKE ?2 ESCAPE '\\' OR member LIKE ?2 ESCAPE '\\')
       ORDER BY coalesce(name, member), member LIMIT ?3`),
+    dirPage: db.query(`SELECT m.member AS user, m.name, m.email, m.removed_at FROM reg_members m
+      WHERE m.tenant = ?1 AND (?2 IS NULL OR m.member > ?2)
+        AND (?3 IS NULL OR m.name LIKE ?3 ESCAPE '\\' OR m.email LIKE ?3 ESCAPE '\\' OR m.member LIKE ?3 ESCAPE '\\')
+        AND ((?4 = 'removed' AND m.removed_at IS NOT NULL)
+          OR (?4 = 'all' AND m.removed_at IS NULL)
+          OR (?4 = 'admin' AND m.removed_at IS NULL AND EXISTS (SELECT 1 FROM reg_tenant_admins a WHERE a.tenant = m.tenant AND (a.member = m.member OR (m.email IS NOT NULL AND a.member = 'email:' || lower(trim(m.email))))))
+          OR (?4 = 'member' AND m.removed_at IS NULL AND NOT EXISTS (SELECT 1 FROM reg_tenant_admins a WHERE a.tenant = m.tenant AND (a.member = m.member OR (m.email IS NOT NULL AND a.member = 'email:' || lower(trim(m.email)))))))
+      ORDER BY m.member ASC LIMIT ?5`),
     sowners: db.query(`SELECT subject_type, subject FROM reg_scope_grants g WHERE scope_type = ? AND scope_id = ? AND role = 'owner'
       AND (subject_type = 'user' OR EXISTS (SELECT 1 FROM reg_team_members m WHERE m.team = g.subject))`),
     teamOwned: db.query("SELECT scope_type, scope_id FROM reg_scope_grants WHERE subject_type = 'team' AND subject = ? AND role = 'owner' AND scope_type IN ('group', 'space')"),
@@ -540,6 +550,23 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
   const addAdminTx = db.transaction((tenant, user) => {
     if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
     q.insAdmin.run(tenant, user, q.adminN.get(tenant).n);
+  });
+
+  const removeAdminTx = db.transaction((tenant, member) => {
+    if (!q.tenantExists.get(tenant)) throw new Error("registry: no such tenant");
+    const admins = q.admins.all(tenant).map(r => r.member);
+    const userIds = new Set(), emails = new Set();
+    for (const entry of [...admins, member]) {
+      if (entry.startsWith("email:")) { const e = normEmail(entry.slice(6)); if (e) emails.add(e); }
+      else userIds.add(entry);
+    }
+    const memberRows = q.dirAllForAdmins.all(tenant, JSON.stringify([...userIds]), JSON.stringify([...emails]))
+      .map(r => ({ user: r.user, email: r.email, removed: !!r.removed }));
+    const { toRemove, blocked } = resolveAdminRemoval(admins, memberRows, member);
+    if (blocked) throw new RegistryError("last-admin", "cannot remove the last live tenant admin");
+    if (toRemove.length === 0) return false;
+    for (const entry of toRemove) q.delAdmin.run(tenant, entry);
+    return true;
   });
 
   const addMemberTx = db.transaction((tenant, email, addedAt) => {
@@ -990,6 +1017,12 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       if (!str(tenant)) throw new Error("registry: no such tenant");
       addAdminTx.immediate(tenant, String(user));
     },
+    async removeTenantAdmin(tenant, member) {
+      ready();
+      if (!str(tenant)) throw new Error("registry: no such tenant");
+      if (!str(member) || !member || member.includes("\0")) throw new Error("registry: bad member");
+      return removeAdminTx.immediate(tenant, member);
+    },
     async addTenantMember(tenant, email) {
       ready();
       if (!str(tenant)) throw new Error("registry: no such tenant");
@@ -1403,6 +1436,19 @@ function build(db, { path, now = Date.now, fullfsync = true, busyTimeoutMs = 500
       ready();
       const like = likeOf(term), n = smallLimit(limit, TEAMS.find.default, TEAMS.find.max);
       return str(tenant) ? q.dirFind.all(tenant, like, n) : [];
+    },
+    async membersPage(tenant, { q: term = null, role = "all", after = null, limit } = {}) {
+      ready();
+      const r = role ?? "all";
+      if (!DIRECTORY.roles.includes(r)) throw new Error("registry: bad role");
+      const like = likeOf(term), cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, DIRECTORY.page.default, DIRECTORY.page.max);
+      if (!str(tenant)) return { items: [], nextCursor: null };
+      const rows = q.dirPage.all(tenant, cur, like, r, n + 1);
+      const page = rows.slice(0, n);
+      return {
+        items: page.map(x => ({ user: x.user, name: x.name, email: x.email, removed: x.removed_at != null, updatedAt: x.removed_at ?? null })),
+        nextCursor: rows.length > n ? page[n - 1].user : null,
+      };
     },
     async setScopedGrant({ scope, subject, role }) {
       ready();

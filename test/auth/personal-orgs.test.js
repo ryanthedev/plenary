@@ -230,9 +230,11 @@ for (const [name, makeRegistry] of ADAPTERS) {
       const wsMem = await wsMemRes.json();
       expect(wsMem.members).toEqual([]);
       expect(wsMem.admins).toEqual(["alice@acme.com"]);
+      expect(wsMem.pendingAdmins).toEqual([]);
+      expect(wsMem.nextCursor).toBeNull();
       expect(wsMem.directory).toEqual([
-        { name: "Alice", email: "alice@acme.com", isAdmin: true },
-        { name: "Dave", email: "dave@acme.com", isAdmin: false },
+        { user: "google:alice", name: "Alice", email: "alice@acme.com", isAdmin: true, contentTier: "none", removed: false },
+        { user: "google:dave", name: "Dave", email: "dave@acme.com", isAdmin: false, contentTier: "none", removed: false },
       ]);
 
       // Unknown tenant returns 404 on members endpoints

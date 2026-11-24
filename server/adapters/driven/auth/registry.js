@@ -3,7 +3,7 @@
 // last-owner and failure rules) is server/auth/registry-port.js; this adapter passes test/auth/registry-contract.js.
 
 import { normEmail, capTo, higher, ROLES, INVITE_ROLES, LINK_ROLES } from "../../../core/auth/util.js";
-import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../../../ports/registry.js";
+import { batchScopes, mint, RegistryError, KINDS, domainList, orgDefaults, MEMBER_ROLE_ID, DEFAULT_MEMBER_PERMS, pageLimit, HOME, IDEM, idemErr, idemOf, smallLimit, searchQuery, asciiFold, TEAMS, TRASH, BOARD_VERSIONS, DIRECTORY, resolveAdminRemoval, likeOf, profileText, ROLE_LIMITS, capOf, isCustomRoleId, ASK, askLimited, askScope, askRole, askLive, askWait, askLimits } from "../../../ports/registry.js";
 
 /**
  * @typedef {import("../../../ports/registry.js").Registry} Registry
@@ -153,6 +153,18 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const t = tenants.get(tenant);
       if (!t) throw new Error("registry: no such tenant");
       if (!t.admins.includes(user)) t.admins.push(user);
+    },
+    async removeTenantAdmin(tenant, member) {
+      const t = tenants.get(tenant);
+      if (!t) throw new Error("registry: no such tenant");
+      if (typeof member !== "string" || !member || member.includes("\0")) throw new Error("registry: bad member");
+      const memberRows = [...(directory.get(tenant)?.values() ?? [])].map(r => ({ user: r.user, email: r.email, removed: r.removedAt != null }));
+      const { toRemove, blocked } = resolveAdminRemoval(t.admins, memberRows, member);
+      if (blocked) throw new RegistryError("last-admin", "cannot remove the last live tenant admin");
+      if (toRemove.length === 0) return false;
+      const drop = new Set(toRemove);
+      t.admins = t.admins.filter(a => !drop.has(a));
+      return true;
     },
     async addTenantMember(tenant, email) {
       if (typeof tenant !== "string" || !tenants.has(tenant)) throw new Error("registry: no such tenant");
@@ -739,6 +751,30 @@ export function memoryRegistry({ now = Date.now } = {}) {
       const like = likeOf(q), term = like && asciiFold(q.trim()), n = smallLimit(limit, TEAMS.find.default, TEAMS.find.max);
       const hit = r => term == null || [r.name ?? "", r.email ?? "", r.user].some(x => asciiFold(x).includes(term));
       return [...(directory.get(tenant)?.values() ?? [])].filter(r => r.removedAt == null && hit(r)).sort((a, b) => ((a.name ?? a.user) + "\n" + a.user < (b.name ?? b.user) + "\n" + b.user ? -1 : 1)).slice(0, n).map(publicRow);
+    },
+    async membersPage(tenant, { q = null, role = "all", after = null, limit } = {}) {
+      const r = role ?? "all";
+      if (!DIRECTORY.roles.includes(r)) throw new Error("registry: bad role");
+      const like = likeOf(q), term = like && asciiFold(q.trim()), cur = orgDefaults.cursor(after, "id"), n = smallLimit(limit, DIRECTORY.page.default, DIRECTORY.page.max);
+      const t = tenants.get(tenant);
+      if (!t) return { items: [], nextCursor: null };
+      const adminSet = new Set(t.admins);
+      const isAdminRow = m => adminSet.has(m.user) || (m.email != null && adminSet.has("email:" + normEmail(m.email)));
+      const hit = m => term == null || [m.name ?? "", m.email ?? "", m.user].some(x => asciiFold(x).includes(term));
+      const all = [...(directory.get(tenant)?.values() ?? [])].filter(m => {
+        if (cur != null && !(m.user > cur)) return false;
+        if (!hit(m)) return false;
+        if (r === "removed") return m.removedAt != null;
+        if (m.removedAt != null) return false;
+        if (r === "admin") return isAdminRow(m);
+        if (r === "member") return !isAdminRow(m);
+        return true;
+      }).sort((a, b) => (a.user < b.user ? -1 : a.user > b.user ? 1 : 0));
+      const page = all.slice(0, n);
+      return {
+        items: page.map(m => ({ user: m.user, name: m.name, email: m.email, removed: m.removedAt != null, updatedAt: m.removedAt ?? null })),
+        nextCursor: all.length > n ? page[n - 1].user : null,
+      };
     },
 
     async setScopedGrant({ scope, subject, role }) {

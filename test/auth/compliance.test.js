@@ -233,19 +233,15 @@ test("eraseUserData: allows self-erasure for regular member and for non-sole adm
   await registry.addTenantAdmin(acme.id, ADMIN2.user);
   await registry.touchMember(acme.id, { user: ADMIN2.user, name: ADMIN2.name, email: ADMIN2.email });
   await registry.setGrant(board.id, ADMIN.user, "editor");
-  await expect(eraseUserData({ registry, tenant: acme.id, targetUserId: ADMIN.user, actor: ADMIN, now }))
+  const noRevokeRegistry = Object.assign(Object.create(registry), { removeTenantAdmin: undefined });
+  await expect(eraseUserData({ registry: noRevokeRegistry, tenant: acme.id, targetUserId: ADMIN.user, actor: ADMIN, now }))
     .rejects.toMatchObject({ code: "is-admin", status: 409 });
 
-  // When an adapter supports `removeTenantAdmin`, erasing a non-sole admin revokes admin status and completes erasure.
-  let removedAdmins = [];
-  const extRegistry = Object.assign(Object.create(registry), {
-    async removeTenantAdmin(_tenantId, entry) { removedAdmins.push(entry); },
-    async removeMember(o) { return { removed: true, grants: 0, scopedGrants: 0, teams: 0, invites: 0, handedOver: false }; },
-  });
-  const adminRes = await eraseUserData({ registry: extRegistry, tenant: acme.id, targetUserId: ADMIN.user, actor: ADMIN, now });
+  // With the real adapter's `removeTenantAdmin`, erasing a non-sole admin revokes admin status and completes erasure.
+  const adminRes = await eraseUserData({ registry, tenant: acme.id, targetUserId: ADMIN.user, actor: ADMIN, now });
   expect(adminRes.erased).toBe(true);
   expect(adminRes.revoked.adminRevoked).toBe(true);
-  expect(removedAdmins).toEqual([ADMIN.user, "email:" + ADMIN.email]);
+  expect((await registry.tenant(acme.id)).admins).toEqual([ADMIN2.user]);
   expect(await registry.grant(board.id, ADMIN.user)).toBeNull();
 });
 

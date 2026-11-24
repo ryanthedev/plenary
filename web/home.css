@@ -966,7 +966,7 @@
   }
 }
 
-/* ── Mobile & Touch (Chrome on iOS <= 720px / <= 640px) ── */
+/* ── Mobile & Touch (Chrome on iOS <= 720px / < 640px) ── */
 @media (max-width: 720px) {
   .home-page .home-top {
     padding: calc(8px + env(safe-area-inset-top)) calc(14px + env(safe-area-inset-right)) 8px calc(14px + env(safe-area-inset-left));

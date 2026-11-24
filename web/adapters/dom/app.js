@@ -144,6 +144,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     theme: initialTheme,
     settings: userSettings,
     workspaceMode: /** @type {"draw" | "animate" | "present"} */ ("draw"),
+    modeMenuOpen: false,
     timelineExpanded: false,
     panel: parsePanel(get("plenary.panel")), drawer: null, sheet: null, dialog: null, colorPicker: null, colorPickerState: { h: null, mode: "hex" }, library: loadLibrary(prefs),
     ribbon: { pinnedOpen: false, manualCollapsed: false, showAll: false, lastSelSig: "" },
@@ -222,8 +223,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   let closeMoreMenu = null;
   let closeMoreMenuNow = () => {};
+  let closeModeMenu = null;
+  /** @type {(focusTrigger?: boolean) => void} */
+  let closeModeMenuNow = () => {};
   document.addEventListener("click", e => {
     closeMoreMenu?.(e);
+    closeModeMenu?.(e);
     if (ui.colorPicker && !isPhone()) {
       const inside = matchUp(e.target, x => hasClass(x, "color-popover") || Boolean(attrOf(x, "data-color-popover")));
       if (!inside) { cancelActiveSampler(); ui.colorPicker = null; chromeDirty = true; }
@@ -1047,6 +1052,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       chromeDirty = true;
       return;
     }
+    if (e.key === "Escape" && ui.modeMenuOpen) {
+      e.preventDefault(); e.stopPropagation?.();
+      closeModeMenuNow(true);
+      return;
+    }
     if (e.key === "Escape" && ui.workspaceMode === "present" && !ui.sheet && !ui.moreOpen && !viewsMenu.isOpen() && !settingsDialog.isOpen() && !versionsDialog?.isOpen() && !isHelpDialogOpen(document)) {
       e.preventDefault(); e.stopPropagation?.();
       setWorkspaceMode("draw");
@@ -1611,7 +1621,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function setWorkspaceMode(mode) {
     if (S.role !== "presenter" || S.effective !== "presenter") return false;
     if (mode !== "draw" && mode !== "animate" && mode !== "present") return false;
-    if (ui.workspaceMode === mode) return true;
+    ui.modeMenuOpen = false;
+    if (ui.workspaceMode === mode) { closeModeMenuNow(); return true; }
     ui.workspaceMode = mode;
     syncWorkspaceModeAttr(mode);
     if (mode === "animate") {
@@ -1805,25 +1816,54 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       title: "Jump to frame or view (⌘J)",
       onclick: e => openViewsMenu(e?.currentTarget ?? null),
     }, icon("frame", { size: 14 }), h("span.views-pill-lab", {}, viewsPillLabel), h("kbd.views-pill-kbd", {}, "⌘J"));
-    const modeSwitcher = role === "presenter"
-      ? h("div.island.mode-switcher", {
-          role: "tablist",
-          "aria-label": "Workspace mode",
-          "data-workspace-mode": ui.workspaceMode,
+    const modeMeta = [
+      ["draw", "Draw", "edit", "Draw mode — sketch and edit shapes"],
+      ["animate", "Animate", "play", "Animate mode — multi-swimlane movie timeline"],
+      ["present", "Present", "fit", "Present mode — distraction-free live walkthrough"],
+    ];
+    const activeModeMeta = modeMeta.find(([id]) => id === ui.workspaceMode) ?? modeMeta[0];
+    let modeSwitcher = null;
+    let modeTrigger = null;
+    const setModeMenu = (open, focusTrigger = false) => {
+      ui.modeMenuOpen = Boolean(open);
+      modeSwitcher?.setAttribute?.("data-mode-menu-open", String(ui.modeMenuOpen));
+      modeTrigger?.setAttribute?.("aria-expanded", String(ui.modeMenuOpen));
+      if (!ui.modeMenuOpen && focusTrigger) modeTrigger?.focus?.();
+    };
+    if (role === "presenter") {
+      modeTrigger = h("button.mode-trigger", {
+        type: "button",
+        "data-mode-trigger": "1",
+        "aria-haspopup": "menu",
+        "aria-expanded": String(!!ui.modeMenuOpen),
+        "aria-label": `Workspace mode: ${activeModeMeta[1]}`,
+        title: `Switch mode (${activeModeMeta[1]})`,
+        onclick: () => setModeMenu(!ui.modeMenuOpen),
+        onkeydown: e => {
+          if (e.key === "Escape" && ui.modeMenuOpen) { e.preventDefault(); setModeMenu(false, true); }
         },
-        [
-          ["draw", "Draw", "edit", "Draw mode — sketch and edit shapes"],
-          ["animate", "Animate", "play", "Animate mode — multi-swimlane movie timeline"],
-          ["present", "Present", "fit", "Present mode — distraction-free live walkthrough"],
-        ].map(([id, label, ic, tip]) => h("button.mode-tab" + (ui.workspaceMode === id ? ".on" : ""), {
+      }, icon(activeModeMeta[2], { size: 13 }), h("span.mode-trigger-lab", {}, activeModeMeta[1]), h("span", { "aria-hidden": "true" }, "▾"));
+      const modeTabsEl = h("div.mode-tabs", {},
+        modeMeta.map(([id, label, ic, tip]) => h("button.mode-tab" + (ui.workspaceMode === id ? ".on" : ""), {
           type: "button",
           role: "tab",
           "aria-selected": String(ui.workspaceMode === id),
           "data-mode": id,
           title: tip,
-          onclick: () => setWorkspaceMode(/** @type {"draw" | "animate" | "present"} */ (id)),
-        }, icon(ic, { size: 13 }), h("span.mode-tab-lab", {}, label))))
-      : null;
+          onclick: () => { setModeMenu(false); setWorkspaceMode(/** @type {"draw" | "animate" | "present"} */ (id)); },
+        }, icon(ic, { size: 13 }), h("span.mode-tab-lab", {}, label))));
+      modeSwitcher = h("div.island.mode-switcher", {
+        role: "tablist",
+        "aria-label": "Workspace mode",
+        "data-workspace-mode": ui.workspaceMode,
+        "data-mode-menu-open": String(!!ui.modeMenuOpen),
+      }, modeTrigger, modeTabsEl);
+      closeModeMenu = e => { if (ui.modeMenuOpen && !modeSwitcher.contains(e.target)) setModeMenu(false); };
+      closeModeMenuNow = (focusTrigger = false) => { if (ui.modeMenuOpen) setModeMenu(false, focusTrigger); };
+    } else {
+      closeModeMenu = null;
+      closeModeMenuNow = () => {};
+    }
     const showToolRail = role !== "presenter" || ui.workspaceMode === "draw";
     const showRibbonTabs = role !== "viewer" && role !== "annotator" && ui.workspaceMode !== "present" && ui.panel.open;
     const ribbonTabs = (() => {
@@ -1942,14 +1982,14 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           "aria-label": "Previous cue or frame",
           title: hasAnimOrCues ? "Previous cue" : "Previous frame",
           onclick: stepPrev,
-        }, icon("chevronLeft", { size: 15 }), " Prev"),
+        }, icon("chevronLeft", { size: 15 }), h("span.present-lab", {}, "Prev")),
         h("button.btn.primary", {
           type: "button",
           "data-present-action": "next",
           "aria-label": hasAnimOrCues ? "Next cue" : "Next frame",
           title: hasAnimOrCues ? "Play to next cue" : "Next frame or view",
           onclick: stepNext,
-        }, hasAnimOrCues ? "Next Cue " : "Next Frame ", icon("chevronRight", { size: 15 })),
+        }, h("span.present-lab-long", {}, hasAnimOrCues ? "Next Cue" : "Next Frame"), h("span.present-lab-short", {}, "Next"), icon("chevronRight", { size: 15 })),
         h("span.sep"),
         h("button.btn.ghost", {
           type: "button",
@@ -1960,7 +2000,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           "aria-label": "Views",
           title: "Jump to frame or view (⌘J)",
           onclick: e => openViewsMenu(e?.currentTarget ?? null),
-        }, icon("frame", { size: 15 }), " Views"),
+        }, icon("frame", { size: 15 }), h("span.present-lab", {}, "Views")),
         h("button.btn.ghost" + (laserOn ? ".on" : ""), {
           type: "button",
           "data-present-action": "laser",
@@ -1968,7 +2008,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           "aria-pressed": String(laserOn),
           title: "Toggle laser pointer",
           onclick: () => { S.setTool(laserOn ? "select" : "laser"); chromeDirty = true; },
-        }, icon("laser", { size: 15 }), " Laser"),
+        }, icon("laser", { size: 15 }), h("span.present-lab", {}, "Laser")),
         h("button.btn.ghost" + (audienceLocked ? ".on" : ""), {
           type: "button",
           "data-present-action": "lock-audience",
@@ -1977,7 +2017,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           disabled: !may,
           title: audienceLocked ? "Unlock audience edits" : "Lock audience edits",
           onclick: toggleAudienceLock,
-        }, icon(audienceLocked ? "lock" : "unlock", { size: 15 }), audienceLocked ? " Locked" : " Lock Audience"),
+        }, icon(audienceLocked ? "lock" : "unlock", { size: 15 }), h("span.present-lab", {}, audienceLocked ? "Locked" : "Lock Audience")),
         h("span.sep"),
         h("button.btn.ghost.present-exit", {
           type: "button",
@@ -1985,7 +2025,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
           "aria-label": "Exit Present",
           title: "Exit Present mode (Esc)",
           onclick: () => setWorkspaceMode("draw"),
-        }, icon("close", { size: 14 }), " Exit Present"));
+        }, icon("close", { size: 14 }), h("span.present-lab", {}, "Exit Present")));
       replace($("#hudBL"), []);
       replace($("#hudBC"), presenterBar);
       replace($("#hudBR"), []);
@@ -2138,7 +2178,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       reducedMotion: reduced,
       expanded,
       compactOnly: isNarrowPhone(),
-      showAuthoring: ui.workspaceMode === "animate",
+      showAuthoring: ui.workspaceMode === "animate" && !isNarrowPhone(),
       canEdit: S.may(),
       act: fn => S.act("board", fn),
       actSettings: fn => S.act("board", fn, { settings: true }),
@@ -2214,7 +2254,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const sheetBtn = (icName, label, id) => btn(icName, label, ui.sheet === id, e => setSheet(ui.sheet === id ? null : id, { opener: e?.currentTarget }), false, label, { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === id) });
     const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) });
     let items;
-    if (role === "presenter") items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
+    if (role === "presenter") {
+      const discussBtn = isNarrowPhone()
+        ? [btn("comments", "Discuss", ui.sheet === "notes" || ui.sheet === "comments", e => setSheet(ui.sheet === "notes" || ui.sheet === "comments" ? null : "notes", { opener: e?.currentTarget }), false, "Notes and comments", { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "notes" || ui.sheet === "comments"), "data-dock-discuss": "1" })]
+        : [sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
+      items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), ...discussBtn];
+    }
     else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
     else items = [btn("chevronLeft", "Prev", false, () => stepBoardFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => stepBoardFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     replace(dockEl, items);

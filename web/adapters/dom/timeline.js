@@ -120,7 +120,7 @@ export function buildTimeline(el, ctx) {
   const actSettings = ctx.actSettings ?? (fn => fn(B));
   const compactOnly = Boolean(ctx.compactOnly);
   const isExpanded = Boolean(ctx.expanded && !compactOnly);
-  const showAuthoring = Boolean(ctx.showAuthoring || isExpanded);
+  const showAuthoring = Boolean((ctx.showAuthoring || isExpanded) && !compactOnly);
   const reduced = ctx.reducedMotion ?? prefersReducedMotion();
   const maxCueAt = cues.length ? cues[cues.length - 1].at : 0;
   const naturalDur = Math.max(Number.isFinite(dur) ? dur : 0, maxCueAt);

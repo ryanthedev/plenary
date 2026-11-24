@@ -8,6 +8,7 @@
 .home-drawer-toggle,
 .home-drawer-backdrop,
 .home-drawer-head,
+.home-drawer-foot,
 .home-mobile-tabs,
 .card-mobile-actions,
 .home-fab {
@@ -178,8 +179,30 @@
   font-weight: 600;
 }
 
-/* ── Breakpoint < 640px for Issue #96 ── */
-@media (max-width: 639px) {
+/* ── Breakpoint <= 640px for Issue #96 (standardized with style.css, home.css, collab.css, app.js) ── */
+@media (max-width: 640px) {
+  /* Mobile Chrome Diet: trim Home header to [☰] [Plenary] + dedicated full-width search row below */
+  .home-page .home-top {
+    flex-wrap: wrap;
+    row-gap: 8px;
+    column-gap: 8px;
+  }
+
+  .home-page .home-top .home-org-badge,
+  .home-page .home-top .home-help-btn,
+  .home-page .home-top .theme-toggle,
+  .home-page .home-top .home-logout,
+  .home-page .home-top .spacer {
+    display: none;
+  }
+
+  .home-page .home-top .home-searchbox {
+    order: 10;
+    flex: 1 0 100%;
+    max-width: 100%;
+    width: 100%;
+  }
+
   .home-page .home-drawer-toggle {
     display: inline-flex;
     align-items: center;
@@ -207,12 +230,17 @@
     width: min(300px, 84vw);
     max-width: 300px;
     z-index: 1100;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
     background: var(--surface, #fff);
     border-right: 1px solid var(--border, #e5e7eb);
+    border-bottom: 0;
     padding: calc(12px + env(safe-area-inset-top)) 12px calc(16px + env(safe-area-inset-bottom));
     transform: translateX(-105%);
     transition: transform 0.2s ease;
     overflow-y: auto;
+    overflow-x: hidden;
     box-shadow: var(--shadow-lg, 4px 0 24px rgba(0, 0, 0, 0.16));
   }
 
@@ -220,18 +248,96 @@
     transform: translateX(0);
   }
 
+  /* Override home.css <=720px horizontal-row rules inside the vertical mobile drawer */
+  .home-page .home-nav-group,
+  .home-page .home-side .tree,
+  .home-page .home-side .tree .grp,
+  .home-page .home-admin-list {
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    overflow-x: visible;
+    width: 100%;
+    gap: 4px;
+  }
+
+  .home-page .home-side .nav,
+  .home-page .home-side .nav.sub {
+    width: 100%;
+    flex: 0 0 auto;
+    min-height: 44px;
+    padding: 8px 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: transparent;
+    border: 1px solid transparent;
+  }
+
+  .home-page .home-side .nav.sub {
+    padding-left: 18px;
+  }
+
+  .home-page .home-side h4 {
+    margin: 10px 10px 3px;
+    width: auto;
+  }
+
   .home-page .home-drawer-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     padding-bottom: 10px;
     margin-bottom: 10px;
     border-bottom: 1px solid var(--border, #e5e7eb);
   }
 
+  .home-page .home-drawer-org {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .home-page .home-drawer-org strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .home-page .home-drawer-org .home-drawer-org-pill {
+    display: inline-flex;
+    align-items: center;
+    align-self: flex-start;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--surface-subtle);
+    border: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-size: 11px;
+    font-weight: 600;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .home-page .home-drawer-close {
     min-width: 44px;
     min-height: 44px;
+    flex-shrink: 0;
+  }
+
+  .home-page .home-drawer-foot {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--border, #e5e7eb);
   }
 
   .home-page .home-mobile-tabs {
@@ -284,6 +390,20 @@
     min-height: 44px;
   }
 
+  .home-page .card .card-mobile-actions {
+    position: absolute;
+    top: 8px;
+    right: 58px;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(6px);
+    color: var(--fg-muted);
+  }
+
   .home-page .card .card-menu {
     display: none;
   }
@@ -334,6 +454,10 @@
   }
 
   /* CSS fallback: collapse any wide table.matrix into single-column cards */
+  table.matrix {
+    min-width: 0;
+  }
+
   table.matrix,
   table.matrix tbody,
   table.matrix tr,

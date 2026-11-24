@@ -131,6 +131,11 @@ describe("Issue #96 — Mobile Home, Share, Move & Admin/RBAC cards", () => {
       toggle.click();
       expect(side.getAttribute("data-drawer-open")).toBe("true");
       expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      expect(firstOf(side, e => e.getAttribute("data-drawer-org-badge") === "true")).not.toBeNull();
+      const drawerFoot = firstOf(side, e => e.getAttribute("data-drawer-footer") === "true");
+      expect(drawerFoot).not.toBeNull();
+      expect(firstOf(drawerFoot, e => e.getAttribute("data-drawer-action") === "help")).not.toBeNull();
+      expect(firstOf(drawerFoot, e => e.getAttribute("data-drawer-action") === "theme")).not.toBeNull();
 
       document.fire("keydown", { key: "Escape" });
       expect(side.getAttribute("data-drawer-open")).toBe("false");
@@ -659,13 +664,19 @@ describe("Issue #97 — Unified Meeting Bar & Epic #79 Mobile Experiences", () =
     bar.destroy();
   });
 
-  test("CSS contract: 48px poll buttons, 44x44px Q&A upvote & star targets, 639px breakpoint, 16px inputs", () => {
+  test("CSS contract: 48px poll buttons, 44x44px Q&A upvote & star targets, 640px breakpoint, 16px inputs", () => {
     const css = readFileSync(CSS_PATH, "utf8");
-    expect(css).toContain("@media (max-width: 639px)");
+    expect(css).toContain("@media (max-width: 640px)");
     expect(css).toMatch(/\.poll-option-btn\s*\{[^}]*min-height:\s*48px/s);
     expect(css).toMatch(/\.qa-upvote-btn\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/s);
     expect(css).toMatch(/\.home-page \.card \.star,\s*\.home-page \.card \.card-mobile-actions\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/s);
     expect(css).toMatch(/\.mobile-touch-row\s*\{[^}]*min-height:\s*44px/s);
     expect(css).toMatch(/\.qa-compose-input\s*\{[^}]*font-size:\s*16px/s);
+    // Phase 1 Mobile Chrome Diet & Drawer Vertical Column Contract
+    expect(css).toMatch(/\.home-page \.home-top \.home-searchbox\s*\{[^}]*flex:\s*1 0 100%/s);
+    expect(css).toMatch(/\.home-page \.home-nav-group,[\s\S]*?\.home-page \.home-admin-list\s*\{[^}]*flex-direction:\s*column[^}]*align-items:\s*stretch[^}]*overflow-x:\s*visible/s);
+    expect(css).toMatch(/\.home-page \.home-side \.nav,\s*\.home-page \.home-side \.nav\.sub\s*\{[^}]*width:\s*100%[^}]*min-height:\s*44px/s);
+    expect(css).toMatch(/table\.matrix\s*\{[^}]*min-width:\s*0/s);
+    expect(css).toMatch(/\.home-page \.card \.card-mobile-actions\s*\{[^}]*position:\s*absolute/s);
   });
 });

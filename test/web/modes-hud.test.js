@@ -133,18 +133,34 @@ describe("Wave 13B: 3-Mode Canvas HUD (Draw · Animate · Present)", () => {
     expect(findAll(page.byId.timeline, e => e.classList?.contains?.("tl-lane-row")).length).toBe(1);
     expect(find(page.byId.panel, e => e.attrs?.["data-sec"] === "animate")).toBeDefined();
 
-    // Phone (<= 640px) stays collapsed single-bar even in Animate mode
+    // Phone (< 640px): compact mode trigger opens popover, Animate stays playback/step-only (no authoring buttons)
     const mobile = setup({ narrowPhone: true });
     drawRect(mobile.S, 60, 60);
     mobile.step(2);
     mobile.S.act("board", e => e.animate("fade"));
     mobile.step(10);
+    const modeTrigger = find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs?.["data-mode-trigger"] === "1");
+    expect(modeTrigger).toBeDefined();
+    expect(modeTrigger.attrs["aria-expanded"]).toBe("false");
+    modeTrigger.click();
+    expect(modeTrigger.attrs["aria-expanded"]).toBe("true");
     find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs?.["data-mode"] === "animate").click();
     mobile.step(20);
     expect(mobile.app.ui.workspaceMode).toBe("animate");
     expect(page.byId.timeline.hidden).toBe(false);
     expect(page.byId.timeline.attrs["data-expanded"]).toBe("false");
     expect(find(page.byId.timeline, e => e.attrs?.["data-nle"] === "1")).toBeUndefined();
+    expect(find(page.byId.timeline, e => e.classList?.contains?.("tl-authoring"))).toBeUndefined();
+    expect(find(page.byId.timeline, e => e.attrs?.["data-action"] === "add-animate")).toBeUndefined();
+    expect(find(page.byId.timeline, e => e.attrs?.["data-action"] === "add-cue")).toBeUndefined();
+    expect(find(page.byId.timeline, e => e.attrs?.["data-action"] === "cascade")).toBeUndefined();
+    expect(find(page.byId.timeline, e => e.attrs?.["data-action"] === "align")).toBeUndefined();
+    // Present mode on narrow phone has single-row compact Next label & all controls
+    find(page.byId.topbar, e => e.tagName === "BUTTON" && e.attrs?.["data-mode"] === "present").click();
+    mobile.step(20);
+    const mobileBar = find(page.byId.hudBC, e => e.attrs?.["data-presenter-bar"] === "1");
+    expect(mobileBar).toBeDefined();
+    expect(find(mobileBar, e => e.classList?.contains?.("present-lab-short"))?.textContent).toBe("Next");
   });
 
   test("Present mode hides dock/panel/timeline, shows Presenter Bar with Next Cue / Laser / Lock Audience / Views, and Escape exits back to Draw", () => {

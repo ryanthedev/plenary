@@ -623,17 +623,46 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       h("summary.home-admin-summary", {}, "Workspace Admin"),
       h("div.home-admin-list", {}, adminLinks))
       : null;
+    const orgName = !d.guest && d.unit ? (d.unit.name || "Your workspace") : "";
     const drawerHead = drawerOpen
       ? h("div.home-drawer-head", {},
-        h("strong", {}, d.unit?.name || "Navigation"),
+        h("div.home-drawer-org", {},
+          h("strong", {}, orgName || "Navigation"),
+          orgName ? h("span.home-drawer-org-pill", { "data-drawer-org-badge": "true" }, d.unit?.personal ? "Personal workspace" : "Organization") : null),
         h("button.btn.ghost.home-drawer-close", { type: "button", "aria-label": "Close navigation", onclick: () => setDrawer(false, true) }, "✕"))
+      : null;
+    const isDarkTheme = themeToggle.el.getAttribute?.("aria-pressed") === "true";
+    const drawerFoot = drawerOpen
+      ? h("div.home-drawer-foot", { "data-drawer-footer": "true" },
+        h("button.nav", {
+          type: "button",
+          "data-drawer-action": "help",
+          "aria-label": "Help & shortcuts",
+          onclick: e => openHelp(e?.currentTarget ?? drawerToggle),
+        }, icon("help", { size: 16 }), "Help & shortcuts"),
+        h("button.nav", {
+          type: "button",
+          "data-drawer-action": "theme",
+          "aria-label": isDarkTheme ? "Switch to light mode" : "Switch to dark mode",
+          "aria-pressed": String(isDarkTheme),
+          onclick: () => { themeToggle.el.click?.(); renderSide(); },
+        }, icon(isDarkTheme ? "sun" : "moon", { size: 16 }), isDarkTheme ? "Light mode" : "Dark mode"),
+        onLogout && S.status !== "signed-out"
+          ? h("button.nav", {
+            type: "button",
+            "data-drawer-action": "logout",
+            "aria-label": "Sign out",
+            onclick: () => { setDrawer(false, false); onLogout(); },
+          }, icon("logout", { size: 16 }), "Sign out")
+          : null)
       : null;
     replace(side,
       drawerHead,
       d.guest ? null : newBoard(),
       h("div.home-nav-group", {}, navBtn("home", "Home"), d.guest ? null : navBtn("starred", "Starred", d.starred.length), navBtn("shared", "Shared with me", d.shared.length), dailyLinks),
       spacesSec,
-      adminSec);
+      adminSec,
+      drawerFoot);
   }
 
   function renderMobileChrome() {

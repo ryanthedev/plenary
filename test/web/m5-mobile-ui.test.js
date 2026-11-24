@@ -204,6 +204,33 @@ test("HTML & CSS static rules: viewport-fit=cover, 100dvh/--vv-height, safe-area
   const collabCoarse = collabCss.match(/@media\s*\(pointer:\s*coarse\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
   expect(collabCoarse).toMatch(/\.collab-pop\s+textarea\.field[^}]*font-size:\s*16px/);
   expect(collabCoarse).toMatch(/\.collab-emotes\s+\.tb[^}]*min-width:\s*44px;\s*min-height:\s*44px/);
+
+  // Phase 1 Unified --canvas-bottom Layout Contract & Breakpoint Standardization (all phone CSS unified on max-width: 640px)
+  const homeCss = await Bun.file(new URL("../../web/home.css", import.meta.url)).text();
+  const mp2Css = await Bun.file(new URL("../../web/styles/mobile-phase2.css", import.meta.url)).text();
+  const mp34Css = await Bun.file(new URL("../../web/styles/mobile-phase3-4.css", import.meta.url)).text();
+  expect(css).toContain("--safe-top:");
+  expect(css).toContain("--safe-bottom:");
+  expect(css).toContain("--dock-h:");
+  expect(css).toContain("--hud-gap:");
+  expect(css).toContain("--canvas-bottom:");
+  expect(css).toMatch(/body\[data-workspace-mode="animate"\]\s*\{[^}]*--canvas-bottom:\s*var\(--hud-gap\)/s);
+  expect(css).toMatch(/body\[data-workspace-mode="present"\]\s*\{[^}]*--canvas-bottom:\s*calc\(12px \+ var\(--safe-bottom\)\)/s);
+  expect(css).toMatch(/body\[data-workspace-mode="present"\]\s*\.hud-bc\s*\{\s*display:\s*flex\s*!important;\s*\}/);
+  expect(css).toContain("var(--canvas-bottom");
+  expect(collabCss).toContain("var(--canvas-bottom");
+  expect(mp2Css).toContain("var(--canvas-bottom");
+  expect(css).not.toContain("@media (max-width: 639px)");
+  expect(homeCss).not.toContain("@media (max-width: 639px)");
+  expect(collabCss).not.toContain("@media (max-width: 639px)");
+  expect(mp34Css).not.toContain("@media (max-width: 639px)");
+  expect(mp34Css).toContain("@media (max-width: 640px)");
+  // Editor topbar Chrome Diet on <640px + coarse pointer targets on timeline & clickable pill
+  expect(css).toContain(".topbar .pill.connected { display: none; }");
+  expect(css).toContain(".topbar .collab-avatars, .topbar .avatars { display: none; }");
+  expect(css).toContain("body .topbar .phone-only.paste-btn { display: none !important; }");
+  expect(coarseBlock).toContain(".timeline .c");
+  expect(coarseBlock).toContain('.pill[role="button"]');
 });
 
 test("WebKit gesturestart, gesturechange, and gestureend call preventDefault() on board and canvas container", () => {
@@ -229,10 +256,10 @@ test("bottom sheet swipe-down-to-dismiss: past threshold & fast flick dismiss; s
   const { byId, app, net, step } = setupMobile({ token: "t-ada", phone: true, collab: true });
   const sheetEl = byId.sheet;
 
-  // Open Notes sheet via dock button
-  const notesBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Notes"));
-  expect(notesBtn).toBeTruthy();
-  notesBtn.click();
+  // Open Notes/Comments sheet via combined Discuss dock button on narrow phone
+  const discussBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Discuss"));
+  expect(discussBtn).toBeTruthy();
+  discussBtn.click();
   step(2);
   expect(app.ui.sheet).toBe("notes");
   expect(sheetEl.hidden).toBe(false);
@@ -270,8 +297,11 @@ test("bottom sheet swipe-down-to-dismiss: past threshold & fast flick dismiss; s
   expect(sheetEl.hidden).toBe(true);
 
   // 3) Fast downward flick (40px in 30ms -> 1.33 px/ms > 0.55) on Comments sheet -> dismisses
-  const commentsBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Comments"));
-  commentsBtn.click();
+  discussBtn.click();
+  step(2);
+  const commentsTab = find(sheetEl, e => e.tagName === "BUTTON" && e.textContent.includes("Comments"));
+  expect(commentsTab).toBeTruthy();
+  commentsTab.click();
   step(2);
   expect(app.ui.sheet).toBe("comments");
   handle = getHandle();
@@ -284,7 +314,7 @@ test("bottom sheet swipe-down-to-dismiss: past threshold & fast flick dismiss; s
   expect(sheetEl.hidden).toBe(true);
 
   // 4) pointercancel mid-drag snaps back cleanly without dismissing
-  notesBtn.click();
+  discussBtn.click();
   step(2);
   handle = getHandle();
   handle.fire("pointerdown", { pointerId: 4, clientY: 400 });
@@ -306,10 +336,10 @@ test("mobile layout invariants (<= 640px) for presenter, annotator, and viewer",
     const overflow = find(byId.topbar, e => e.className.includes("overflow-btn") && e.className.includes("phone-only"));
     expect(overflow).toBeTruthy();
     const dockLabels = findAll(byId.dock, e => e.tagName === "BUTTON").map(b => b.textContent);
+    expect(dockLabels.length).toBeLessThanOrEqual(7);
     expect(dockLabels.some(t => t.includes("Select"))).toBe(true);
     expect(dockLabels.some(t => t.includes("More"))).toBe(true);
-    expect(dockLabels.some(t => t.includes("Notes"))).toBe(true);
-    expect(dockLabels.some(t => t.includes("Comments"))).toBe(true);
+    expect(dockLabels.some(t => t.includes("Discuss"))).toBe(true);
     overflow.click();
     step(2);
     expect(app.ui.sheet).toBe("tools");

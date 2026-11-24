@@ -6,13 +6,13 @@
 
 import { describe, test, expect, beforeAll, beforeEach, afterEach } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, statSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { httpRoutes, LOGIN_COOKIE, EXCHANGE_COOKIE, CLI_TOKEN_TTL_SEC } from "../../server/adapters/driving/auth-http.js";
 import { googleOidc } from "../../server/adapters/driven/auth/oidc.js";
-import { sessions as makeSessions } from "../../server/adapters/driven/auth/session.js";
+import { sessions as makeSessions, MAX_TTL_SEC } from "../../server/adapters/driven/auth/session.js";
 import { memoryRegistry } from "../../server/adapters/driven/auth/registry.js";
 import { tenancy as makeTenancy } from "../../server/core/auth/tenancy.js";
 import { fakeIdp, CLIENT_ID } from "./fake-idp.js";
@@ -23,7 +23,7 @@ import {
   removeServerCredentials,
   resolveCredentials,
 } from "../../scripts/plenary-client.js";
-import { runCli } from "../../scripts/plenary-cli.js";
+import { runCli, runLoginFlow } from "../../scripts/plenary-cli.js";
 import { createMcpHandler } from "../../scripts/plenary-mcp.js";
 
 const ORIGIN = "https://app.plenary.test";
@@ -133,6 +133,7 @@ describe("Server PKCE loopback CLI login", () => {
       `cli_port=80&cli_state=${pkce.state}&cli_challenge=${pkce.challenge}`,
       `cli_port=1023&cli_state=${pkce.state}&cli_challenge=${pkce.challenge}`,
       `cli_port=65536&cli_state=${pkce.state}&cli_challenge=${pkce.challenge}`,
+      `cli_port=04321&cli_state=${pkce.state}&cli_challenge=${pkce.challenge}`,
       `cli_port=abc&cli_state=${pkce.state}&cli_challenge=${pkce.challenge}`,
       `cli_port=1234.5&cli_state=${pkce.state}&cli_challenge=${pkce.challenge}`,
       // Invalid state
@@ -225,6 +226,8 @@ describe("Server PKCE loopback CLI login", () => {
     expect(chooser.status).toBe(200);
     expect(chooser.headers.get("content-type")).toContain("text/html");
     expect(chooser.headers.get("cache-control")).toBe("no-store");
+    expect(chooser.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    expect(chooser.headers.get("content-security-policy")).toContain("base-uri 'none'");
     const html = await chooser.text();
     expect(html).toContain("Sign in to Plenary CLI");
     expect(html).toContain("Continue with Google");
@@ -248,6 +251,53 @@ describe("Server PKCE loopback CLI login", () => {
     }));
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ error: "sign-in-unavailable" });
+  });
+
+  test("sessions.issue rejects invalid, unbounded, or non-integer ttlSec / ttlMs (validates both when both given)", async () => {
+    const id = { user: "google:1001", name: "Ann", email: "ann@acme.com", domain: "acme.com" };
+    for (const bad of [
+      { ttlSec: 0 },
+      { ttlSec: -10 },
+      { ttlSec: 1.5 },
+      { ttlSec: MAX_TTL_SEC + 1 },
+      { ttlSec: Number.POSITIVE_INFINITY },
+      { ttlMs: 0 },
+      { ttlMs: -1 },
+      { ttlMs: 1.5 },
+      { ttlMs: MAX_TTL_SEC * 1000 + 1 },
+      { ttlSec: 60, ttlMs: MAX_TTL_SEC * 1000 + 1 }, // validates ttlMs even when ttlSec is valid
+    ]) {
+      await expect(sessions.issue(id, bad)).rejects.toThrow();
+    }
+    const okTok = await sessions.issue(id, { ttlSec: 3600, ttlMs: 3600_000 });
+    expect((await sessions.verify(okTok))?.user).toBe("google:1001");
+  });
+
+  test("cliCodes maxLoginStates cap fails closed with 503 unavailable", async () => {
+    const capped = httpRoutes({
+      registry,
+      sessions,
+      oidc,
+      tenancy,
+      now,
+      config: { ...config, maxLoginStates: 1 },
+    });
+    // First CLI login fills the single cliCodes slot.
+    await completeCliOidc(ADMIN, { via: capped });
+    // Second CLI login hits the cap on callback -> 503 unavailable.
+    const pkce2 = makePkce();
+    const q = new URLSearchParams({ cli_port: "43211", cli_state: pkce2.state, cli_challenge: pkce2.challenge });
+    const start = await capped(new Request(`${ORIGIN}/auth/login?${q}`));
+    expect(start.status).toBe(302);
+    const idpLoc = new URL(start.headers.get("location"));
+    const gCode = "g-" + randomBytes(8).toString("hex");
+    idp.codes.set(gCode, await idp.mint({ ...ADMIN, nonce: idpLoc.searchParams.get("nonce") }));
+    const cbQ = new URLSearchParams({ code: gCode, state: idpLoc.searchParams.get("state") });
+    const cb = await capped(new Request(`${ORIGIN}/auth/callback?${cbQ}`, {
+      headers: { cookie: cookieOf(start, LOGIN_COOKIE) ?? "" },
+    }));
+    expect(cb.status).toBe(503);
+    expect(await cb.json()).toEqual({ error: "unavailable" });
   });
 });
 
@@ -293,20 +343,21 @@ describe("Credentials store, CLI login/whoami/logout, and MCP auto-loading", () 
 
   test("resolveCredentials precedence: explicit/env token > credentials.json > none", () => {
     const env = { PLENARY_CREDENTIALS_PATH: credPath };
+    const futureExp = Date.now() + 86_400_000;
     expect(resolveCredentials({ env })).toEqual({
-      url: null, token: null, source: "none", user: null, expiresAt: null,
+      url: null, token: null, source: "none", user: null, expiresAt: null, expired: false,
     });
 
     saveServerCredentials({
       url: "https://p5y.omni.ooo",
       token: "s1.saved.one",
-      expiresAt: 1900000000000,
+      expiresAt: futureExp,
       user: { id: "google:1", name: "Ann", email: "ann@acme.com" },
     }, { env });
     saveServerCredentials({
       url: "https://staging.omni.ooo",
       token: "s1.saved.two",
-      expiresAt: 1900000000001,
+      expiresAt: futureExp + 1,
       user: { id: "google:2", name: "Bo", email: "bo@acme.com" },
       setDefault: false,
     }, { env });
@@ -317,7 +368,8 @@ describe("Credentials store, CLI login/whoami/logout, and MCP auto-loading", () 
       token: "s1.saved.one",
       source: "credentials",
       user: { id: "google:1", name: "Ann", email: "ann@acme.com" },
-      expiresAt: 1900000000000,
+      expiresAt: futureExp,
+      expired: false,
     });
 
     // PLENARY_URL selects matching server entry.
@@ -326,7 +378,8 @@ describe("Credentials store, CLI login/whoami/logout, and MCP auto-loading", () 
       token: "s1.saved.two",
       source: "credentials",
       user: { id: "google:2", name: "Bo", email: "bo@acme.com" },
-      expiresAt: 1900000000001,
+      expiresAt: futureExp + 1,
+      expired: false,
     });
 
     // PLENARY_TOKEN overrides credentials.json.
@@ -336,6 +389,7 @@ describe("Credentials store, CLI login/whoami/logout, and MCP auto-loading", () 
       source: "env",
       user: null,
       expiresAt: null,
+      expired: false,
     });
 
     // Explicit --token overrides both.
@@ -345,7 +399,121 @@ describe("Credentials store, CLI login/whoami/logout, and MCP auto-loading", () 
       source: "env",
       user: null,
       expiresAt: null,
+      expired: false,
     });
+  });
+
+  test("corrupt defaultUrl in credentials.json is sanitized to null without crashing", () => {
+    const env = { PLENARY_CREDENTIALS_PATH: credPath };
+    mkdirSync(join(dir, "plenary"), { recursive: true });
+    writeFileSync(credPath, JSON.stringify({ defaultUrl: "ftp://bad-proto.example", servers: {} }), "utf8");
+    expect(readCredentials({ env })).toEqual({ defaultUrl: null, servers: {} });
+    expect(resolveCredentials({ env })).toEqual({
+      url: null, token: null, source: "none", user: null, expiresAt: null, expired: false,
+    });
+  });
+
+  test("expired and missing credentials surface actionable PlenaryError in CLI and MCP", async () => {
+    const env = { PLENARY_CREDENTIALS_PATH: credPath };
+    // Missing credentials: CLI returns exit 1 with actionable message, MCP returns isError with same message.
+    const errs = [];
+    const missingCode = await runCli(["list-boards"], env, { out: () => {}, err: s => errs.push(s) });
+    expect(missingCode).toBe(1);
+    expect(errs[0]).toContain("Not authenticated — run 'plenary login'");
+
+    const mcp = createMcpHandler({ env });
+    const mcpMissing = await mcp({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_boards", arguments: {} } });
+    expect(mcpMissing.result.isError).toBe(true);
+    expect(JSON.parse(mcpMissing.result.content[0].text).error).toContain("Not authenticated — run 'plenary login'");
+
+    // Expired credentials: resolveCredentials marks expired: true, token: null.
+    saveServerCredentials({
+      url: "https://p5y.omni.ooo",
+      token: "s1.expired.tok",
+      expiresAt: Date.now() - 1000,
+      user: { id: "google:1", name: "Ann", email: "ann@acme.com" },
+    }, { env });
+    const resolved = resolveCredentials({ env });
+    expect(resolved.expired).toBe(true);
+    expect(resolved.token).toBeNull();
+
+    errs.length = 0;
+    const expiredCode = await runCli(["list-boards"], env, { out: () => {}, err: s => errs.push(s) });
+    expect(expiredCode).toBe(1);
+    expect(errs[0]).toContain("Credentials expired — run 'plenary login' to re-authenticate.");
+
+    const mcpExpired = await mcp({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_boards", arguments: {} } });
+    expect(mcpExpired.result.isError).toBe(true);
+    expect(JSON.parse(mcpExpired.result.content[0].text).error).toContain("Credentials expired — run 'plenary login' to re-authenticate.");
+  });
+
+  test("runLoginFlow hardening: 405 non-GET, 404 no-store, wrong state ignores ?error=, XSS-escaped error page + CSP", async () => {
+    const mockServer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(req) {
+        if (new URL(req.url).pathname === "/auth/cli-exchange") {
+          return new Response(JSON.stringify({ error: "<script>alert(1)</script>" }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    const baseUrl = `http://127.0.0.1:${mockServer.port}`;
+    try {
+      const env = { PLENARY_CREDENTIALS_PATH: credPath };
+      let resolveUrl;
+      const urlReady = new Promise(r => { resolveUrl = r; });
+      const flowResult = runLoginFlow({
+        url: baseUrl,
+        noOpen: true,
+        env,
+        timeoutMs: 5000,
+        err: s => {
+          const m = s.match(/https?:\/\/[^\s]+/);
+          if (m) resolveUrl(m[0]);
+        },
+      }).then(
+        v => ({ ok: true, value: v }),
+        e => ({ ok: false, error: e }),
+      );
+
+      const loginUrl = new URL(await urlReady);
+      const cliPort = loginUrl.searchParams.get("cli_port");
+      const cliState = loginUrl.searchParams.get("cli_state");
+      const loopbackBase = `http://127.0.0.1:${cliPort}`;
+
+      // Non-GET -> 405 with cache-control: no-store.
+      const postRes = await fetch(`${loopbackBase}/callback`, { method: "POST" });
+      expect(postRes.status).toBe(405);
+      expect(postRes.headers.get("cache-control")).toBe("no-store");
+
+      // Unknown path -> 404 with cache-control: no-store.
+      const notFound = await fetch(`${loopbackBase}/other`);
+      expect(notFound.status).toBe(404);
+      expect(notFound.headers.get("cache-control")).toBe("no-store");
+
+      // Wrong state with ?error=access_denied returns 400 and does NOT abort the login flow.
+      const badStateErr = await fetch(`${loopbackBase}/callback?error=access_denied&state=wrong-state`);
+      expect(badStateErr.status).toBe(400);
+
+      // Real state triggers exchange -> server returns XSS payload in error -> escaped HTML + strict CSP + no-referrer.
+      const xssRes = await fetch(`${loopbackBase}/callback?code=${"a".repeat(43)}&state=${encodeURIComponent(cliState)}`);
+      expect(xssRes.status).toBe(400);
+      expect(xssRes.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      expect(xssRes.headers.get("referrer-policy")).toBe("no-referrer");
+      const html = await xssRes.text();
+      expect(html).not.toContain("<script>");
+      expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+
+      const settled = await flowResult;
+      expect(settled.ok).toBe(false);
+      expect(settled.error?.message).toMatch(/CLI token exchange failed/);
+    } finally {
+      mockServer.stop(true);
+    }
   });
 
   test("CLI whoami redacts token and logout removes one or all servers", async () => {

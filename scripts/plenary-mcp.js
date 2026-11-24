@@ -599,6 +599,12 @@ export function createMcpHandler({ env = process.env, clientFactory } = {}) {
   const getClient = () => {
     if (clientFactory) return clientFactory();
     const creds = resolveCredentials({ env });
+    if (creds.expired) {
+      throw new PlenaryError("Credentials expired — run 'plenary login' to re-authenticate.", { code: "auth-expired" });
+    }
+    if (!creds.token) {
+      throw new PlenaryError("Not authenticated — run 'plenary login' (or set PLENARY_URL and PLENARY_TOKEN).", { code: "config-error" });
+    }
     return createPlenaryClient({
       url: creds.url ?? undefined,
       token: creds.token ?? undefined,

@@ -404,7 +404,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
     const rawPort = url.searchParams.get("cli_port") ?? "";
     const cliState = url.searchParams.get("cli_state") ?? "";
     const cliChallenge = url.searchParams.get("cli_challenge") ?? "";
-    if (!/^\d+$/.test(rawPort)) throw refuse(400, "bad-request");
+    if (!/^[1-9]\d{3,4}$/.test(rawPort)) throw refuse(400, "bad-request");
     const cliPort = Number(rawPort);
     if (!Number.isInteger(cliPort) || cliPort < 1024 || cliPort > 65535) throw refuse(400, "bad-request");
     if (!CLI_STATE_RE.test(cliState) || !CLI_CHALLENGE_RE.test(cliChallenge)) throw refuse(400, "bad-request");
@@ -455,7 +455,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
         ...NO_STORE,
         "referrer-policy": "no-referrer",
         "x-frame-options": "DENY",
-        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
       },
     });
   }

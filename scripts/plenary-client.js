@@ -2,7 +2,8 @@
 // Shared Plenary HTTP Admin API + Protocol v1.1 WebSocket client for AI agents (CLI & MCP).
 // Zero extra dependencies: only Bun/Node built-ins and workspace packages.
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Replica } from "../packages/protocol/replica.js";
@@ -1980,9 +1981,10 @@ export function readCredentials({ env = process.env, credPath } = {}) {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { defaultUrl: null, servers: {} };
     }
-    const defaultUrl = typeof parsed.defaultUrl === "string" && parsed.defaultUrl.trim()
-      ? parsed.defaultUrl.trim()
-      : null;
+    let defaultUrl = null;
+    if (typeof parsed.defaultUrl === "string" && parsed.defaultUrl.trim()) {
+      try { defaultUrl = normalizeBaseUrl(parsed.defaultUrl); } catch { defaultUrl = null; }
+    }
     const servers = parsed.servers && typeof parsed.servers === "object" && !Array.isArray(parsed.servers)
       ? parsed.servers
       : {};
@@ -2003,16 +2005,21 @@ export function writeCredentials(creds, { env = process.env, credPath } = {}) {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch { /* best-effort on non-POSIX filesystems */ }
-  const tmp = `${path}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
   const body = JSON.stringify({
     defaultUrl: creds.defaultUrl ?? null,
     servers: creds.servers ?? {},
   }, null, 2) + "\n";
-  writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
-  try { chmodSync(tmp, 0o600); } catch { /* best-effort */ }
-  renameSync(tmp, path);
-  try { chmodSync(path, 0o600); } catch { /* best-effort */ }
-  return path;
+  try {
+    writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    try { chmodSync(tmp, 0o600); } catch { /* best-effort */ }
+    renameSync(tmp, path);
+    try { chmodSync(path, 0o600); } catch { /* best-effort */ }
+    return path;
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
+    throw e;
+  }
 }
 
 /**
@@ -2071,15 +2078,16 @@ export function removeServerCredentials({ url = null, all = false } = {}, { env 
 }
 
 /**
- * Resolve `{ url, token, source, user, expiresAt }` using precedence:
+ * Resolve `{ url, token, source, user, expiresAt, expired }` using precedence:
  *   1. Explicit `token` or `env.PLENARY_TOKEN` wins (source: `"env"`).
  *   2. Otherwise reads `credentials.json`: resolves `url` from explicit `url` -> `env.PLENARY_URL` -> `creds.defaultUrl`,
- *      and `token` from `creds.servers[normalizedUrl]` (source: `"credentials"`).
- *   3. Otherwise returns `token: null, source: "none"`.
- * @param {{ url?: string | null, token?: string | null, env?: Record<string, string | undefined>, credPath?: string }} [opts]
- * @returns {{ url: string | null, token: string | null, source: "env" | "credentials" | "none", user: { id: string, name: string | null, email: string | null } | null, expiresAt: number | null }}
+ *      and `token` from `creds.servers[normalizedUrl]` (source: `"credentials"`). If `expiresAt <= now()`, returns
+ *      `token: null, expired: true`.
+ *   3. Otherwise returns `token: null, source: "none", expired: false`.
+ * @param {{ url?: string | null, token?: string | null, env?: Record<string, string | undefined>, credPath?: string, now?: () => number }} [opts]
+ * @returns {{ url: string | null, token: string | null, source: "env" | "credentials" | "none", user: { id: string, name: string | null, email: string | null } | null, expiresAt: number | null, expired: boolean }}
  */
-export function resolveCredentials({ url = null, token = null, env = process.env, credPath } = {}) {
+export function resolveCredentials({ url = null, token = null, env = process.env, credPath, now = Date.now } = {}) {
   const explicitToken = typeof token === "string" && token.trim() ? token.trim() : null;
   const envToken = typeof env?.PLENARY_TOKEN === "string" && env.PLENARY_TOKEN.trim() ? env.PLENARY_TOKEN.trim() : null;
   const creds = readCredentials({ env, credPath });
@@ -2100,15 +2108,28 @@ export function resolveCredentials({ url = null, token = null, env = process.env
       source: "env",
       user: null,
       expiresAt: null,
+      expired: false,
     };
   }
   if (saved && typeof saved.token === "string" && saved.token.trim()) {
+    const expiresAt = typeof saved.expiresAt === "number" && Number.isFinite(saved.expiresAt) ? saved.expiresAt : null;
+    if (expiresAt !== null && expiresAt <= now()) {
+      return {
+        url: normalizedUrl,
+        token: null,
+        source: "credentials",
+        user: saved.user ?? null,
+        expiresAt,
+        expired: true,
+      };
+    }
     return {
       url: normalizedUrl,
       token: saved.token.trim(),
       source: "credentials",
       user: saved.user ?? null,
-      expiresAt: typeof saved.expiresAt === "number" ? saved.expiresAt : null,
+      expiresAt,
+      expired: false,
     };
   }
   return {
@@ -2117,5 +2138,6 @@ export function resolveCredentials({ url = null, token = null, env = process.env
     source: "none",
     user: null,
     expiresAt: null,
+    expired: false,
   };
 }

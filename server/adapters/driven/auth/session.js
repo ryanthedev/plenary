@@ -13,6 +13,9 @@ import { b64url, unb64url, utf8, fromUtf8 } from "../../../core/auth/util.js";
 /** @typedef {import("../../../ports/idp.js").Identity} Identity */
 /** @typedef {import("../../../ports/idp.js").Session} Session */
 
+/** Maximum allowed per-token TTL override (1 year). */
+export const MAX_TTL_SEC = 365 * 24 * 60 * 60;
+
 /** @param {{ key: Uint8Array|string, ttlSec?: number, snapshotTtlSec?: number, blobTtlSec?: number, now?: () => number }} config */
 export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, blobTtlSec = 300, now = Date.now }) {
   const raw = typeof key === "string" ? utf8(key) : key;
@@ -29,11 +32,16 @@ export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, 
       const iat = Math.floor(now() / 1000);
       let ttl = ttlSec;
       if (opts?.ttlSec !== undefined) {
-        if (!Number.isInteger(opts.ttlSec) || opts.ttlSec <= 0) throw new Error("session: ttlSec must be a positive integer");
+        if (!Number.isSafeInteger(opts.ttlSec) || opts.ttlSec <= 0 || opts.ttlSec > MAX_TTL_SEC) {
+          throw new Error(`session: ttlSec must be a safe integer in [1, ${MAX_TTL_SEC}]`);
+        }
         ttl = opts.ttlSec;
-      } else if (opts?.ttlMs !== undefined) {
-        if (!Number.isFinite(opts.ttlMs) || opts.ttlMs <= 0) throw new Error("session: ttlMs must be positive");
-        ttl = Math.max(1, Math.floor(opts.ttlMs / 1000));
+      }
+      if (opts?.ttlMs !== undefined) {
+        if (!Number.isSafeInteger(opts.ttlMs) || opts.ttlMs <= 0 || opts.ttlMs > MAX_TTL_SEC * 1000) {
+          throw new Error(`session: ttlMs must be a safe integer in [1, ${MAX_TTL_SEC * 1000}]`);
+        }
+        if (opts.ttlSec === undefined) ttl = Math.max(1, Math.floor(opts.ttlMs / 1000));
       }
       const payload = b64url(utf8(JSON.stringify({ u: id.user, n: typeof id.name === "string" ? id.name.slice(0, 200) : null, e: id.email ?? null, d: id.domain ?? null, iat, exp: iat + ttl })));
       const mac = await crypto.subtle.sign("HMAC", k, utf8("s1." + payload));

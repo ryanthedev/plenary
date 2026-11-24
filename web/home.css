@@ -1217,3 +1217,23 @@
     transform: none !important;
   }
 }
+
+/* ── Home Sidebar Workspace Admin Footer Link ── */
+.home-page .home-admin-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.home-page .home-admin-link {
+  font-weight: 600;
+  color: var(--fg);
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+}
+
+.home-page .home-admin-link:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--fg);
+}

@@ -14,7 +14,7 @@ import { keeper } from "./focus.js";
 import { icon } from "./icons.js";
 import { hasActiveOverlay } from "./a11y.js";
 import { openHelpDialog, closeHelpDialog, isHelpDialogOpen } from "./help-dialog.js";
-import { overflowMenu, svgEl, brandMark, avatarEl, auditTone } from "./spaces.js";
+import { overflowMenu, svgEl, brandMark } from "./spaces.js";
 import { createThemeToggle } from "./theme.js";
 import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
@@ -194,29 +194,25 @@ function prefillNewBoardTitle(dlg, boardTitle) {
 /**
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/home.js").createHomeModel>, clock: import("../../ports/clock.js").Clock,
  *   boardHref: (id: string) => string, spaceHref: (id: string) => string, groupHref: (id: string) => string,
- *   teamsHref?: string | null, trashHref?: string | null, rolesHref?: string | null, offboardHref?: string | null, unitAccessHref?: ((id: string) => string) | null,
+ *   teamsHref?: string | null, trashHref?: string | null, rolesHref?: string | null, offboardHref?: string | null, unitAccessHref?: ((id: string) => string) | null, adminHref?: string | null,
  *   move?: { port: import("../../ports/move.js").MovePort, clock: import("../../ports/clock.js").Clock, newKey?: (() => string)|null }|null,
- *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"|"listTenantMembers"|"addTenantMember"|"removeTenantMember"|"adminAudit"> | null,
+ *   org?: Pick<import("../../ports/admin.js").AdminPort, "createTenant"> | null,
  *   storage?: import("../../ports/storage.js").Storage | null,
  *   themeCtrl?: import("./theme.js").ThemeController | null,
  *   onLogout?: (() => void) | null,
  *   dialogs: Pick<ReturnType<typeof import("./dialogs.js").createDialogs>, "newBoard"|"newSpace"|"newGroup">, homeHref?: string, signIn?: { href: string, text?: string, links?: Array<{ href: string, text?: string }> } | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null, themeCtrl = null, onLogout = null }) {
+export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref, teamsHref = null, trashHref = null, rolesHref = null, offboardHref = null, unitAccessHref = null, adminHref = null, dialogs, homeHref = "./", signIn = null, move = null, org = null, storage = null, themeCtrl = null, onLogout = null }) {
   const S = model.state, keys = keeper(), mark = keys.mark;
   let destroyed = false;
-  /** @type {null|"members"|"audit"} */ let panel = null;
-  let adminOpen = false;
   let drawerOpen = false;
   let orgBusy = false;
   /** @type {null | { close: () => void }} */ let activeCardSheet = null;
-  const mem = { status: "idle", tenant: null, members: [], admins: [], directory: [], busy: false, removing: null, seq: 0 };
-  const audit = { status: "idle", tenant: null, events: [], nextBefore: null, loadingMore: false, seq: 0 };
 
   const status = h("div.home-status", { role: "status", "aria-live": "polite" });
   const search = h("input.home-search", { type: "search", placeholder: "Search boards and Spaces", "aria-label": "Search boards and Spaces", autocomplete: "off", maxlength: "100", spellcheck: "false",
-    oninput: e => { panel = null; model.setQuery(e.target.value); },
+    oninput: e => { model.setQuery(e.target.value); },
     onkeydown: e => { if (e.key === "Escape" && search.value) { search.value = ""; model.setQuery(""); e.preventDefault(); } } });
   const drawerToggle = h("button.btn.ghost.home-drawer-toggle", {
     type: "button",
@@ -366,11 +362,6 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     h("form.home-org-form", { onsubmit: e => { e.preventDefault?.(); submitCreateOrg(); } }, orgNameInput, orgCreateBtn),
     orgCreateErr);
 
-  const memEmailInput = h("input.field.home-org-input", { type: "email", maxlength: "320", autocomplete: "off", placeholder: "friend@gmail.com", "aria-label": "Collaborator email" });
-  const memAddBtn = h("button.btn.primary.home-org-btn", { type: "submit" }, "Add by email");
-  const memErr = h("p.sp-error", { role: "alert" });
-  const memAddForm = h("form.home-org-form", { onsubmit: e => { e.preventDefault?.(); submitAddMember(); } }, memEmailInput, memAddBtn);
-
   async function submitCreateOrg() {
     if (!org || orgBusy) return;
     const name = String(orgNameInput.value ?? "").trim();
@@ -392,111 +383,13 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     }
   }
 
-  async function loadMembers(tenantId) {
-    if (!org || !tenantId) return;
-    const seq = ++mem.seq;
-    mem.tenant = tenantId;
-    if (mem.status !== "ready") mem.status = "loading";
-    render();
-    try {
-      const r = await org.listTenantMembers(tenantId);
-      if (destroyed || seq !== mem.seq) return;
-      mem.members = Array.isArray(r?.members) ? r.members : [];
-      mem.admins = Array.isArray(r?.admins) ? r.admins : [];
-      mem.directory = Array.isArray(r?.directory) ? r.directory : [];
-      mem.status = "ready";
-    } catch {
-      if (destroyed || seq !== mem.seq) return;
-      mem.status = "error";
-    }
-    render();
-  }
-
-  function openMembers() {
-    const id = S.data?.unit?.id;
-    if (!id || !org) return;
-    panel = "members";
-    memErr.textContent = "";
-    loadMembers(id);
-  }
-
-  async function submitAddMember() {
-    const tenantId = S.data?.unit?.id;
-    if (!org || !tenantId || mem.busy) return;
-    const email = String(memEmailInput.value ?? "").trim();
-    if (!email) { memErr.textContent = "Enter an email address."; memEmailInput.focus?.(); return; }
-    mem.busy = true; memErr.textContent = ""; memAddBtn.disabled = true; memAddBtn.textContent = "Adding…";
-    try {
-      const r = await org.addTenantMember(tenantId, email);
-      if (destroyed) return;
-      memEmailInput.value = "";
-      model.notify(`Added ${r?.email || email}.`);
-      await loadMembers(tenantId);
-    } catch (e) {
-      if (destroyed) return;
-      memErr.textContent = e?.message || "Could not add member.";
-    } finally {
-      mem.busy = false; memAddBtn.disabled = false; memAddBtn.textContent = "Add by email";
-    }
-  }
-
-  async function removeMember(email) {
-    const tenantId = S.data?.unit?.id;
-    if (!org || !tenantId || mem.removing) return;
-    mem.removing = email; memErr.textContent = "";
-    render();
-    try {
-      await org.removeTenantMember(tenantId, email);
-      if (destroyed) return;
-      model.notify(`Removed ${email}.`);
-      await loadMembers(tenantId);
-    } catch (e) {
-      if (destroyed) return;
-      memErr.textContent = e?.message || "Could not remove member.";
-    } finally {
-      mem.removing = null;
-      if (!destroyed) render();
-    }
-  }
-
-  async function loadAudit(tenantId, { before = null, append = false } = {}) {
-    if (!org || typeof org.adminAudit !== "function" || !tenantId) return;
-    const seq = ++audit.seq;
-    audit.tenant = tenantId;
-    if (append) audit.loadingMore = true;
-    else audit.status = "loading";
-    render();
-    try {
-      const r = await org.adminAudit({ tenant: tenantId, limit: 50, ...(before ? { before } : {}) });
-      if (destroyed || seq !== audit.seq) return;
-      const evs = Array.isArray(r?.events) ? r.events : [];
-      audit.events = append ? [...audit.events, ...evs] : evs;
-      audit.nextBefore = r?.nextBefore ?? null;
-      audit.status = "ready";
-    } catch {
-      if (destroyed || seq !== audit.seq) return;
-      if (!append) audit.status = "error";
-      else model.notify("Could not load more audit events.");
-    } finally {
-      audit.loadingMore = false;
-      if (!destroyed) render();
-    }
-  }
-
-  function openAudit() {
-    const id = S.data?.unit?.id;
-    if (!id || !org || typeof org.adminAudit !== "function") return;
-    panel = "audit";
-    loadAudit(id);
-  }
-
   const guest = () => !!S.data?.guest;
   // Every control that can hold focus is marked with a stable key, so a redraw (a star toggled, a view picked, a load, a notice) puts focus back.
   const newBoard = () => mark(h("button.btn.primary.home-new-board", { type: "button", onclick: e => { setPendingTemplate(storage, null, clock.now()); dialogs.newBoard({ opener: e.currentTarget }); } }, "＋ New board"), "new-board");
   const newSpace = () => mark(h("button.btn.home-side-add", { type: "button", title: "New space", "aria-label": "New space", onclick: e => dialogs.newSpace({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New space")), "new-space");
   const newGroup = () => (S.data?.can?.createGroup ? mark(h("button.btn.home-side-add", { type: "button", title: "New area", "aria-label": "New area", onclick: e => dialogs.newGroup({ opener: e.currentTarget }) }, "＋", h("span.sr-only", {}, " New area")), "new-group") : null);
-  const navBtn = (view, label, count) => mark(h("button.nav", { type: "button", "aria-current": S.view === view && !panel && !S.query.trim() ? "page" : null,
-    onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); setDrawer(false); } }, label, count != null ? h("span.n", {}, String(count)) : null), `nav:${view}`);
+  const navBtn = (view, label, count) => mark(h("button.nav", { type: "button", "aria-current": S.view === view && !S.query.trim() ? "page" : null,
+    onclick: () => { search.value = ""; model.setQuery(""); model.setView(view); setDrawer(false); } }, label, count != null ? h("span.n", {}, String(count)) : null), `nav:${view}`);
 
   function openTemplate(tpl, opener) {
     if (guest() || typeof dialogs?.newBoard !== "function") return;
@@ -526,7 +419,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   }
 
   function renderTemplates() {
-    if (guest() || S.view !== "home" || panel || S.query.trim() || typeof dialogs?.newBoard !== "function") return null;
+    if (guest() || S.view !== "home" || S.query.trim() || typeof dialogs?.newBoard !== "function") return null;
     return h("section.home-templates", { "aria-label": "Start from a template", "data-home-templates": "true" },
       h("p.home-tpl-heading", {}, "Start from a template"),
       h("div.home-tpl-grid", {}, HOME_TEMPLATES.map(tpl => mark(
@@ -585,27 +478,12 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     // A Space opens its own page (?space=<id>), a Group its (?group=<id>).
     const node = s => mark(h("a.nav.sub", { href: spaceHref(s.id), title: `Open ${s.name}`, "aria-label": `Open ${s.name}` }, s.personal ? "◐ " : "▢ ", s.name), `space:${s.id}`);
     const t = d.tree;
-    const canMembers = !d.guest && !!org && d.unit?.isAdmin === true;
-    const canAudit = !d.guest && !!org && typeof org.adminAudit === "function" && d.unit?.isAdmin === true;
-    const membersBtn = canMembers
-      ? mark(h("button.nav", { type: "button", "aria-current": panel === "members" && !S.query.trim() ? "page" : null,
-        onclick: () => { search.value = ""; model.setQuery(""); openMembers(); } }, "Members"), "nav:members")
-      : null;
-    const auditBtn = canAudit
-      ? mark(h("button.nav", { type: "button", "aria-current": panel === "audit" && !S.query.trim() ? "page" : null,
-        onclick: () => { search.value = ""; model.setQuery(""); openAudit(); } }, "Audit log"), "nav:audit")
-      : null;
     const dailyLinks = d.guest ? [] : [
       teamsHref ? mark(h("a.nav", { href: teamsHref }, "Teams"), "link:teams") : null,
       trashHref ? mark(h("a.nav", { href: trashHref }, "Trash"), "link:trash") : null,
     ].filter(Boolean);
-    const adminLinks = d.guest ? [] : [
-      membersBtn,
-      unitAccessHref && d.unit && d.can?.manageAccess ? mark(h("a.nav", { href: unitAccessHref(d.unit.id) }, "Organization access"), "link:unit-access") : null,
-      rolesHref && d.can?.manageRoles ? mark(h("a.nav", { href: rolesHref }, "Roles"), "link:roles") : null,
-      auditBtn,
-      offboardHref && d.can?.manageAccess ? mark(h("a.nav", { href: offboardHref }, "Offboard a member"), "link:offboard") : null,
-    ].filter(Boolean);
+    const hasAdminAccess = !d.guest && (d.unit?.isAdmin === true || d.can?.manageAccess === true || d.can?.manageRoles === true);
+    const resolvedAdminHref = adminHref ?? ((org || rolesHref || offboardHref || unitAccessHref) ? "?admin=people" : null);
     const spaceActions = d.guest ? [] : [newSpace(), newGroup()].filter(Boolean);
     const spacesSec = (t || spaceActions.length)
       ? h("div.home-spaces-sec", {},
@@ -617,11 +495,9 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
           t.spaces.length ? h("div.grp", {}, t.groups.length ? h("h4", {}, "Other spaces") : null, t.spaces.map(node)) : null,
           t.more ? h("p.muted", {}, "Some Spaces or boards are not listed. Use search.") : null))
       : null;
-    const adminSec = adminLinks.length
-      ? h("details.home-admin", { "data-home-admin": "true", open: adminOpen || panel === "members" || panel === "audit",
-        ontoggle: e => { adminOpen = Boolean(e.currentTarget?.open); } },
-      h("summary.home-admin-summary", {}, "Workspace Admin"),
-      h("div.home-admin-list", {}, adminLinks))
+    const adminSec = hasAdminAccess && resolvedAdminHref
+      ? h("div.home-admin-footer", { "data-home-admin": "true" },
+        mark(h("a.nav.home-admin-link", { href: resolvedAdminHref, "data-admin-entry": "true" }, "Workspace Admin"), "link:admin"))
       : null;
     const orgName = !d.guest && d.unit ? (d.unit.name || "Your workspace") : "";
     const drawerHead = drawerOpen
@@ -676,8 +552,8 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       type: "button",
       role: "tab",
       "data-mobile-tab": view,
-      "aria-selected": S.view === view && !panel && !S.query.trim() ? "true" : "false",
-      onclick: () => { panel = null; search.value = ""; model.setQuery(""); model.setView(view); },
+      "aria-selected": S.view === view && !S.query.trim() ? "true" : "false",
+      onclick: () => { search.value = ""; model.setQuery(""); model.setView(view); },
     }, label, count != null ? h("span.n", {}, String(count)) : null);
     replace(mobileTabs,
       tab("home", "Recent", null),
@@ -695,103 +571,6 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
       : null);
   }
 
-  function renderMembersPanel() {
-    const d = S.data, isPersonal = d?.unit?.personal === true;
-    const unitName = d?.unit?.name || (isPersonal ? "Personal Workspace" : "Your workspace");
-    const hasLoaded = mem.members.length || mem.admins.length || mem.directory.length;
-    const collaboratorsSec = (alwaysShow) => (alwaysShow || mem.members.length
-      ? h("section.adm-sec", { "aria-label": "Collaborators" },
-        h("h2.sec", {}, `Collaborators (${mem.members.length})`),
-        mem.members.length
-          ? h("ul.rows.adm-list", {}, mem.members.map(email => h("li.row.adm-row", {},
-            avatarEl(email),
-            h("span.who.adm-who", {}, h("span.adm-name", {}, email)),
-            mark(h("button.btn.btn-danger-ghost.home-org-btn", { type: "button", disabled: mem.removing === email,
-              "aria-label": `Remove ${email}`, onclick: () => removeMember(email) },
-            mem.removing === email ? "Removing…" : "Remove"), `member-rm:${email}`))))
-          : h("div.adm-empty", {}, h("p.muted", {}, "No collaborators added yet.")))
-      : null);
-    let body;
-    if (mem.status === "loading" && !hasLoaded) {
-      body = h("div.adm-empty", {}, h("p.muted", {}, "Loading members…"));
-    } else if (mem.status === "error") {
-      body = [empty({ title: "Could not load members.", detail: "Check your connection and try again." }),
-        mark(h("button.btn.home-org-btn", { type: "button", onclick: () => loadMembers(d.unit.id) }, "Try again"), "members-retry")];
-    } else if (isPersonal) {
-      body = [
-        mem.admins.length ? h("section.adm-sec", { "aria-label": "Admins" },
-          h("h2.sec", {}, "Admins"),
-          h("ul.rows.adm-list", {}, mem.admins.map(a => h("li.row.adm-row", {},
-            avatarEl(a),
-            h("span.who.adm-who", {}, h("span.adm-name", {}, a)),
-            h("span.badge.badge-accent", {}, "Admin"))))) : null,
-        collaboratorsSec(true),
-      ];
-    } else {
-      const dirEmails = new Set(mem.directory.map(p => (p.email ? String(p.email).toLowerCase() : null)).filter(Boolean));
-      const pendingAdmins = mem.admins.filter(a => !dirEmails.has(String(a).toLowerCase()));
-      body = [
-        h("section.adm-sec", { "aria-label": "Organization members" },
-          h("h2.sec", {}, `Members (${mem.directory.length})`),
-          mem.directory.length
-            ? h("ul.rows.adm-list", {}, mem.directory.map(p => h("li.row.adm-row", {},
-              avatarEl(p.name || p.email),
-              h("span.who.adm-who", {},
-                h("span.adm-name", {}, p.name),
-                p.email && p.email !== p.name ? [" ", h("span.muted.adm-email", {}, p.email)] : null),
-              p.isAdmin ? h("span.badge.badge-accent", {}, "Admin") : null)))
-            : (!pendingAdmins.length ? h("div.adm-empty", {}, h("p.muted", {}, "No members have signed in yet.")) : null)),
-        pendingAdmins.length ? h("section.adm-sec", { "aria-label": "Admins" },
-          h("h2.sec", {}, "Admins"),
-          h("ul.rows.adm-list", {}, pendingAdmins.map(a => h("li.row.adm-row", {},
-            avatarEl(a),
-            h("span.who.adm-who", {}, h("span.adm-name", {}, a)),
-            h("span.badge.badge-accent", {}, "Admin"))))) : null,
-        collaboratorsSec(false),
-      ];
-    }
-    const sub = isPersonal
-      ? `${unitName} — add collaborators by email so they can open shared Spaces and boards.`
-      : `${unitName} — organization members who have signed in with your workspace domain.`;
-    return replace(main,
-      h("div.home-panel-head", {}, mark(h("h1", { tabindex: "-1" }, "Workspace members"), "heading")),
-      h("p.home-panel-sub", {}, sub),
-      isPersonal ? h("div.home-panel-card", {}, memAddForm, memErr) : memErr,
-      body);
-  }
-
-  function renderAuditPanel() {
-    const d = S.data, unitName = d?.unit?.name || "your workspace";
-    const refresh = mark(h("button.btn.home-org-btn", { type: "button", disabled: audit.status === "loading",
-      onclick: () => loadAudit(d.unit.id) }, "Refresh"), "audit-refresh");
-    const body = audit.status === "loading" && !audit.events.length
-      ? h("div.adm-empty", {}, h("p.muted", {}, "Loading audit log…"))
-      : audit.status === "error"
-        ? [empty({ title: "Could not load audit log.", detail: "Check your connection and try again." }),
-          mark(h("button.btn.home-org-btn", { type: "button", onclick: () => loadAudit(d.unit.id) }, "Try again"), "audit-retry")]
-        : audit.events.length
-          ? [
-            h("ul.rows.adm-list.home-audit-list", { "aria-label": "Audit log events" }, audit.events.map(ev => {
-              const target = ev.board ? `board ${ev.board}` : (ev.target ? `target ${ev.target}` : null);
-              return h("li.row.adm-row.audit-row", {},
-                h("span", { class: `badge badge-action badge-${auditTone(ev.action)}` }, String(ev.action ?? "")),
-                h("span.who.audit-who", {},
-                  ev.actor ? h("span.audit-actor", {}, ev.actor) : null,
-                  ev.actor && target ? h("span.audit-sep", {}, " · ") : null,
-                  target ? h("span.audit-target", {}, target) : null),
-                h("span.muted.audit-when", {}, whenText(ev.at, clock.now())));
-            })),
-            audit.nextBefore ? h("div.home-audit-more", {}, mark(h("button.btn.home-org-btn", { type: "button", disabled: audit.loadingMore,
-              onclick: () => loadAudit(d.unit.id, { before: audit.nextBefore, append: true }) },
-            audit.loadingMore ? "Loading…" : "Load more"), "audit-more")) : null,
-          ]
-          : h("div.adm-empty", {}, h("p.muted", {}, "No audit events yet."));
-    return replace(main,
-      h("div.home-panel-head", {}, mark(h("h1", { tabindex: "-1" }, "Audit log"), "heading"), refresh),
-      h("p.home-panel-sub", {}, `Recent activity in ${unitName}.`),
-      body);
-  }
-
   function renderMain() {
     if (S.status === "loading" && !S.data) return replace(main, h("p.muted", {}, "Loading…"));
     if (S.status === "error") return replace(main, empty({ title: "Could not load Home.", detail: "The server did not answer. Check your connection and try again." }), mark(h("button.btn", { type: "button", onclick: () => model.load() }, "Try again"), "retry"));
@@ -803,8 +582,6 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
         : null;
       return replace(main, empty({ title: "You are signed out.", detail: "Sign in again to see your boards." }), signInButtons);
     }
-    if (!S.query.trim() && panel === "members" && S.data && !S.data.guest && S.data.unit?.isAdmin && org) return renderMembersPanel();
-    if (!S.query.trim() && panel === "audit" && S.data && !S.data.guest && S.data.unit?.isAdmin && org && typeof org.adminAudit === "function") return renderAuditPanel();
     const m = model.main();
     if (!m) return replace(main);
     if (m.kind === "search") {

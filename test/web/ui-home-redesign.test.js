@@ -173,11 +173,11 @@ test("#119 template strip: renders 5 rich templates on Home, opens New board wit
   expect(guestSetup.root.find(e => e.getAttribute("data-home-templates") === "true")).toBeUndefined();
 });
 
-test("#119 sidebar IA: single primary + New board, compact + Space/Group buttons beside Spaces header, collapsible Workspace Admin hidden for non-admins even with Teams & Trash", async () => {
-  // Regular member with production Teams & Trash links but no admin capabilities: Workspace Admin section is omitted completely
+test("#119 sidebar IA: single primary + New board, compact + Space/Group buttons beside Spaces header, single Workspace Admin footer link hidden for non-admins even with Teams & Trash", async () => {
+  // Regular member with production Teams & Trash links but no admin capabilities: Workspace Admin footer link is omitted completely
   const plain = await setup(
     { ...BASE_DATA, unit: { id: "t-1", kind: "company", name: "Acme", personal: false, isAdmin: false }, can: { createGroup: false, manageAccess: false, manageRoles: false } },
-    { teamsHref: "?teams=1", trashHref: "?trash=1", rolesHref: "?roles=1", offboardHref: "?offboard=1", unitAccessHref: id => `?access=unit:${id}` },
+    { teamsHref: "?admin=teams", trashHref: "?trash=1", adminHref: "?admin=people" },
   );
   const plainSide = plain.root.find(e => e.hasClass("home-side"));
   expect(plainSide.find(e => e.getAttribute("data-home-admin") === "true")).toBeUndefined();
@@ -188,35 +188,20 @@ test("#119 sidebar IA: single primary + New board, compact + Space/Group buttons
   expect(textOf(spacesHead.find(e => e.hasClass("home-side-label")))).toBe("Spaces");
   expect(spacesHead.findAll(e => e.hasClass("home-side-add")).map(textOf)).toEqual(["＋ New space"]);
 
-  // Admin user: collapsible Workspace Admin section separates admin-only links from daily nav
-  const org = {
-    createTenant: async () => ({ tenant: { id: "t-1", name: "Acme" } }),
-    listTenantMembers: async () => ({ members: ["sam@acme.com"], admins: ["ada@acme.com"] }),
-    addTenantMember: async (_t, email) => ({ email }),
-    removeTenantMember: async () => {},
-    adminAudit: async () => ({ events: [], nextBefore: null }),
-  };
+  // Admin user: single Workspace Admin link in sidebar footer replaces the old 5-item details accordion
   const adm = await setup(BASE_DATA, {
-    org,
-    teamsHref: "?teams=1",
-    rolesHref: "?roles=1",
-    offboardHref: "?offboard=1",
+    teamsHref: "?admin=teams",
     trashHref: "?trash=1",
-    unitAccessHref: id => `?access=unit:${id}`,
+    adminHref: "?admin=people",
   });
   const admSide = adm.root.find(e => e.hasClass("home-side"));
-  const admDetails = admSide.find(e => e.getAttribute("data-home-admin") === "true");
-  expect(admDetails).toBeTruthy();
-  expect(admDetails.tagName).toBe("DETAILS");
-  expect(textOf(admDetails.find(e => e.tagName === "SUMMARY"))).toBe("Workspace Admin");
-  const admNavText = admDetails.findAll(e => e.hasClass("nav")).map(textOf);
-  expect(admNavText).toEqual(["Members", "Organization access", "Roles", "Audit log", "Offboard a member"]);
-
-  // Opening Members auto-expands the Workspace Admin details section
-  admDetails.find(e => e.getAttribute("data-fk") === "nav:members").click();
-  await new Promise(r => setTimeout(r, 0));
-  const reopened = adm.root.find(e => e.getAttribute("data-home-admin") === "true");
-  expect(reopened.getAttribute("open") !== null || reopened.open === true).toBe(true);
+  const admFooter = admSide.find(e => e.getAttribute("data-home-admin") === "true");
+  expect(admFooter).toBeTruthy();
+  expect(admSide.find(e => e.tagName === "DETAILS")).toBeUndefined();
+  const admLink = admFooter.find(e => e.tagName === "A");
+  expect(admLink).toBeTruthy();
+  expect(admLink.getAttribute("href")).toBe("?admin=people");
+  expect(textOf(admLink)).toBe("Workspace Admin");
 });
 
 test("#119 rich visual board cards: preview header, role pill, title tooltip, and non-wrapping timestamp span without altering card-open text", async () => {

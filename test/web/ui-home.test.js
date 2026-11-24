@@ -201,27 +201,28 @@ test("destroy removes the page and unsubscribes", async () => {
   expect(root.childNodes.length).toBe(0);
 });
 
-test("Home links to Teams for a member, and to the organization's access only when the server says the caller manages it; a guest sees neither", async () => {
-  const at = { teamsHref: "?teams=1", unitAccessHref: id => `?access=unit:${id}` };
-  await mount({ ...DATA, can: { createGroup: false, manageAccess: false } }, at);
+test("Home links to Teams for a member, and to Workspace Admin only when the server says the caller has admin/management access; a guest sees neither", async () => {
+  const at = { teamsHref: "?admin=teams", adminHref: "?admin=people", unitAccessHref: id => `?access=unit:${id}` };
+  await mount({ ...DATA, can: { createGroup: false, manageAccess: false, manageRoles: false } }, at);
   const side = () => root.find(e => e.hasClass("home-side")).findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)]);
-  expect(side()).toContainEqual(["?teams=1", "Teams"]);
-  expect(side().map(x => x[1])).not.toContain("Organization access");
+  expect(side()).toContainEqual(["?admin=teams", "Teams"]);
+  expect(side().map(x => x[1])).not.toContain("Workspace Admin");
   await mount({ ...DATA, can: { createGroup: true, manageAccess: true } }, at);
-  expect(side()).toContainEqual(["?access=unit:t", "Organization access"]);
+  expect(side()).toContainEqual(["?admin=people", "Workspace Admin"]);
   await mount({ ...DATA, guest: true, unit: null, tree: null, can: { createGroup: false, manageAccess: false } }, at);
   expect(side().map(x => x[1])).not.toContain("Teams");
+  expect(side().map(x => x[1])).not.toContain("Workspace Admin");
 });
 
-test("Home links to Roles only when the server says the caller may manage roles (roles.manage), never for a guest", async () => {
-  const at = { teamsHref: "?teams=1", rolesHref: "?roles=1" };
+test("Home links to Workspace Admin when the server says the caller may manage roles (roles.manage), never for a guest", async () => {
+  const at = { teamsHref: "?admin=teams", rolesHref: "?admin=roles", adminHref: "?admin=people" };
   const side = () => root.find(e => e.hasClass("home-side")).findAll(e => e.tagName === "A").map(e => [e.getAttribute("href"), textOf(e)]);
-  await mount({ ...DATA, can: { createGroup: false, manageAccess: true, manageRoles: false } }, at);
-  expect(side().map(x => x[1])).not.toContain("Roles");
+  await mount({ ...DATA, can: { createGroup: false, manageAccess: false, manageRoles: false } }, at);
+  expect(side().map(x => x[1])).not.toContain("Workspace Admin");
   await mount({ ...DATA, can: { createGroup: false, manageAccess: false, manageRoles: true } }, at);
-  expect(side()).toContainEqual(["?roles=1", "Roles"]);
+  expect(side()).toContainEqual(["?admin=people", "Workspace Admin"]);
   await mount({ ...DATA, guest: true, unit: null, tree: null, can: { createGroup: false, manageAccess: false, manageRoles: true } }, at);
-  expect(side().map(x => x[1])).not.toContain("Roles");
+  expect(side().map(x => x[1])).not.toContain("Workspace Admin");
 });
 
 // #91: Home cards offer Move to… (the shared startMove flow) only where the server says can.move and the page has a move port.

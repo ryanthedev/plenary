@@ -83,9 +83,10 @@ export function pickerView({ api, teams, rolesFor = null, onAdd, label, setTimer
 const sortRows = rows => [...rows].sort((a, b) => (a.subject.name.toLowerCase() < b.subject.name.toLowerCase() ? -1 : a.subject.name.toLowerCase() > b.subject.name.toLowerCase() ? 1 : a.subject.id < b.subject.id ? -1 : 1));
 
 /** The Teams list: search, Create (when allowed), Teams as links, Show more. */
-export function mountTeamsPage({ root, model, hrefs, signIn = null, themeCtrl = null }) {
+export function mountTeamsPage({ root, model, hrefs, signIn = null, themeCtrl = null, chrome = null }) {
   const S = model.state;
-  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
+  const ownChrome = !chrome;
+  const { status, main, destroyTheme } = chrome ?? shell(root, hrefs, { themeCtrl });
   const keys = keeper();
   let after = null, moreBtn = null, createBtn = null;
   const q = h("input.field", { type: "search", "aria-label": "Search teams", maxlength: "100", placeholder: "Search teams" });
@@ -102,8 +103,9 @@ export function mountTeamsPage({ root, model, hrefs, signIn = null, themeCtrl = 
     if (createBtn) setOff(createBtn, S.busy);
     const rows = [...S.teams].sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : a.id < b.id ? -1 : 1));
     moreBtn = S.next ? keys.mark(h("button.btn", { type: "button", "aria-disabled": S.busy ? "true" : "false", onclick: e => { if (e.currentTarget.getAttribute("aria-disabled") !== "true") model.loadMore(); } }, "Show more teams"), "show-more") : null;
-    replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"),
-      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Teams"), "heading"), h("span.badge.badge-accent", {}, "Organization")),
+    const crumbs = ownChrome ? h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /") : null;
+    replace(main, crumbs,
+      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Teams"), "heading"), h("span.badge.badge-accent", {}, "Workspace")),
       h("form.pick-row", { role: "search", onsubmit: e => { e.preventDefault?.(); model.load(q.value); } }, q, h("button.btn", { type: "submit" }, "Search")),
       createBtn ? h("div.pick-row", {}, name, createBtn) : null,
       rows.length ? h("ul.rows", { "aria-label": "Teams" }, rows.map(t => h("li.row", { "aria-label": t.name },
@@ -112,15 +114,16 @@ export function mountTeamsPage({ root, model, hrefs, signIn = null, themeCtrl = 
         : message(S.q ? `No teams match "${S.q}".` : "No teams yet.", S.can.create ? "Create one to give a group of people the same access." : "Admins create teams."),
       moreBtn);
   }
-  model.subscribe(render);
+  const unsub = model.subscribe(render);
   render();
-  return { destroy() { destroyTheme(); root.replaceChildren(); } };
+  return { destroy() { unsub(); if (ownChrome) { destroyTheme?.(); root.replaceChildren(); } else { replace(main); } } };
 }
 
 /** One Team: rename, members (remove), add a member through the picker, delete. */
-export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker = {}, themeCtrl = null }) {
+export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker = {}, themeCtrl = null, chrome = null }) {
   const S = model.state;
-  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
+  const ownChrome = !chrome;
+  const { status, main, destroyTheme } = chrome ?? shell(root, hrefs, { themeCtrl });
   const keys = keeper();
   let confirming = false, after = null, view = null, controls = [];
   const pend = () => { for (const c of controls) c.setAttribute("aria-disabled", "true"); };      // a change is in flight: its row controls stay in the tab order but do nothing
@@ -146,7 +149,10 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
     nameIn.value = p.team.name;
     view ??= pickerView({ api, teams: false, onAdd: async person => model.addMember({ user: person.id, name: person.name, email: person.email }), label: "Add a member", ...picker });
     const rows = sortRows(p.members.map(m => ({ subject: { type: "user", id: m.user, name: m.name }, email: m.email })));
-    replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ", h("a", { href: hrefs.teams }, "Teams"), " /"),
+    const crumbs = ownChrome
+      ? h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ", h("a", { href: hrefs.teams }, "Teams"), " /")
+      : h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.teams }, "Teams"), " /");
+    replace(main, crumbs,
       h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, p.team.name), "heading"), h("span.badge", {}, sizeText(p.team.size))),
       can ? h("form.pick-row", { onsubmit: e => { e.preventDefault?.(); model.rename(nameIn.value); } }, nameIn, h("button.btn", { type: "submit" }, "Rename")) : null,
       h("h2", {}, "Members"),
@@ -164,19 +170,20 @@ export function mountTeamPage({ root, model, api, hrefs, signIn = null, picker =
             keys.mark(act({}, "Cancel", () => { confirming = false; after = () => keys.focusKey("delete-team"); render(); }), "cancel-delete"))]
         : keys.mark(act({ class: "btn-danger-ghost" }, "Delete team…", () => { confirming = true; after = () => keys.focusKey("confirm-delete"); render(); }), "delete-team")) : null);
   }
-  model.subscribe(render);
+  const unsub = model.subscribe(render);
   render();
-  return { destroy() { destroyTheme(); root.replaceChildren(); } };
+  return { destroy() { unsub(); if (ownChrome) { destroyTheme?.(); root.replaceChildren(); } else { replace(main); } } };
 }
 
 /**
  * The access page of a scope (unit | group | space | board): who has access and through what, change or remove a role where the server allows it, and
  * the one picker to add a person or Team.
  */
-export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {}, newKey = null, themeCtrl = null }) {
+export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker = {}, newKey = null, themeCtrl = null, chrome = null }) {
   const S = model.state;
-  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
-  main.setAttribute?.("class", "home-main sp-main access-main");
+  const ownChrome = !chrome;
+  const { status, main, destroyTheme } = chrome ?? shell(root, hrefs, { themeCtrl });
+  if (ownChrome) main.setAttribute?.("class", "home-main sp-main access-main");
   const keys = keeper();
   let view = null, after = null, controls = [], ask = null, askSig = null;
   function render() {
@@ -243,34 +250,38 @@ export function mountAccessPage({ root, model, api, hrefs, signIn = null, picker
     const orgAdmins = p.organization?.admins ?? [];
     const nothing = !rows.length && !p.inherited.length && !p.general.length && !orgAdmins.length && !(p.admins?.length);
     const headingText = sc.type === "unit" ? `Access: ${orgLabel}` : `Access${sc.name ? ": " + sc.name : ""}`;
-    const badgeText = sc.personal ? "Personal · only you" : sc.type === "unit" ? "Organization" : noun;
+    const badgeText = sc.personal ? "Personal · only you" : sc.type === "unit" ? "Workspace" : noun;
+    const peopleHref = hrefs.people ?? (typeof hrefs.admin === "function" ? hrefs.admin("people") : "?admin=people");
     const noAddCard = p.can.manage
       ? sc.type === "unit"
         ? h("div.home-empty.sp-action-card", {},
           h("h2", {}, "No custom roles yet"),
-          h("p", {}, "Organization-wide access uses custom roles."),
-          (hrefs.roles || hrefs.teams || hrefs.home) ? h("div.sp-action-links", {},
+          h("p", {}, "Workspace-wide access uses custom roles."),
+          (hrefs.roles || peopleHref) ? h("div.sp-action-links", {},
             hrefs.roles ? h("a.btn.primary", { href: hrefs.roles }, "Create a role →") : null,
-            (hrefs.teams || hrefs.home) ? h("a.btn", { href: hrefs.teams ?? hrefs.home }, "Manage members →") : null) : null)
+            peopleHref ? h("a.btn", { href: peopleHref }, "Manage Workspace Admins →") : null) : null)
         : message("There is nothing to add here yet.", "")
       : null;
-    replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ", sc.type === "unit" ? null : [h("a", { href: back }, sc.name ?? noun), " /"]),
+    const crumbs = ownChrome
+      ? h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " / ", sc.type === "unit" ? null : [h("a", { href: back }, sc.name ?? noun), " /"])
+      : h("nav.crumbs", { "aria-label": "Breadcrumb" }, hrefs.roles ? [h("a", { href: hrefs.roles }, "Roles & Permissions"), " /"] : null);
+    replace(main, crumbs,
       h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, headingText), "heading"), h("span.badge", {}, badgeText)),
       mineSection, requests,
       h("h2", {}, "Who has access"),
-      nothing ? message(sc.type === "unit" ? "No organization-wide role grants yet." : "Only the people set elsewhere have access.", addable ? "Add people or teams below." : "") : null,
+      nothing ? message(sc.type === "unit" ? "No workspace-wide role grants yet." : "Only the people set elsewhere have access.", addable ? "Add people or teams below." : "") : null,
       group("Added directly", `People added directly to this ${noun}`, direct.map(rowView)),
       group("Through teams", `Teams with access to this ${noun}`, teams.map(rowView)),
       [...inheritedBy].map(([k, list]) => { const s = list[0].scope; const from = s?.type === "unit" ? "your organization" : `${SCOPE_NOUN[s?.type] ?? "container"} ${s?.name ?? ""}`.trim();
         return group(`Inherited from ${from}`, `Access inherited from ${from}`, list.map(inheritedRow)); }),
       p.hiddenAbove ? h("p.muted", { "data-fk": "hidden-above" }, HIDDEN_ABOVE) : null,
-      group("Everyone in the organization", "General access", general),
+      group("Everyone in the workspace", "General access", general),
       group("Organization admins", "Organization admins", orgAdmins.map(a => h("li.row", { "aria-label": a.name }, avatarEl(a.name), h("span.who", {}, a.name))), p.organization?.more ? "They manage access in every Space. The list shows the first few." : "They manage access in every Space; they see boards only where they are added."),
       p.next ? keys.mark(act({}, "Show more", () => model.loadMore()), "show-more") : null,
-      p.admins?.length ? [h("h2", {}, "Admins"), h("ul.rows", { "aria-label": "Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, avatarEl(a.name), h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null))))] : null,
+      p.admins?.length ? [h("h2", {}, "Workspace Admins"), h("ul.rows", { "aria-label": "Workspace Admins" }, p.admins.map(a => h("li.row", { "aria-label": a.name }, avatarEl(a.name), h("span.who", {}, a.name, a.email ? h("small", {}, ` ${a.email}`) : null))))] : null,
       addable ? h("section.sp-card", { "aria-label": "Add people or teams" }, h("h2", {}, "Add people or teams"), view.el) : noAddCard);
   }
-  model.subscribe(render);
+  const unsub = model.subscribe(render);
   render();
-  return { destroy() { destroyTheme(); root.replaceChildren(); } };
+  return { destroy() { unsub(); if (ownChrome) { destroyTheme?.(); root.replaceChildren(); } else { replace(main); } } };
 }

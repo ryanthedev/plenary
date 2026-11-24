@@ -79,14 +79,30 @@ export function httpAdmin({ origin = "", token, fetch }) {
     createTenant({ name }) {
       return request("POST", "/tenants", { name });
     },
-    listTenantMembers(tenant) {
-      return request("GET", `/tenants/${enc(tenant)}/members`);
+    listTenantMembers(tenant, opts = undefined) {
+      const qs = opts ? query({ q: opts.q, role: opts.role, after: opts.after, limit: opts.limit }) : "";
+      return request("GET", `/tenants/${enc(tenant)}/members${qs}`);
     },
     addTenantMember(tenant, email) {
       return request("POST", `/tenants/${enc(tenant)}/members`, { email });
     },
     removeTenantMember(tenant, email) {
       return request("DELETE", `/tenants/${enc(tenant)}/members/${enc(email)}`);
+    },
+    addTenantAdmin(tenant, { userId, email } = {}) {
+      const payload = {};
+      if (userId !== undefined) payload.userId = userId;
+      if (email !== undefined) payload.email = email;
+      return request("POST", `/tenants/${enc(tenant)}/admins`, payload);
+    },
+    removeTenantAdmin(tenant, member) {
+      return request("DELETE", `/tenants/${enc(tenant)}/admins/${enc(member)}`);
+    },
+    getTenantMemberSummary(tenant, user) {
+      return request("GET", `/tenants/${enc(tenant)}/members/${enc(user)}/summary`);
+    },
+    listTenantSpacesOverview(tenant) {
+      return request("GET", `/tenants/${enc(tenant)}/spaces-overview`);
     },
     listBoards() {
       return request("GET", "/boards");
@@ -139,6 +155,14 @@ export function httpAdmin({ origin = "", token, fetch }) {
     },
     adminAudit({ tenant, board, limit, before } = {}) {
       return request("GET", `/admin/audit${query({ tenant, board, limit, before })}`);
+    },
+    exportTenantData({ tenant } = {}) {
+      return request("GET", `/admin/export-data${query({ tenant })}`);
+    },
+    gdprErase({ userId, tenant } = { userId: "" }) {
+      const payload = { userId };
+      if (tenant !== undefined && tenant !== null && tenant !== "") payload.tenant = tenant;
+      return request("POST", "/admin/gdpr/erase", payload);
     },
   };
 }

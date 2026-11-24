@@ -247,13 +247,13 @@ test("a viewer sees who has access and nothing to change; the unit page says whe
   root.replaceChildren();
   await accessPage("unit");
   expect(textOf(root.find(e => e.tagName === "H1"))).toBe("Access: Acme Corp");
-  expect(textOf(root.find(e => e.hasClass("badge")))).toBe("Organization");
+  expect(textOf(root.find(e => e.hasClass("badge")))).toBe("Workspace");
   expect(textOf(root)).toContain("You are an organization admin for Acme Corp. You can manage members, roles, and organization-wide access.");
   expect(textOf(root)).not.toContain("You have no board access of your own");
   expect(textOf(root)).not.toContain("Only the people set elsewhere have access.");
   const actionCard = root.find(e => e.hasClass("sp-action-card"));
-  expect(textOf(actionCard)).toContain("Organization-wide access uses custom roles.");
-  expect(actionCard.findAll(e => e.tagName === "A").map(a => [a.getAttribute("href"), textOf(a)])).toEqual([["?roles=1", "Create a role →"], ["?teams=1", "Manage members →"]]);
+  expect(textOf(actionCard)).toContain("Workspace-wide access uses custom roles.");
+  expect(actionCard.findAll(e => e.tagName === "A").map(a => [a.getAttribute("href"), textOf(a)])).toEqual([["?roles=1", "Create a role →"], ["?admin=people", "Manage Workspace Admins →"]]);
   // Fallback when unit scope has no name: shows "Your workspace"
   state.access = AP({ scope: { type: "unit", id: "t-1" }, roles: [], general: [], rows: [] });
   root.replaceChildren();

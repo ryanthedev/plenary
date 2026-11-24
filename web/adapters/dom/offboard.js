@@ -16,13 +16,14 @@ import { isMobileCardViewport, renderOffboardCards } from "./mobile/admin-cards.
 import { itemLabel, planLine, removeLines } from "../../core/offboard.js";
 
 /**
- * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/offboard.js").createOffboardModel>, hrefs: { home: string }, signIn?: { href: string, text?: string } | null, start?: string|null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null }} o
- *   start: a person to open at once (`?offboard=<user id>`)
+ * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/offboard.js").createOffboardModel>, hrefs: { home: string }, signIn?: { href: string, text?: string } | null, start?: string|null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null, chrome?: { status: any, main: any, destroyTheme?: () => void } | null, onDemoteAdmin?: ((userId: string) => Promise<void>) | null }} o
+ *   start: a person to open at once (`?offboard=<user id>` or `?admin=offboard&user=<user id>`)
  */
-export function mountOffboardPage({ root, model, hrefs, signIn = null, start = null, mobileCards = null, themeCtrl = null }) {
+export function mountOffboardPage({ root, model, hrefs, signIn = null, start = null, mobileCards = null, themeCtrl = null, chrome = null, onDemoteAdmin = null }) {
   const S = model.state;
-  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
-  let dlg = null, reviewBtn = null, removeBtn = null, h1 = null, focusTo = null;
+  const ownChrome = !chrome;
+  const { status, main, destroyTheme } = chrome ?? shell(root, hrefs, { themeCtrl });
+  let dlg = null, reviewBtn = null, removeBtn = null, h1 = null, focusTo = null, demoting = false, demoteError = "";
   /** The control with this `data-fk` in the CURRENT page (a redraw replaces every node, so a held reference points at a detached one), else the heading. */
   const keeper = k => (typeof main.querySelector === "function" ? main.querySelector(`[data-fk="${k}"]`) : main.find(e => e.getAttribute?.("data-fk") === k)) ?? h1;
   /** An opener the dialog focuses when it closes: resolved THEN (after the redraws the apply made), never a node held from before. */
@@ -52,8 +53,8 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     if (S.status === "notfound") return replace(main, message("This person is not available.", "They may never have signed in to this organization."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     if (S.status === "error") return replace(main, message("Could not load this page.", S.notice ?? "The server did not answer."), h("a.btn", { href: hrefs.home }, "Back to Home"));
     h1 = h("h1", { id: "page-title", tabindex: "-1", "data-fk": "heading" }, "Offboard a member");
-    const crumbs = h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /");
-    const finder = searchBox("Find a person", q => model.search(q), S.found, p => model.open(p.id), "offboard-find", "found");
+    const crumbs = ownChrome ? h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /") : null;
+    const finder = searchBox("Find a person", q => model.search(q), S.found, p => { demoteError = ""; model.open(p.id); }, "offboard-find", "found");
     if (!S.member) return replace(main, crumbs, h("div.sp-head", {}, h1), h("p.sub-h", {}, "Reassign what they solely own, then remove them. Nothing moves until you confirm."), finder);
     const m = S.member, d = S.defaults, n = S.items.length, can = model.actionable().length, qualifies = can > 0 || model.handedOver() !== null;
     const itemsView = isMobileCardViewport(mobileCards)
@@ -73,10 +74,32 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
     reviewBtn = act({ class: "primary", "data-fk": "review" }, "Review and reassign…", () => { dlg = null; if (model.openConfirm("items")) openConfirm(openerOf("review")); }, () => S.busy || !can);
     removeBtn = act({ class: "btn-danger-ghost", "data-fk": "remove" }, `Remove ${m.name}…`, () => { if (model.openConfirm("remove")) openConfirm(openerOf("remove")); }, () => S.busy || !S.canRemove);
     setOff(reviewBtn, S.busy || !can); setOff(removeBtn, S.busy || !S.canRemove);
+    const demoteBtn = S.blocked === "admin" && typeof onDemoteAdmin === "function"
+      ? act({ class: "btn-danger-ghost", "data-fk": "demote-admin", "aria-disabled": demoting || S.busy ? "true" : "false" },
+        demoting ? "Removing Workspace Admin…" : "Remove Workspace Admin first",
+        async () => {
+          demoting = true; demoteError = ""; render();
+          try {
+            await onDemoteAdmin(m.id);
+            announce(`Removed Workspace Admin from ${m.name}.`);
+            demoting = false;
+            await model.open(m.id);
+          } catch (e) {
+            demoting = false;
+            demoteError = e?.code === "last-admin" || e?.status === 409
+              ? "Cannot remove the last Workspace Admin. Promote another member first."
+              : (e?.message || "Could not remove Workspace Admin.");
+            render();
+          }
+        }, () => demoting || S.busy)
+      : null;
     replace(main, crumbs, h("div.sp-head", {}, h1, h("span", { class: `badge${m.removed ? " badge-danger" : " badge-accent"}` }, m.removed ? "Removed" : "Member")),
       h("p", {}, `${m.name}${m.email ? ` (${m.email})` : ""}.`, qualifies ? ` Each item goes to ${d.recipient.name} (${d.reason === "manager" ? "their manager" : "you, as no manager is known"}) unless you pick someone else in its row.` : " You can't hand on any of their items."),
       m.removed ? h("p", {}, `${m.name} has been removed from the organization.`) : null,
-      S.blocked === "admin" ? h("p", { role: "status" }, `${m.name} is an organization admin and can't be removed here.`) : null,
+      S.blocked === "admin" ? h("div.sp-card.admin-blocked-card", {},
+        h("p", { role: "status" }, `${m.name} is an organization admin and can't be removed here.`),
+        demoteBtn ? h("div.pick-row", {}, demoteBtn) : null,
+        demoteError ? h("p.sp-error", { role: "alert" }, demoteError) : null) : null,
       n ? [h("h2", {}, "Items"), itemsView, S.next ? h("button.btn", { type: "button", onclick: () => model.more() }, "Show more") : null,
         h("h2", {}, "Another new owner"), h("p.muted", {}, "Search for a person to offer them in every row's list."), searchBox("Find a new owner", q => model.search(q, "foundOwner"), S.foundOwner, p => model.addKnown(p), "offboard-owner", "foundOwner")]
         : !m.removed && !S.blocked ? message(`${m.name} solely owns nothing.`, "They can be removed now.") : null,
@@ -116,5 +139,5 @@ export function mountOffboardPage({ root, model, hrefs, signIn = null, start = n
   const unsub = model.subscribe(render);
   render();
   if (start) model.open(start);
-  return { destroy() { destroyTheme(); unsub(); root.replaceChildren(); } };
+  return { destroy() { unsub(); if (ownChrome) { destroyTheme?.(); root.replaceChildren(); } else { replace(main); } } };
 }

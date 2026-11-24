@@ -44,6 +44,7 @@ import { mountOffboardPage } from "./adapters/dom/offboard.js";
 import { mountRolesPage } from "./adapters/dom/roles.js";
 import { createRolesModel } from "./core/role-admin.js";
 import { mountTeamsPage, mountTeamPage, mountAccessPage } from "./adapters/dom/access.js";
+import { adminShell, normalizeAdminSection, mountAdminPeople, mountAdminSpaces, mountAdminAudit } from "./adapters/dom/admin-shell.js";
 import { createTeamsModel, createTeamModel, createAccessModel } from "./core/access.js";
 import { createPageModel } from "./core/spaces.js";
 import { takeSignIn, signInNotice, asParam, menuSignIn, devLinks, signOut } from "./core/signin.js";
@@ -88,7 +89,7 @@ if (back) { q.set("board", back); history.replaceState(history.state, "", `${loc
 // A link with no board lands on Home (everyone, a dev user included): Recent, Starred, Shared with me, the Space tree, search.
 const board = asked ?? back;
 const idParam = name => (/^[\w-]{1,64}$/.test(q.get(name) ?? "") ? q.get(name) : null);
-const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles"), trashPage = q.has("trash"), offboardPage = q.has("offboard");
+const spaceId = idParam("space"), groupId = idParam("group"), teamId = idParam("team"), teamsPage = q.has("teams"), rolesPage = q.has("roles"), trashPage = q.has("trash"), offboardPage = q.has("offboard"), adminPage = q.has("admin");
 const accessArg = /^(unit|group|space|board):([\w-]{1,64})$/.exec(q.get("access") ?? "");
 /** A link to another page of this app, keeping the theme. */
 const hrefTo = params => `?${new URLSearchParams({ ...params, ...(theme0 ? { theme: theme0 } : {}) })}`;
@@ -122,28 +123,85 @@ if (!signIn.token) {
   document.querySelector(".app")?.remove();
   const root = document.createElement("div");
   document.body.append(root);
-  const hrefs = { home: location.pathname, board: id => hrefTo({ board: id }), space: id => hrefTo({ space: id }), group: id => hrefTo({ group: id }),
-    team: id => hrefTo({ team: id }), teams: hrefTo({ teams: "1" }), roles: hrefTo({ roles: "1" }), offboard: hrefTo({ offboard: "1" }), trash: hrefTo({ trash: "1" }), access: (type, id) => hrefTo({ access: `${type}:${id}` }) };
+  const hrefs = {
+    home: location.pathname,
+    board: id => hrefTo({ board: id }),
+    space: id => hrefTo({ space: id }),
+    group: id => hrefTo({ group: id }),
+    team: id => hrefTo({ team: id }),
+    teams: hrefTo({ admin: "teams" }),
+    roles: hrefTo({ admin: "roles" }),
+    offboard: hrefTo({ admin: "offboard" }),
+    people: hrefTo({ admin: "people" }),
+    spaces: hrefTo({ admin: "spaces" }),
+    audit: hrefTo({ admin: "audit" }),
+    trash: hrefTo({ trash: "1" }),
+    access: (type, id) => hrefTo({ access: `${type}:${id}` }),
+    admin: (sec = "people", extra = {}) => hrefTo({ admin: sec, ...extra }),
+  };
   const dialogs = createDialogs({ host: root, api: spacesApi, hrefs, go: href => location.assign(href) });
-  if (rolesPage) {
-    // The Roles screen (PROTOCOL.md § Roles): the server answers 404 to a caller without roles.manage, which shows the same "not available" page.
-    const model = createRolesModel({ api: httpRoles({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
-    mountRolesPage({ root, model, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load();
-  } else if (offboardPage) {
-    // The leaver screen (PROTOCOL.md § Leaver offboarding): a caller without members.manage gets the same "not available" page. `?offboard=<user id>` opens a person.
-    const who = q.get("offboard") && q.get("offboard") !== "1" ? q.get("offboard").slice(0, 200) : null;
-    const model = createOffboardModel({ api: httpOffboard({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
-    mountOffboardPage({ root, model, hrefs, signIn: signInLink, start: who, themeCtrl }); hideGate();
+  const isUnitAccess = Boolean(accessArg && accessArg[1] === "unit");
+  const inAdminShell = adminPage || rolesPage || offboardPage || teamsPage || Boolean(teamId) || isUnitAccess;
+  if (inAdminShell) {
+    const section = adminPage
+      ? normalizeAdminSection(q.get("admin"))
+      : (rolesPage || isUnitAccess) ? "roles"
+        : offboardPage ? "offboard"
+          : "teams";
+    const chrome = adminShell({ root, section, hrefs, themeCtrl, onLogout });
+    hideGate();
+    let tenant = null;
+    try {
+      const res = await orgApi.listTenants();
+      const list = Array.isArray(res?.tenants) ? res.tenants : [];
+      const found = list.find(t => t.isAdmin) ?? list[0] ?? null;
+      if (found) tenant = { ...found, personal: found.domain === null };
+      if (tenant?.name) chrome.setWorkspaceName(tenant.name);
+    } catch {
+      tenant = null;
+    }
+    if (isUnitAccess) {
+      const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
+      const model = createAccessModel({ api, type: "unit", id: accessArg[2] });
+      mountAccessPage({ root, chrome, model, api, hrefs, signIn: signInLink, newKey: () => randomKey(), themeCtrl });
+      model.load();
+    } else if (section === "people") {
+      mountAdminPeople({ root, chrome, org: orgApi, tenant, hrefs });
+    } else if (section === "spaces") {
+      mountAdminSpaces({ chrome, org: orgApi, tenant, hrefs });
+    } else if (section === "audit") {
+      mountAdminAudit({ chrome, org: orgApi, tenant, clock });
+    } else if (section === "roles") {
+      const model = createRolesModel({ api: httpRoles({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
+      mountRolesPage({ root, chrome, model, hrefs, signIn: signInLink, themeCtrl, unitId: tenant?.id ?? null });
+      model.load();
+    } else if (section === "offboard") {
+      const who = q.get("user") || (q.get("offboard") && q.get("offboard") !== "1" ? q.get("offboard") : null);
+      const model = createOffboardModel({ api: httpOffboard({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
+      mountOffboardPage({
+        root, chrome, model, hrefs, signIn: signInLink, start: who ? who.slice(0, 200) : null, themeCtrl,
+        onDemoteAdmin: tenant?.id ? (uid => orgApi.removeTenantAdmin(tenant.id, uid)) : null,
+      });
+    } else if (teamId) {
+      const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
+      const model = createTeamModel({ api, id: teamId });
+      mountTeamPage({ root, chrome, model, api, hrefs, signIn: signInLink, themeCtrl });
+      model.load();
+    } else {
+      const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
+      const model = createTeamsModel({ api });
+      mountTeamsPage({ root, chrome, model, hrefs, signIn: signInLink, themeCtrl });
+      model.load();
+    }
   } else if (trashPage) {
     // The Trash (PROTOCOL.md § Trash and restore): what this person may restore. A caller outside a Unit gets the same "not available" page.
     const model = createTrashModel({ api: httpTrash({ fetch: fetchNow, token: signIn.token, timers: clock }), newKey: () => randomKey() });
     mountTrashPage({ root, model, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load();
-  } else if (teamId || teamsPage || accessArg) {
-    // Teams, a Team, or the access page of a scope (PROTOCOL.md § Teams and access). An id the person can't open shows the same "not available" page as one that does not exist.
+  } else if (accessArg) {
+    // Access page of a group, space, or board scope.
     const api = httpAccess({ fetch: fetchNow, token: signIn.token, timers: clock });
-    if (teamsPage) { const model = createTeamsModel({ api }); mountTeamsPage({ root, model, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load(); }
-    else if (teamId) { const model = createTeamModel({ api, id: teamId }); mountTeamPage({ root, model, api, hrefs, signIn: signInLink, themeCtrl }); hideGate(); model.load(); }
-    else { const model = createAccessModel({ api, type: /** @type {"unit"|"group"|"space"|"board"} */ (accessArg[1]), id: accessArg[2] }); mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey(), themeCtrl }); hideGate(); model.load(); }
+    const model = createAccessModel({ api, type: /** @type {"unit"|"group"|"space"|"board"} */ (accessArg[1]), id: accessArg[2] });
+    mountAccessPage({ root, model, api, hrefs, signIn: signInLink, newKey: () => randomKey(), themeCtrl }); hideGate(); model.load();
   } else if (spaceId || groupId) {
     // A Space or Group page. An id the person can't open shows the same "not available" page as one that does not exist.
     const model = createPageModel({ api: spacesApi, kind: spaceId ? "space" : "group", id: spaceId ?? groupId });
@@ -156,7 +214,7 @@ if (!signIn.token) {
     const model = createHomeModel({ api: httpHome({ fetch: fetchNow, token: signIn.token, timers: clock }), clock });
     mountHome({ root, model, clock, signIn: signInLink, homeHref: location.pathname, dialogs,
       org: orgApi, onLogout, themeCtrl,
-      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id),
+      boardHref: hrefs.board, spaceHref: hrefs.space, groupHref: hrefs.group, teamsHref: hrefs.teams, trashHref: hrefs.trash, rolesHref: hrefs.roles, offboardHref: hrefs.offboard, unitAccessHref: id => hrefs.access("unit", id), adminHref: hrefs.admin("people"),
       move: { port: httpMove({ fetch: fetchNow, token: signIn.token, timers: clock }), clock, newKey: () => randomKey() } });
     hideGate();
     model.load();

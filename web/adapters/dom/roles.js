@@ -23,13 +23,15 @@ const CELL = { yes: ["✓", "applies"], no: ["", "not granted"], na: ["–", "no
 
 /**
  * Mount the Roles administration page into `root`.
- * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/role-admin.js").createRolesModel>, hrefs: { home: string },
- *   signIn?: { href: string, text?: string } | null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null }} o
+ * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/role-admin.js").createRolesModel>, hrefs: { home: string, access?: (type: string, id: string) => string, unitAccess?: ((id: string) => string) | string | null },
+ *   signIn?: { href: string, text?: string } | null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null,
+ *   chrome?: { status: any, main: any, destroyTheme?: () => void } | null, unitId?: string | null }} o
  * @returns {{ destroy(): void }}
  */
-export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards = null, themeCtrl = null }) {
+export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards = null, themeCtrl = null, chrome = null, unitId = null }) {
   const S = model.state;
-  const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });
+  const ownChrome = !chrome;
+  const { status, main, destroyTheme } = chrome ?? shell(root, hrefs, { themeCtrl });
   const keys = keeper();
   let after = null, deleting = false, saveBtn = null, discardBtn = null, controls = [];
   const nameIn = h("input.field", { type: "text", maxlength: "250", "aria-label": "Role name", oninput: e => { model.setName(e.target.value); sync(); } });
@@ -141,14 +143,35 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
   function draw() {
     controls = [];
     const p = S.page;
-    replace(main, h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /"),
-      h("div.sp-head", {}, keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Roles"), "heading"), h("span.badge", {}, "Organization")),
-      h("p.muted", {}, "Choose what people can view, edit, and manage across your organization, areas, spaces, and boards."),
+    const unitAccessHref = typeof hrefs.unitAccess === "string"
+      ? hrefs.unitAccess
+      : (unitId && typeof hrefs.unitAccess === "function"
+        ? hrefs.unitAccess(unitId)
+        : (unitId && typeof hrefs.access === "function" ? hrefs.access("unit", unitId) : null));
+    const hierarchy = h("section.admin-hierarchy", { "aria-label": "Admin and role hierarchy", "data-role-hierarchy": "true" },
+      h("div.admin-hierarchy-card", {},
+        h("h2", {}, "Workspace Admins"),
+        h("p.muted", {}, "Manage people, teams, roles, offboarding, and compliance across the Workspace. Do not automatically see private board content.")),
+      h("div.admin-hierarchy-card", {},
+        h("h2", {}, "Content Admins"),
+        h("p.muted", {}, "Hold a Workspace-level content-tier role to open boards beyond their own access across shared or personal Spaces.")),
+      h("div.admin-hierarchy-card", {},
+        h("h2", {}, "Area & Space Owners"),
+        h("p.muted", {}, "Manage membership, general access, and boards inside the specific Areas & Spaces they own.")));
+    const crumbs = ownChrome ? h("nav.crumbs", { "aria-label": "Breadcrumb" }, h("a", { href: hrefs.home }, "Home"), " /") : null;
+    replace(main, crumbs,
+      h("div.sp-head", {},
+        keys.mark(h("h1", { id: "page-title", tabindex: "-1" }, "Roles & Permissions"), "heading"),
+        h("span.badge", {}, "Workspace"),
+        h("span.spacer"),
+        unitAccessHref ? h("a.btn", { href: unitAccessHref, "data-unit-access-link": "true" }, "Workspace-wide role grants →") : null),
+      h("p.muted", {}, "Choose what people can view, edit, and manage across your workspace, areas, spaces, and boards."),
+      hierarchy,
       h("ul.rows", { "aria-label": "Roles" }, p.roles.map(listItem)),
       p.roles.every(r => r.kind !== "custom") ? message("No custom roles yet.", "Built-in roles cover most needs. Duplicate one to make your own.") : null,
       detail());
   }
-  model.subscribe(render);
+  const unsub = model.subscribe(render);
   render();
-  return { destroy() { destroyTheme(); root.replaceChildren(); } };
+  return { destroy() { unsub(); if (ownChrome) { destroyTheme?.(); root.replaceChildren(); } else { replace(main); } } };
 }

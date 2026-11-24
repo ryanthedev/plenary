@@ -175,12 +175,12 @@ test("HTML & CSS static rules: viewport-fit=cover, 100dvh/--vv-height, safe-area
   expect(css).toMatch(/html,\s*body\s*\{[^}]*height:\s*100dvh[^}]*overscroll-behavior:\s*none/s);
   expect(css).toMatch(/\.app\s*\{[^}]*top:\s*var\(--vv-top,\s*0px\)[^}]*height:\s*100dvh[^}]*height:\s*var\(--vv-height,\s*100dvh\)/s);
 
-  // Safe-area insets on .topbar, .dock, .hud-*, and .sheet
+  // Safe-area insets on .topbar, .dock, .hud-rail, and .sheet
   expect(css).toMatch(/\.topbar\s*\{[^}]*env\(safe-area-inset-top\)[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-left\)/s);
   expect(css).toMatch(/\.dock\s*\{[^}]*env\(safe-area-inset-left\)[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-bottom\)/s);
-  expect(css).toMatch(/\.hud-bl\s*\{[^}]*env\(safe-area-inset-left\)[^}]*env\(safe-area-inset-bottom\)/s);
-  expect(css).toMatch(/\.hud-bc\s*\{[^}]*env\(safe-area-inset-bottom\)/s);
-  expect(css).toMatch(/\.hud-br\s*\{[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-bottom\)/s);
+  expect(css).toMatch(/\.hud-rail\s*\{[^}]*env\(safe-area-inset-bottom\)[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-left\)/s);
+  const touchBlock = css.match(/@media\s*\(max-width:\s*1023px\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+  expect(touchBlock).toMatch(/\.hud-rail\s*\{[^}]*env\(safe-area-inset-bottom\)[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-left\)/s);
   expect(css).toMatch(/\.sheet\s*\{[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-bottom\)[^}]*env\(safe-area-inset-left\)/s);
   expect(collabCss).toMatch(/\.collab-picker\s*\{[^}]*env\(safe-area-inset-bottom\)/s);
   expect(collabCss).toMatch(/\.collab-pop\s*\{[^}]*env\(safe-area-inset-left\)[^}]*env\(safe-area-inset-right\)[^}]*env\(safe-area-inset-bottom\)/s);

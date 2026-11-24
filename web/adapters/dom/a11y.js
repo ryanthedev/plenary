@@ -102,7 +102,7 @@ export function accessibleName(el, doc = globalThis.document) {
 
 // Unified per-document overlay stack: only the topmost active overlay handles Tab wrapping and Escape dismissal,
 // through a single document-level keydown listener per Document (attached while at least one overlay is active).
-/** @typedef {{ container: HTMLElement, handle: (e: any) => void }} OverlayEntry */
+/** @typedef {{ container: HTMLElement, handle: (e: any) => void, mountRoot: any, detach: () => void }} OverlayEntry */
 /** @type {WeakMap<object, OverlayEntry[]>} */
 const docStacks = new WeakMap();
 /** @type {WeakMap<object, (e: any) => void>} */
@@ -111,6 +111,46 @@ const docListeners = new WeakMap();
 const nullStack = [];
 const handledEvents = new WeakSet();
 
+/** @param {any} el */
+function rootAncestor(el) {
+  let x = el;
+  while (x?.parentNode) x = x.parentNode;
+  return x ?? null;
+}
+
+/** @param {OverlayEntry} entry @param {Document | null | undefined} doc */
+function isEntryConnected(entry, doc) {
+  const { container, mountRoot } = entry;
+  if (!container) return false;
+  if (typeof container.isConnected === "boolean") return container.isConnected;
+  if (!doc || typeof doc !== "object") return true;
+  const body = doc.body ?? null;
+  const rootEl = doc.documentElement ?? null;
+  const root = rootAncestor(container);
+  if (body || rootEl) {
+    if (root === body || root === rootEl) return true;
+    // Preserve stub-DOM callers (e.g. collab/fake-dom.js) that mount dialogs into a detached host root
+    // even when doc.body exists, as long as the dialog has not been detached from that mountRoot.
+    return Boolean(mountRoot && mountRoot !== container && root === mountRoot);
+  }
+  return mountRoot ? root === mountRoot : true;
+}
+
+/** @param {Document | null | undefined} doc @param {OverlayEntry[]} stack */
+function pruneStack(doc, stack) {
+  let removed = false;
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const entry = stack[i];
+    if (!isEntryConnected(entry, doc)) {
+      stack.splice(i, 1);
+      entry.detach();
+      removed = true;
+    }
+  }
+  if (removed) releaseDocListenerIfEmpty(doc);
+  return stack;
+}
+
 /** @param {Document | null | undefined} doc */
 function getStack(doc) {
   if (!doc || typeof doc !== "object") return nullStack;
@@ -118,8 +158,9 @@ function getStack(doc) {
   if (!stack) {
     stack = [];
     docStacks.set(doc, stack);
+    return stack;
   }
-  return stack;
+  return pruneStack(doc, stack);
 }
 
 /** @param {Document | null | undefined} doc */
@@ -127,8 +168,8 @@ function ensureDocListener(doc) {
   if (!doc || typeof doc !== "object" || typeof doc.addEventListener !== "function") return;
   if (docListeners.has(doc)) return;
   const listener = e => {
-    const stack = docStacks.get(doc);
-    if (!stack || !stack.length) return;
+    const stack = getStack(doc);
+    if (!stack.length) return;
     stack[stack.length - 1].handle(e);
   };
   docListeners.set(doc, listener);
@@ -153,7 +194,10 @@ function releaseDocListenerIfEmpty(doc) {
  * @returns {boolean}
  */
 export function hasActiveOverlay(doc = globalThis.document ?? null) {
-  return getStack(doc).length > 0;
+  if (!doc || typeof doc !== "object") return false;
+  const stack = docStacks.get(doc);
+  if (!stack || !stack.length) return false;
+  return pruneStack(doc, stack).length > 0;
 }
 
 /**
@@ -222,7 +266,17 @@ export function createFocusTrap(container, {
   };
 
   /** @type {OverlayEntry} */
-  const entry = { container, handle: onKeyDown };
+  const entry = {
+    container,
+    handle: onKeyDown,
+    mountRoot: null,
+    detach() {
+      if (!active) return;
+      active = false;
+      container?.removeEventListener?.("keydown", onKeyDown);
+      previousFocus = null;
+    },
+  };
 
   function activate() {
     if (active || !container) return;
@@ -232,6 +286,7 @@ export function createFocusTrap(container, {
     const stack = getStack(doc);
     const idx = stack.indexOf(entry);
     if (idx >= 0) stack.splice(idx, 1);
+    entry.mountRoot = rootAncestor(container);
     stack.push(entry);
     ensureDocListener(doc);
     container.addEventListener?.("keydown", onKeyDown);
@@ -243,16 +298,20 @@ export function createFocusTrap(container, {
 
   function deactivate({ restoreFocus = true } = {}) {
     if (!active) return;
+    const prev = previousFocus;
     active = false;
-    const stack = getStack(doc);
-    const idx = stack.indexOf(entry);
-    if (idx >= 0) stack.splice(idx, 1);
-    releaseDocListenerIfEmpty(doc);
-    container?.removeEventListener?.("keydown", onKeyDown);
-    if (restoreFocus && previousFocus && previousFocus.isConnected !== false) {
-      previousFocus.focus?.();
-    }
     previousFocus = null;
+    const rawStack = doc && typeof doc === "object" ? docStacks.get(doc) : null;
+    if (rawStack) {
+      const idx = rawStack.indexOf(entry);
+      if (idx >= 0) rawStack.splice(idx, 1);
+      pruneStack(doc, rawStack);
+      releaseDocListenerIfEmpty(doc);
+    }
+    container?.removeEventListener?.("keydown", onKeyDown);
+    if (restoreFocus && prev && prev.isConnected !== false) {
+      prev.focus?.();
+    }
   }
 
   return {

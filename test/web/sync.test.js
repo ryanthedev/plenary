@@ -276,6 +276,53 @@ test("while a gesture is open the Editor may run ahead; the release reconciles i
   expectConverged(net, peers);
 });
 
+test("Escape-abandoned resize and rotate after peer delete do not resurrect the deleted shape", () => {
+  for (const kind of ["resize", "rotate"]) {
+    const { net, peers } = setup();
+    const [a, b] = peers, ed = a.editor;
+    const id = box(a, net);
+    ed.setTool("select"); ed.select([id]);
+    const h = ed.handles().find(h => (kind === "rotate" ? h.kind === "rotate" : h.kind === "resize" && h.dir === "se"));
+    const to = { x: h.x + 80, y: h.y + 40 };
+    drag(ed, null, { x: h.x, y: h.y }, to, 20, false);
+    b.editor.select([id]); b.editor.key("backspace"); net.settle();
+    ed.key("escape");
+    expect(ed.g?.kind).toBe(kind);
+    ed.pointerUp(to, {}); net.settle();
+    expect(ed.doc.get(id)).toBeNull();
+    expectConverged(net, peers);
+  }
+});
+
+test("Escape-abandoned container + child move after peer delete does not resurrect deleted elements", () => {
+  const { net, peers } = setup();
+  const [a, b] = peers, ed = a.editor;
+  drag(ed, "frame", { x: 50, y: 50 }, { x: 350, y: 250 }, 10);
+  ed.key("escape");
+  drag(ed, "rectangle", { x: 450, y: 100 }, { x: 530, y: 160 }, 10);
+  const childId = ed.doc.live().find(e => e.type === "rectangle").id;
+  ed.setTool("select"); ed.select([childId]);
+  const c = centre(ed, childId);
+  drag(ed, null, c, { x: 160, y: 150 }, 10);
+  ed.key("escape");
+  net.settle();
+  const frameEl = ed.doc.live().find(e => e.type === "frame");
+  const childEl = ed.doc.get(childId);
+  expect(childEl.frameId).toBe(frameEl.id);
+
+  ed.setTool("select"); ed.select([frameEl.id]);
+  const from = ed.toScreen({ x: frameEl.x + frameEl.width / 2, y: frameEl.y });
+  const to = { x: from.x + 120, y: from.y + 60 };
+  drag(ed, null, from, to, 20, false);
+  b.editor.select([frameEl.id, childEl.id]); b.editor.key("backspace"); net.settle();
+  ed.key("escape");
+  expect(ed.g?.kind).toBe("move");
+  ed.pointerUp(to, {}); net.settle();
+  expect(ed.doc.get(frameEl.id)).toBeNull();
+  expect(ed.doc.get(childEl.id)).toBeNull();
+  expectConverged(net, peers);
+});
+
 test("pointercancel mid-create sends nothing and leaves no element or tombstone (M4, L1)", () => {
   const { net, peers } = setup();
   const ed = peers[0].editor, n = net.log.entries.length;
@@ -333,8 +380,11 @@ test("pointer move, resize and rotate of a labelled shape with a bound arrow; no
     drag(ed, "select", { x: h.x, y: h.y }, { x: h.x + 60, y: h.y + 40 }, 1100);
     net.settle();
   }
-  // Core does list an element twice in one op (settleArrows); none of those duplicates reach the room.
-  expect(ops.some(o => !o.transient && o.elements && new Set(o.elements.map(e => e.id)).size < o.elements.length)).toBe(true);
+  // Editor.emitElementsOp deduplicates element IDs per op (keeping settled arrow versions) before onOp fires.
+  const committed = ops.filter(o => !o.transient && o.elements?.length);
+  expect(committed.length).toBeGreaterThan(0);
+  for (const o of committed) expect(new Set(o.elements.map(e => e.id)).size).toBe(o.elements.length);
+  expect(committed.some(o => o.elements.some(e => e.id === shape.id) && o.elements.some(e => e.id === arrow.id))).toBe(true);
   for (const e of net.log.entries) if (e.op.elements) expect(new Set(e.op.elements.map(x => x.id)).size).toBe(e.op.elements.length);
   expect(a.sync.resets).toBe(1);
   expect(b.editor.doc.get(arrow.id).endBinding?.elementId).toBe(shape.id);

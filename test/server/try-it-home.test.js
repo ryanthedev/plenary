@@ -44,6 +44,6 @@ test("web/main.js: a signed-in link with no board mounts Home (not the old 'No b
   const src = (await Bun.file(new URL("../../web/main.js", import.meta.url)).text()).replace(/\/\/.*$/gm, "");
   expect(src).not.toContain("No board in this link");
   expect(src).not.toContain("devBoard");
-  expect(src).toMatch(/else if \(!board\) \{[^]*?mountHome\(/);
+  expect(src).toMatch(/\} else \{[^]*?if \(!board\) \{[^]*?mountHome\(/);
   expect(src).toMatch(/const board = asked \?\? back;/);
 });

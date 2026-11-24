@@ -121,7 +121,7 @@ test("DW-52.2 link access: role and expiry, then the link is listed with its add
 test("DW-52.3 inherited rows are read-only text with where they come from, and point to the Access page; no control edits them", async () => {
   await open();
   const rows = items("Who else has access").map(li => li.getAttribute("aria-label"));
-  expect(rows).toEqual(["Design team, Editor, via Group Product", "Everyone in the organization, Viewer, via Space Design"]);
+  expect(rows).toEqual(["Design team, Editor, via Area Product", "Everyone in the organization, Viewer, via Space Design"]);
   expect(items("People added to this board").map(li => li.getAttribute("aria-label"))).toEqual(["Ada, Owner, Added directly"]);
   for (const li of [...items("Who else has access"), ...items("People added to this board")]) expect(li.findAll(e => /^(BUTTON|INPUT|SELECT)$/.test(e.tagName))).toEqual([]);
   expect(all(e => e.tagName === "A").map(a => a.getAttribute("href"))).toEqual(["?access=board:b-1"]);

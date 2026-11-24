@@ -176,7 +176,7 @@ test("icons.js defines paste and image SVG icons and index.html #picker accepts 
   expect(ICONS.paste.length).toBeGreaterThan(0);
   expect(Array.isArray(ICONS.image)).toBe(true);
   const html = await Bun.file(new URL("../../web/index.html", import.meta.url)).text();
-  expect(html).toContain('id="picker" accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm,video/quicktime,.excalidraw,.excalidrawlib"');
+  expect(html).toContain('id="picker" accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm,video/quicktime,.excalidraw,.excalidrawlib,.json,.drawio,.xml"');
 });
 
 test("Paste button click with image/png ClipboardItem calls clipboard.read() synchronously, inserts image, and uploads blob", async () => {

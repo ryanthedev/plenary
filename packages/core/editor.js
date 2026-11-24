@@ -708,7 +708,7 @@ export class Editor {
   finishSingleGesture(g, p, m = {}) {
     switch (g.kind) {
       case "move": {
-        if (!g.moved) return this.changed();
+        if (!g.moved || !this.sel.size) return this.changed();
         const dirty = new Map();
         const movedIds = new Set(g.orig?.keys() ?? []);
         for (const id of movedIds) {
@@ -736,6 +736,7 @@ export class Editor {
         return this.commitGesture(g.before, dirty);
       }
       case "resize": case "point": case "rotate": {
+        if (!this.sel.size) return this.changed();
         /** @type {[string, any][]} */
         const entries = [...g.orig.keys()].map(id => /** @type {[string, any]} */ ([id, clone(this.doc.get(id))])).filter(([, e]) => e);
         const dirty = new Map(entries);

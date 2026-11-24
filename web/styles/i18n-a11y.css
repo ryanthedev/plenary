@@ -65,15 +65,6 @@ select:focus-visible,
   left: 12px;
 }
 
-[dir="rtl"] .panel .edge {
-  left: auto;
-  right: -3px;
-}
-
-[dir="rtl"] .panel-head {
-  justify-content: flex-start;
-}
-
 [dir="rtl"] .hud-rail {
   flex-direction: row;
   padding-inline-start: calc(12px + env(safe-area-inset-right));
@@ -84,16 +75,11 @@ select:focus-visible,
   direction: rtl;
 }
 
-[dir="rtl"] .radial-hub-trigger.on {
-  transform: rotate(-45deg) scale(1.04);
-}
-
 /* ── High-contrast user preference ── */
 @media (prefers-contrast: more) {
   .island,
   .drawer,
-  .panel,
-  .radial-hub-trigger {
+  .panel {
     border-color: var(--border-strong);
     background: var(--surface);
     backdrop-filter: none;
@@ -123,10 +109,5 @@ select:focus-visible,
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
-  }
-
-  .radial-hub-trigger:hover,
-  .radial-hub-trigger.on {
-    transform: none;
   }
 }

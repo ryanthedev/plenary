@@ -1,32 +1,44 @@
 // @ts-check
-// The canvas page's chrome: a driving adapter over the DOM (it calls into the core; it implements no port). Draws the verified
-// mock, paints through ./paint.js, feeds input to the core session (web/core/session.js), and
-// keeps UI preferences in the storage port it is given. Every write goes through session.act/setTool/key; nothing
-// here touches the protocol, a transport or sign-in (web/main.js, the composition root, wires those).
+/**
+ * @module web/adapters/dom/app
+ * Canvas board DOM adapter: wires the core `Session` (`web/core/session.js`), Canvas2D renderer
+ * (`./paint.js`), collaboration overlay (`./collab/ui.js`), inspector ribbon (`./panel.js`),
+ * importers (`./importers.js`), board dialogs (`./board-dialogs.js`), and responsive mobile dock/sheets.
+ *
+ * Every mutation goes through `session.act` / `setTool` / `key`; nothing here touches the
+ * wire protocol, transport, or authentication (`web/main.js`, the composition root, wires those).
+ */
 
 import { captureFocus, restoreFocus } from "./focus.js";
 import { trapFocus, hasActiveOverlay } from "./a11y.js";
-import { Editor } from "../../../packages/core/editor.js";
 import { parsePanel, serializePanel, applyPanel, panelLayout, dragWidth, panelSections } from "../../../packages/core/panel.js";
-import { isMermaid } from "../../../packages/core/mermaid.js";
-import { isLabel, layerOf, BASE_LAYER } from "../../../packages/core/model.js";
+import { isLabel, layerOf } from "../../../packages/core/model.js";
 import { listNamedFrames, viewsOf, addView, deleteView, resolveLocalLayers, captureCurrentView, stepViewIndex } from "../../../packages/core/views.js";
-import { parseLinkCardUrl, parseLinkCardFromElement, isPointInLinkCardOpenAction } from "../../../packages/core/link-card.js";
-import { parseEmbedUrl, parseEmbedFromElement, embedPlayButtonRect } from "../../../packages/core/embed.js";
+import { parseLinkCardUrl, parseLinkCardFromElement } from "../../../packages/core/link-card.js";
+import { parseEmbedFromElement, embedPlayButtonRect } from "../../../packages/core/embed.js";
 import { buildTemplateScene, getTemplate } from "../../../packages/core/templates.js";
-import { parseLibrary } from "../../../packages/core/library.js";
-import { parseExcalidraw, MAX_EXCALIDRAW_INPUT_BYTES } from "../../../packages/core/excalidraw.js";
-import { isDrawio, parseDrawio, MAX_DRAWIO_BYTES } from "../../../packages/core/drawio.js";
 import { buildTableElements } from "../../../packages/core/metadata.js";
 import { paint, imageCache, THEMES, color as safeColor, cappedDpr } from "./paint.js";
+import { applyThemeToDom, prefersDarkScheme } from "./theme.js";
+import { RASTER, VIDEO_MIME, createImporters } from "./importers.js";
+import { createBoardDialogs } from "./board-dialogs.js";
+import { restoreVersionSnapshot } from "./version-restore.js";
+import { createFocusRestorer } from "./focus-restore.js";
 import { toolsFor, pillFor, pillTitleFor, connectionBanner, expiryNotice, shouldProbe, RESUME_PROBE_MS } from "../../core/roles.js";
 
-/** The resume probe's jitter window (ms) for a page role (uiRole: presenter | annotator | viewer; null = not known yet). */
+/**
+ * Resume-probe jitter windows (ms) keyed by role class (`presenter` reconnects fast; `other` spreads waves).
+ * @type {Readonly<{ presenter: number, other: number }>}
+ */
 export const PROBE_JITTER_MS = Object.freeze({ presenter: 2000, other: 15_000 });
+/**
+ * Return the resume-probe jitter window (ms) for `role` (`"presenter"` | `"annotator"` | `"viewer"` | null).
+ * @param {string | null | undefined} role
+ * @returns {number}
+ */
 export const probeJitterMs = role => (role === "presenter" ? PROBE_JITTER_MS.presenter : PROBE_JITTER_MS.other);
-import { renderPanel, availableFor, loadLibrary, saveLibrary, addToLibrary, propsModel } from "./panel.js";
+import { renderPanel, availableFor, loadLibrary, saveLibrary, propsModel } from "./panel.js";
 import { shouldExpandRibbon } from "../../core/ribbon.js";
-import { exportSvg, exportExcalidraw, paintPng, loadPictures, buildPrintHtml } from "./export.js";
 import { h, $, replace } from "./dom.js";
 import { mountShareDialog } from "./admin.js";
 import { icon } from "./icons.js";
@@ -48,6 +60,7 @@ import { createLongPressTracker, buildMobileSelectionActions, renderSelectionAct
 import { createViewsMenu } from "./views-menu.js";
 import { createSettingsDialog } from "./settings-dialog.js";
 import { createVersionsDialog } from "./versions-dialog.js";
+import { openHelpDialog, closeHelpDialog, isHelpDialogOpen } from "./help-dialog.js";
 import {
   loadSettings,
   saveSettings,
@@ -64,12 +77,21 @@ import { hitTest, toLocal } from "../../../packages/core/geometry.js";
 const RAW_BOARD_ID_RE = /^(?:b-[a-z0-9]{8,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const CONTROL_BIDI_RE = /[\p{Cc}\u2028\u2029\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/gu;
 
-/** Return true if `id` looks like a raw generated board identifier (e.g. `b-z7r15i5cc4rk28d9`). */
+/**
+ * Return true if `id` looks like a raw generated board identifier (e.g. `b-z7r15i5cc4rk28d9`).
+ * @param {unknown} id
+ * @returns {boolean}
+ */
 export function isRawBoardId(id) {
   return typeof id === "string" && RAW_BOARD_ID_RE.test(id.trim());
 }
 
-/** Resolve the user-facing board title, never showing a raw generated ID when untitled. */
+/**
+ * Resolve the user-facing board title, never showing a raw generated ID when untitled.
+ * @param {string | null | undefined} boardId
+ * @param {string | null} [customTitle]
+ * @returns {string}
+ */
 export function formatBoardTitle(boardId, customTitle = null) {
   const cleaned = typeof customTitle === "string" ? customTitle.replace(CONTROL_BIDI_RE, "").trim() : "";
   if (cleaned) return cleaned.slice(0, 200);
@@ -77,7 +99,11 @@ export function formatBoardTitle(boardId, customTitle = null) {
   return String(boardId);
 }
 
-/** Format `document.title` for the active board. */
+/**
+ * Format `document.title` for the active board.
+ * @param {string} displayTitle
+ * @returns {string}
+ */
 export function formatDocumentTitle(displayTitle) {
   return `${displayTitle || "Untitled board"} — Plenary`;
 }
@@ -111,10 +137,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const get = k => { try { return prefs.get(k); } catch { return null; } };
   const put = (k, v) => { try { prefs.set(k, v); } catch {} };
   let userSettings = loadSettings(prefs);
-  const prefersDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
   const initialTheme = theme0 === "dark" || theme0 === "light"
     ? theme0
-    : resolveTheme(userSettings.defaultTheme, prefersDark());
+    : resolveTheme(userSettings.defaultTheme, prefersDarkScheme());
   const ui = {
     theme: initialTheme,
     settings: userSettings,
@@ -205,6 +230,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
   });
   const canvas = $("#board"), ink = $("#ink"), ctx = canvas.getContext("2d");
+  const { captureOpener, restoreOpener, visibleControl } = createFocusRestorer({ isPhone, defaultFallback: canvas });
   const allFiles = () => ({ ...S.eds.notes.doc.files, ...S.eds.board.doc.files });
 
   // ── collaboration (p7-wire): the collab UI over the root's port, presence painted on its own canvas ──
@@ -268,6 +294,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     lastLocalViewId = ui.localView.activeViewId;
     lastLocalActive = resolved.active;
     if (resolved.filter) {
+      // Why: if the local solo/view filter hides the active drawing layer, remember `preLocalActiveLayer`
+      // and switch locally so new shapes don't land invisibly, and prune hidden `B.sel` items without
+      // ever mutating shared `appState.herdr.layers`.
       if (!resolved.filter(B.activeLayer)) {
         if (preLocalActiveLayer == null) preLocalActiveLayer = B.activeLayer;
         const fallback = resolved.soloLayerId ?? resolved.layers.find(l => l.effectiveVisible)?.id ?? null;
@@ -387,8 +416,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   });
   function openViewsMenu(opener = null) {
     if (viewsMenu.isOpen()) { viewsMenu.close({ restoreFocus: true }); return; }
-    const savedOpener = captureOpener(opener);
     dismissOverlays();
+    const savedOpener = captureOpener(opener);
     const btn = document.querySelector?.("[data-views-open]");
     btn?.setAttribute?.("aria-expanded", "true");
     viewsMenu.open({ opener: savedOpener });
@@ -404,7 +433,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       if (!S.penStyle) S.eds.notes.style.roughness = userSettings.roughDefault;
     }
     if (fromDialog && userSettings.defaultTheme !== prev.defaultTheme) {
-      setTheme(resolveTheme(userSettings.defaultTheme, prefersDark()));
+      setTheme(resolveTheme(userSettings.defaultTheme, prefersDarkScheme()));
     }
     chromeDirty = true;
   }
@@ -424,7 +453,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       S.eds.board.style.roughness = userSettings.roughDefault;
       if (!S.penStyle) S.eds.notes.style.roughness = userSettings.roughDefault;
       if (userSettings.defaultTheme !== prev.defaultTheme) {
-        setTheme(resolveTheme(userSettings.defaultTheme, prefersDark()));
+        setTheme(resolveTheme(userSettings.defaultTheme, prefersDarkScheme()));
       }
       chromeDirty = true;
       toast("Settings reset to defaults");
@@ -438,115 +467,12 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
    */
   function openSettingsDialog(opener = null, tab = "preferences") {
     if (settingsDialog.isOpen()) { settingsDialog.close({ restoreFocus: true }); return; }
-    const savedOpener = captureOpener(opener);
     dismissOverlays();
+    const savedOpener = captureOpener(opener);
     settingsDialog.open({ opener: savedOpener, tab });
   }
 
   // ── Board Version History & Named Snapshots (#19) ──
-  function parseSnapshotHerdr(snap) {
-    const rawApp = snap.appState;
-    if (rawApp !== undefined && (!rawApp || typeof rawApp !== "object" || Array.isArray(rawApp))) return null;
-    const rawHerdr = rawApp?.herdr;
-    if (rawHerdr !== undefined && (!rawHerdr || typeof rawHerdr !== "object" || Array.isArray(rawHerdr))) return null;
-    const herdr = rawHerdr ?? {};
-
-    let layers = [{ id: BASE_LAYER, name: "Layer 1", visible: true, locked: false }];
-    if (herdr.layers !== undefined) {
-      if (!Array.isArray(herdr.layers) || herdr.layers.length === 0) return null;
-      const seenIds = new Set();
-      const validLayers = [];
-      for (const l of herdr.layers) {
-        if (!l || typeof l !== "object" || Array.isArray(l) || typeof l.id !== "string" || !l.id.trim() || l.id.length > 64) return null;
-        if (seenIds.has(l.id)) continue;
-        seenIds.add(l.id);
-        validLayers.push({
-          id: l.id,
-          name: typeof l.name === "string" ? l.name.slice(0, 80) : "",
-          visible: l.visible !== false,
-          locked: Boolean(l.locked),
-        });
-      }
-      if (!validLayers.length) return null;
-      layers = validLayers;
-    }
-
-    let views = [];
-    if (herdr.views !== undefined) {
-      if (!Array.isArray(herdr.views) || herdr.views.some(v => !v || typeof v !== "object" || Array.isArray(v))) return null;
-      views = JSON.parse(JSON.stringify(herdr.views));
-    }
-
-    let timeline = null;
-    if (herdr.timeline !== undefined && herdr.timeline !== null) {
-      if (typeof herdr.timeline !== "object" || Array.isArray(herdr.timeline)) return null;
-      timeline = JSON.parse(JSON.stringify(herdr.timeline));
-    }
-
-    let grid = 0;
-    if (herdr.grid !== undefined) {
-      if (typeof herdr.grid !== "number" || !Number.isFinite(herdr.grid) || herdr.grid < 0) return null;
-      grid = herdr.grid;
-    }
-
-    return { layers, views, timeline, grid };
-  }
-  function restoreVersionSnapshot(version) {
-    if (S.role !== "presenter" || !S.may()) return false;
-    const snap = version?.snapshot;
-    if (!snap || typeof snap !== "object" || Array.isArray(snap) || !Array.isArray(snap.elements)) return false;
-    const herdrPatch = parseSnapshotHerdr(snap);
-    if (!herdrPatch) return false;
-    const restoredById = new Map();
-    for (const raw of snap.elements) {
-      if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.id !== "string" || !raw.id || typeof raw.type !== "string" || raw.isDeleted) continue;
-      restoredById.set(raw.id, raw);
-    }
-    const files = snap.files && typeof snap.files === "object" && !Array.isArray(snap.files) && Object.keys(snap.files).length
-      ? snap.files
-      : undefined;
-    let applied = false;
-    S.act("board", ed => {
-      const ok = Boolean(ed.transact(tx => {
-        for (const liveEl of ed.doc.live()) {
-          if (!restoredById.has(liveEl.id)) {
-            const c = tx.get(liveEl.id);
-            if (c) c.isDeleted = true;
-          }
-        }
-        for (const [id, raw] of restoredById) {
-          const existing = ed.doc.getAny(id);
-          if (existing) {
-            const c = tx.get(id);
-            if (!c) continue;
-            const maxVer = Math.max(c.version ?? 0, Number.isFinite(raw.version) ? raw.version : 0);
-            for (const k of Object.keys(c)) delete c[k];
-            Object.assign(c, JSON.parse(JSON.stringify(raw)));
-            c.isDeleted = false;
-            c.version = maxVer;
-          } else {
-            const next = JSON.parse(JSON.stringify(raw));
-            next.isDeleted = false;
-            tx.add(next);
-          }
-        }
-        return true;
-      }, files ? { files } : undefined));
-      if (ok) {
-        applied = true;
-      }
-    });
-    if (!applied) return false;
-    S.act("board", ed => {
-      ed.setAppState(herdrPatch);
-      ed.fixLayer();
-      ed.select([]);
-    }, { settings: true });
-    dirty = true;
-    chromeDirty = true;
-    toast(`Restored version: ${version.label}`, 2200);
-    return true;
-  }
   const versionsDialog = versions
     ? createVersionsDialog({
       host: document.body,
@@ -556,7 +482,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       clock,
       canWrite: () => S.role === "presenter" && S.may(),
       getSnapshot: () => S.eds.board.doc.toScene(),
-      onRestore: restoreVersionSnapshot,
+      onRestore: version => restoreVersionSnapshot(version, { S, toast, onDirty: () => { dirty = true; chromeDirty = true; } }),
       onToast: (msg, ms) => toast(msg, ms),
       onRestoreFocus: saved => restoreOpener(saved, visibleControl([".header-more", "[data-dock-more]"]) ?? canvas),
     })
@@ -564,9 +490,23 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function openVersionsDialog(opener = null) {
     if (!versionsDialog) return;
     if (versionsDialog.isOpen()) { versionsDialog.close({ restoreFocus: true }); return; }
-    const savedOpener = captureOpener(opener);
     dismissOverlays();
+    const savedOpener = captureOpener(opener);
     versionsDialog.open({ opener: savedOpener });
+  }
+  function openHelp(opener = null) {
+    if (isHelpDialogOpen(document)) {
+      closeHelpDialog({ doc: document, restoreFocus: true });
+      return;
+    }
+    dismissOverlays();
+    const savedOpener = captureOpener(opener);
+    openHelpDialog({
+      opener: savedOpener,
+      doc: document,
+      userSettings,
+      onRestoreFocus: saved => restoreOpener(saved, visibleControl([".header-more", "[data-dock-more]"]) ?? canvas),
+    });
   }
 
   // ── Deep Links to Frame / Element / View (#22) ──
@@ -1073,6 +1013,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   );
   const isSlider = el => matchUp(el, x => attrOf(x, "role") === "slider");
 
+  // Coexist `#dialogs` (mermaid/embed/export/share) with `document.body`-mounted modals
+  // (`help-dialog.js`, `views-menu.js`, `settings-dialog.js`, `versions-dialog.js`, `move.js`) via `a11y.js`.
   const hasOpenDialog = () => Boolean($("#dialogs")?.childNodes?.length) || hasActiveOverlay();
 
   document.addEventListener("keydown", e => {
@@ -1090,6 +1032,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       settingsDialog.close({ restoreFocus: true });
       return;
     }
+    // Why: `?` close-toggle runs before `hasOpenDialog()` so an open Help modal can toggle itself
+    // closed even though its own `trapFocus` overlay makes `hasOpenDialog()` return `true`.
+    if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey && !isEditable(t) && isHelpDialogOpen(document)) {
+      e.preventDefault(); e.stopPropagation?.();
+      closeHelpDialog({ doc: document, restoreFocus: true });
+      return;
+    }
     if (hasOpenDialog() || isEditable(t) || inDialog(t) || isSlider(t)) return;   // inputs, dialogs, sliders keep their keys
     if (e.key === "Escape" && ui.colorPicker && !isPhone()) {
       e.preventDefault(); e.stopPropagation?.();
@@ -1098,7 +1047,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       chromeDirty = true;
       return;
     }
-    if (e.key === "Escape" && ui.workspaceMode === "present" && !ui.sheet && !ui.moreOpen && !viewsMenu.isOpen() && !settingsDialog.isOpen() && !versionsDialog?.isOpen()) {
+    if (e.key === "Escape" && ui.workspaceMode === "present" && !ui.sheet && !ui.moreOpen && !viewsMenu.isOpen() && !settingsDialog.isOpen() && !versionsDialog?.isOpen() && !isHelpDialogOpen(document)) {
       e.preventDefault(); e.stopPropagation?.();
       setWorkspaceMode("draw");
       return;
@@ -1143,6 +1092,11 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (resolved?.kind === "unbound") {
       return;
     }
+    if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault(); e.stopPropagation?.();
+      openHelp();
+      return;
+    }
 
     if (!m.cmd && !m.ctrl && !m.alt && !m.shift && (e.key === "[" || e.key === "]")) {
       const hasSel = (activeEditor()?.sel?.size ?? 0) > 0;
@@ -1162,6 +1116,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const t = e?.target ?? document.activeElement;
     if (hasOpenDialog() || isEditable(t) || inDialog(t)) return false;
     if (document.activeElement && (isEditable(document.activeElement) || inDialog(document.activeElement))) return false;
+    // Why: only let a non-empty browser text selection block copy/cut when focus is outside `#board`
+    // (preserving native text copying in the Notes/Comments drawer without blocking canvas copy).
     if (checkSelection && document.activeElement !== canvas && hasSelection()) return false;
     return true;
   };
@@ -1264,221 +1220,16 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
   }
 
-  // Pictures, videos and libraries: drop, paste, the Image tool's picker.
-  const RASTER = /^image\/(png|jpeg|gif|webp)$/;
-  const VIDEO_MIME = /^video\/(mp4|webm|quicktime)$/;
-  const MAX_VIDEO_BYTES = 50 * 1024 * 1024;
-  async function addPicture(file, at) {
-    if (!S.may()) return;
-    if (!RASTER.test(file.type)) return toast("Pictures: PNG, JPEG, GIF or WebP");
-    if (file.size > 10 * 1024 * 1024) return toast("Pictures are limited to 10 MB");
-    const buf = await file.arrayBuffer();
-    const id = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map(b => b.toString(16).padStart(2, "0")).join("");
-    const dataURL = await new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => res(null); r.readAsDataURL(file); });
-    if (!dataURL) return toast("That picture couldn't be read");
-    const img = await new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = dataURL; });
-    if (!img) return toast("That picture couldn't be read");
-    if (!S.may()) return;
-    const f = { id, mimeType: file.type, dataURL, width: img.naturalWidth, height: img.naturalHeight };
-    if (typeof net.uploadBlob === "function") {
-      try { await S.uploadBlob(id, new Uint8Array(buf), file.type); }
-      catch { return toast("Picture upload failed"); }
-      if (!S.may()) return;
-      S.addPicture(f, at);
-    } else if (S.addPicture(f, at)) {
-      net.put(f);          // upload through a signed URL (wsNet), or the dev tab relay
-    }
-    chromeDirty = true;
-  }
-  async function probeVideoMeta(url) {
-    return new Promise(res => {
-      if (typeof document?.createElement !== "function") return res({ width: 480, height: 270 });
-      const v = document.createElement("video");
-      let settled = false;
-      const done = meta => { if (settled) return; settled = true; try { v.removeAttribute?.("src"); v.src = ""; } catch {} res(meta); };
-      const timer = clock.set(() => done({ width: 480, height: 270 }), 3000);
-      v.preload = "metadata";
-      v.muted = true;
-      v.playsInline = true;
-      v.onloadedmetadata = () => { clock.clear(timer); done({ width: v.videoWidth || 480, height: v.videoHeight || 270 }); };
-      v.onerror = () => { clock.clear(timer); done({ width: 480, height: 270 }); };
-      v.src = url;
-    });
-  }
-  async function addVideoFile(file, at) {
-    if (!S.may()) return;
-    if (!VIDEO_MIME.test(file.type)) return toast("Videos: MP4, WebM or QuickTime");
-    if (file.size > MAX_VIDEO_BYTES) return toast("Videos are limited to 50 MB");
-    const buf = await file.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    const id = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map(b => b.toString(16).padStart(2, "0")).join("");
-    let meta = { width: 480, height: 270 };
-    if (typeof URL?.createObjectURL === "function") {
-      const probeUrl = URL.createObjectURL(file);
-      try { meta = await probeVideoMeta(probeUrl); }
-      finally { try { URL.revokeObjectURL?.(probeUrl); } catch {} }
-    }
-    if (!S.may()) return;
-    const f = { id, mimeType: file.type, bytes, width: meta.width, height: meta.height };
-    if (typeof net.uploadBlob === "function") {
-      try { await S.uploadBlob(id, bytes, file.type); }
-      catch { return toast("Video upload failed"); }
-      if (!S.may()) return;
-      S.addVideo(f, at);
-    } else if (S.addVideo(f, at)) {
-      net.put(/** @type {any} */ (f));          // local / shared-worker tab relay
-    }
-    chromeDirty = true;
-  }
-  function decodeDataUrlBytes(dataURL) {
-    const comma = dataURL.indexOf(",");
-    if (comma < 0) return null;
-    const b64 = dataURL.slice(comma + 1).replace(/\s+/g, "");
-    try {
-      const bin = atob(b64);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    } catch {
-      return null;
-    }
-  }
-  async function prepareExcalidrawFiles(files) {
-    const fileIdMap = new Map();
-    const outFiles = {};
-    for (const [origId, entry] of Object.entries(files ?? {})) {
-      if (!entry || typeof entry.dataURL !== "string") {
-        if (entry && entry.mimeType) outFiles[origId] = entry;
-        continue;
-      }
-      const bytes = decodeDataUrlBytes(entry.dataURL);
-      if (!bytes || !bytes.length || bytes.length > 10 * 1024 * 1024) continue;
-      const sha1 = [...new Uint8Array(await crypto.subtle.digest("SHA-1", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
-      fileIdMap.set(origId, sha1);
-      const next = { id: sha1, mimeType: entry.mimeType || "image/png", dataURL: entry.dataURL, created: entry.created ?? clock.now() };
-      outFiles[sha1] = next;
-      if (RASTER.test(next.mimeType)) {
-        if (typeof net.uploadBlob === "function") {
-          await S.uploadBlob(sha1, bytes, next.mimeType);
-        } else {
-          net.put?.(next);
-        }
-      }
-    }
-    return { fileIdMap, files: outFiles };
-  }
-  /**
-   * @param {any} parsed
-   * @param {{ at?: any, label?: string | null, fitIfNeeded?: boolean, silent?: boolean }} [opts]
-   */
-  async function importExcalidrawParsed(parsed, { at, label = null, fitIfNeeded = false, silent = false } = {}) {
-    if (!S.may()) return false;
-    if (!parsed.ok) {
-      if (!silent) toast("That isn't a valid .excalidraw file");
-      return false;
-    }
-    if (!parsed.elements.length) {
-      if (!silent) toast("No elements in that .excalidraw file");
-      return false;
-    }
-    const hasImageData = Object.values(parsed.files).some(f => typeof f?.dataURL === "string");
-    let fileIdMap = null, files = parsed.files;
-    if (hasImageData) {
-      try {
-        const prepared = await prepareExcalidrawFiles(parsed.files);
-        fileIdMap = prepared.fileIdMap;
-        files = prepared.files;
-      } catch {
-        toast("Import failed: picture upload failed");
-        return false;
-      }
-      if (!S.may()) return false;
-    }
-    const stream = S.role === "presenter" ? S.active : "notes";
-    let ids = [];
-    S.act(stream, ed => {
-      ids = ed.importExcalidraw({ ...parsed, files }, at, { fileIdMap, fitIfNeeded, dropNonSha1: true });
-    });
-    chromeDirty = true;
-    if (!silent && ids.length) {
-      const n = parsed.elements.filter(e => !isLabel(e)).length || ids.length;
-      const from = label ? ` from ${label}` : "";
-      toast(`Imported ${n} element${n === 1 ? "" : "s"}${from}`);
-    }
-    return ids.length > 0;
-  }
-  function pasteText(text, at) {
-    // Cheap string pre-check avoids double-parsing JSON on clipboard paste.
-    if (typeof text === "string" && text.length <= MAX_EXCALIDRAW_INPUT_BYTES && text.trimStart().startsWith("{") && text.includes('"excalidraw')) {
-      const parsed = parseExcalidraw(text, { now: clock.now() });
-      if (parsed.ok) {
-        const hasImageData = Object.values(parsed.files).some(f => typeof f?.dataURL === "string");
-        if (hasImageData) return importExcalidrawParsed(parsed, { at, fitIfNeeded: false, silent: true });
-        if (parsed.elements.length) {
-          const stream = S.role === "presenter" ? S.active : "notes";
-          S.act(stream, ed => ed.importExcalidraw(parsed, at, { fitIfNeeded: false, dropNonSha1: true }));
-          chromeDirty = true;
-          return true;
-        }
-        return false;
-      }
-    }
-    S.paste(text, at);
-    chromeDirty = true;
-    return true;
-  }
-  async function addExcalidrawFile(file, at) {
-    if (!S.may()) return;
-    if (file.size > MAX_EXCALIDRAW_INPUT_BYTES) return toast("That .excalidraw file is too large (max 50 MB)");
-    try {
-      const text = await file.text();
-      const parsed = parseExcalidraw(text, { now: clock.now() });
-      await importExcalidrawParsed(parsed, { at, label: file.name || "Excalidraw", fitIfNeeded: !at, silent: false });
-    } catch {
-      toast("That isn't a valid .excalidraw file");
-    }
-  }
-  async function addDrawioFile(file, at) {
-    if (!S.may()) return false;
-    if (file.size > MAX_DRAWIO_BYTES) { toast("That .drawio file is too large (max 10 MB)"); return false; }
-    try {
-      const text = await file.text();
-      if (!isDrawio(text)) { toast("That isn't a valid .drawio file"); return false; }
-      const parsed = parseDrawio(text, { now: clock.now() });
-      if (!parsed.ok) { toast(parsed.error || "That isn't a valid .drawio file"); return false; }
-      if (!parsed.elements.length) { toast("No elements in that .drawio file"); return false; }
-      if (!S.may()) return false;
-      const stream = S.role === "presenter" ? S.active : "notes";
-      let ids = [];
-      S.act(stream, ed => {
-        ids = ed.insertElements(parsed.elements, {}, at);
-      });
-      chromeDirty = true;
-      if (ids.length) {
-        const n = parsed.elements.filter(e => !isLabel(e)).length || ids.length;
-        const from = file.name ? ` from ${file.name}` : "";
-        toast(`Imported ${n} element${n === 1 ? "" : "s"}${from}`);
-        return true;
-      }
-      return false;
-    } catch {
-      toast("That isn't a valid .drawio file");
-      return false;
-    }
-  }
-  async function addLibraryFile(file) {
-    try { const items = parseLibrary(await file.text()); if (!items.length) return toast("No library items in that file"); setLibrary(addToLibrary(ui.library, items)); toast(`Library: ${items.length} added`); }
-    catch { toast("That isn't an .excalidrawlib file"); }
-  }
-  function takeFiles(files, at) {
-    for (const f of files) {
-      if (/\.(drawio|xml)$/i.test(f.name)) addDrawioFile(f, at);
-      else if (/\.(excalidraw|json)$/i.test(f.name)) addExcalidrawFile(f, at);
-      else if (/\.excalidrawlib$/i.test(f.name)) addLibraryFile(f);
-      else if (f.type?.startsWith("video/")) addVideoFile(f, at);
-      else addPicture(f, at);
-    }
-  }
+  // Pictures, videos, diagrams and libraries: drop, paste, the Image tool's picker.
+  const { addPicture, addVideoFile, pasteText, takeFiles } = createImporters({
+    S,
+    net,
+    clock,
+    toast,
+    getLibrary: () => ui.library,
+    setLibrary,
+    onDirty: () => { chromeDirty = true; },
+  });
   const picker = $("#picker");
   function openPicker() { if (S.may()) picker.click(); }
   picker.addEventListener("change", () => { takeFiles([...picker.files]); picker.value = ""; if (S.tool === "image") S.setTool("select"); });
@@ -1557,17 +1308,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   }
   const setPanel = op => { const n = applyPanel(ui.panel, op); if (n !== ui.panel) { ui.panel = n; put("plenary.panel", serializePanel(n)); if (!n.open) cancelActiveSampler(); } chromeDirty = true; };
   function setLibrary(items) { ui.library = items; saveLibrary(prefs, items); chromeDirty = true; }
-  const THEME_COLORS = { light: "#F8F7F4", dark: "#111113" };
   const setTheme = t => {
-    ui.theme = t;
-    document.documentElement.dataset.theme = t;
-    const meta = document.querySelector?.('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", THEME_COLORS[t] ?? THEME_COLORS.light);
+    ui.theme = applyThemeToDom(t);
     dirty = true;
     chromeDirty = true;
-    collab?.setTheme(t);
+    collab?.setTheme(ui.theme);
   };
-  let activeShare = null, dialogTrap = null, dialogOpener = null, sheetTrap = null, sheetTrapKind = null, sheetOpener = null, sheetBackdropEl = null, dialogRebuilding = false, sheetHistoryPushed = false;
+  let activeShare = null, dialogOpener = null, sheetTrap = null, sheetTrapKind = null, sheetOpener = null, sheetBackdropEl = null, sheetHistoryPushed = false;
   function pushSheetHistory(name) {
     const hist = globalThis.history;
     if (!hist || typeof hist.pushState !== "function") return;
@@ -1590,60 +1337,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (!hasState || hist.state?.plenarySheet) {
       try { hist.back(); } catch {}
     }
-  }
-  function isVisibleControl(el) {
-    if (!el || el.hidden || el.disabled) return false;
-    if (el.getAttribute?.("aria-hidden") === "true") return false;
-    if (el.style?.display === "none" || el.style?.visibility === "hidden") return false;
-    if ("offsetParent" in el && el.offsetParent === null) return false;
-    if (isPhone() && (el.classList?.contains("header-more") || el.classList?.contains("desk-only"))) return false;
-    if (!isPhone() && el.classList?.contains("phone-only")) return false;
-    return true;
-  }
-  function captureOpener(el) {
-    const target = el ?? document.activeElement ?? null;
-    if (!target) return null;
-    const rootId = $("#dock")?.contains?.(target) ? "dock"
-      : $("#topbar")?.contains?.(target) ? "topbar"
-      : $("#hudBL")?.contains?.(target) ? "hudBL"
-      : null;
-    return {
-      el: target,
-      label: target.getAttribute?.("aria-label") ?? null,
-      rootId,
-      dockMore: Boolean(target.getAttribute?.("data-dock-more")),
-    };
-  }
-  function findByAriaLabel(label, preferredRootId = null) {
-    if (!label) return null;
-    const visit = node => {
-      for (const child of node?.children ?? []) {
-        if (child.getAttribute?.("aria-label") === label && isVisibleControl(child)) return child;
-        const found = visit(child);
-        if (found) return found;
-      }
-      return null;
-    };
-    const roots = [];
-    if (preferredRootId) roots.push($(`#${preferredRootId}`));
-    if (isPhone()) roots.push($("#dock"), $("#topbar"), document.body);
-    else roots.push($("#topbar"), $("#dock"), document.body);
-    for (const r of roots) {
-      if (!r) continue;
-      const hit = visit(r);
-      if (hit) return hit;
-    }
-    return null;
-  }
-  function restoreOpener(saved, fallback = canvas) {
-    if (saved?.el && saved.el.isConnected !== false && isVisibleControl(saved.el)) { saved.el.focus?.(); return; }
-    if (saved?.dockMore) {
-      const dockMore = /** @type {HTMLElement | null} */ (document.querySelector?.("[data-dock-more]"));
-      if (dockMore && isVisibleControl(dockMore)) { dockMore.focus?.(); return; }
-    }
-    const twin = findByAriaLabel(saved?.label, saved?.rootId ?? null);
-    if (twin) { twin.focus?.(); return; }
-    fallback?.focus?.();
   }
   function ensureSheetBackdrop() {
     if (sheetBackdropEl && sheetBackdropEl.parentNode) return sheetBackdropEl;
@@ -1668,6 +1361,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     viewsMenu.close({ restoreFocus: false });
     settingsDialog.close({ restoreFocus: false });
     versionsDialog?.close({ restoreFocus: false });
+    closeHelpDialog({ doc: document, restoreFocus: false });
     if (ui.moreOpen) closeMoreMenuNow();
     if (why.isOpen()) why.close(false);
     if (!keepSheet && !isPhone() && ui.colorPicker) {
@@ -1687,11 +1381,13 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     }
     if (!keepDialog) {
       if (activeShare) { activeShare.destroy(); activeShare = null; }
-      if (ui.dialog) {
+      if (ui.dialog || $("#dialogs")?.childNodes?.length) {
         ui.dialog = null;
-        dialogTrap?.deactivate({ restoreFocus: false });
-        dialogTrap = null;
+        // Why: clear `#dialogs` synchronously and mark `chromeDirty` so an external dismissal
+        // never leaves orphaned modal DOM wedging `hasOpenDialog()` when `chrome()` short-circuits.
+        boardDialogs.deactivate();
         dialogOpener = null;
+        chromeDirty = true;
       }
     }
   }
@@ -1723,7 +1419,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     ui.dialog = d;
     chromeDirty = true;
   }
-  const keyLabel = t => (t.keys?.length ? t.keys.map(k => k.toUpperCase()).join(" ") : "");
   const activeStream = () => (S.role === "annotator" ? "notes" : S.active);
   const activeEditor = () => S.eds[activeStream()];
   const undoRedoState = () => {
@@ -1779,7 +1474,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     else if (S.canMove !== true && moveWelcomed) { moveWelcomed = false; moveInfo.space = null; chromeDirty = true; }
   };
   // Escape and Cancel return focus to a control that is on screen at this width (the chrome is rebuilt meanwhile): the Move or Share button, else the More button.
-  const visibleControl = sel => { const c = sel.map(q => document.querySelector(q)); return c.find(e => e && isVisibleControl(e)) ?? c.find(Boolean); };
   const moveOpener = { focus() { (visibleControl(["[data-move-open]", ".header-more", "[data-dock-more]"]) ?? canvas)?.focus?.(); } };
   const openMoveDialog = () => { dismissOverlays(); chromeDirty = true; startMove({ host: document.body, move, board, opener: moveOpener, reload: refreshMove, restoreFocus: () => canvas.focus?.() }); };
   booted = true; syncMove();
@@ -2002,6 +1696,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       role === "presenter" ? boardMenuItem("grid", "Toggle grid", "Snap to grid", toggleGrid, { disabled: !may, kbd: formatCombo(effKeys["action.grid"]), badge: gridOn ? "On" : "", on: gridOn }) : null,
       role !== "viewer" ? boardMenuItem("panel", "Side panel", "Side panel", togglePanel, { kbd: formatCombo(effKeys["action.panel"]), badge: ui.panel.open ? "On" : "", on: ui.panel.open }) : null,
       boardMenuItem("settings", "Settings & keybindings", "Settings & keybindings…", () => openSettingsDialog(), { kbd: formatCombo(effKeys["action.settings"]) }),
+      boardMenuItem("help", "Help & shortcuts", "Help & shortcuts…", () => openHelp(), { kbd: "?" }),
     ]);
     const collabSection = menuSection("Collaborate", [
       boardMenuItem("note", "Notes", "Notes", toggleNotes, { badge: String(notesCount()), on: ui.drawer === "notes" }),
@@ -2624,6 +2319,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
         versions ? h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Version history", onclick: () => { setSheet(null, { restore: false }); openVersionsDialog(); } }, h("span.ic", {}, icon("history", { size: 20 })), "Versions") : null,
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Jump to frame or view", onclick: () => { setSheet(null, { restore: false }); openViewsMenu(); } }, h("span.ic", {}, icon("frame", { size: 20 })), "Views"),
         h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Settings & keybindings", onclick: () => { setSheet(null, { restore: false }); openSettingsDialog(); } }, h("span.ic", {}, icon("settings", { size: 20 })), "Settings"),
+        h("button.tb", { "aria-haspopup": "dialog", "aria-label": "Help & shortcuts", onclick: () => { setSheet(null, { restore: false }); openHelp(); } }, h("span.ic", {}, icon("help", { size: 20 })), "Help"),
         S.role !== "viewer" ? h("button.tb" + (S.toolLock() ? ".on" : ""), { disabled: !may, "aria-pressed": String(S.toolLock()), onclick: () => { S.toggleLock(); chromeDirty = true; } }, h("span.ic", {}, icon(S.toolLock() ? "lock" : "unlock", { size: 20 })), "Lock tool") : null,
         h("button.tb", { "aria-label": "Toggle color theme", title: "Light / dark", "aria-pressed": String(ui.theme === "dark"), onclick: () => { const next = ui.theme === "dark" ? "light" : "dark"; setTheme(next); applyUserSettings({ ...userSettings, defaultTheme: next }); } }, h("span.ic", {}, icon(ui.theme === "dark" ? "sun" : "moon", { size: 20 })), ui.theme === "dark" ? "Light" : "Dark"),
         onLogout ? h("button.tb", { "aria-label": "Sign out", title: "Sign out", "data-action": "logout", onclick: () => { setSheet(null, { restore: false }); onLogout(); } }, h("span.ic", {}, icon("logout", { size: 20 })), "Sign out") : null));
@@ -2769,207 +2465,29 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     onChange: () => { chromeDirty = true; },
   });
 
-  // Mermaid preview: import into a scratch Editor (never bound to the room) and paint it small.
-  function mermaidPreview(cv) {
-    const x = cv.getContext("2d"), theme = THEMES[ui.theme], scratch = new Editor();
-    scratch.setSize(cv.width, cv.height);
-    try { if (!isMermaid(ui.mermaid.src)) throw new Error("Not a Mermaid flowchart (start with flowchart or graph)"); scratch.importMermaid(ui.mermaid.src, undefined, { elbow: ui.mermaid.elbow }); scratch.fit(undefined, 12, { animate: false }); scratch.select([]); }
-    catch (e) { paint(x, [], { width: cv.width, height: cv.height, background: theme.bg }); x.fillStyle = theme.dim; x.font = "12px system-ui"; x.fillText(String(e.message ?? e).slice(0, 60), 10, 20); return false; }
-    paint(x, scratch.displayList(theme), { width: cv.width, height: cv.height, background: theme.bg });
-    return true;
-  }
-  function exportPreview(cv) {
-    const { page, scale, frameId } = ui.export;
-    const frames = listNamedFrames(S.eds.board.doc);
-    const activeFrameId = frameId && frames.some(f => f.id === frameId) ? frameId : undefined;
-    const tmp = document.createElement("canvas");
-    paintPng(S.eds.board.doc, tmp, { page, theme: ui.theme, scale: 1, loadImage: image, ...(activeFrameId ? { frameId: activeFrameId } : {}) });
-    cv.width = tmp.width; cv.height = tmp.height; cv.getContext("2d").drawImage(tmp, 0, 0);
-    return scale;
-  }
-  async function download() {
-    const { format, scale, page, frameId: rawFrameId } = ui.export, doc = S.eds.board.doc;
-    const frames = listNamedFrames(doc);
-    const activeFrame = rawFrameId ? (frames.find(f => f.id === rawFrameId) ?? null) : null;
-    const frameId = activeFrame?.id;
-    if (format === "pdf") {
-      const title = activeFrame ? `${displayBoardTitle()} — ${activeFrame.name}` : displayBoardTitle();
-      const html = buildPrintHtml(doc, { theme: ui.theme, page, frameIds: frameId ? [frameId] : null, title });
-      const opener = globalThis.window?.open ?? globalThis.open;
-      const win = typeof opener === "function" ? opener.call(globalThis.window ?? globalThis, "", "_blank") : null;
-      if (win && win.document && typeof win.document.write === "function") {
-        try { win.opener = null; } catch {}
-        win.document.open?.();
-        win.document.write(html);
-        win.document.close?.();
-        win.focus?.();
-        if (typeof win.print === "function") clock.set(() => { try { win.print(); } catch {} }, 150);
-      } else {
-        const blob = new Blob([html], { type: "text/html;charset=utf-8" });
-        const a = h("a", { href: URL.createObjectURL(blob), download: `${board}${frameId ? `-${frameId}` : ""}-print.html` });
-        document.body.append(a); a.click(); a.remove();
-        clock.set(() => URL.revokeObjectURL(a.href), 5000);
-        toast("Popup blocked — downloaded printable HTML");
-      }
-      return;
-    }
-    const name = `${board}${frameId && format !== "excalidraw" ? `-${frameId}` : ""}.${format}`;
-    let blob;
-    if (format === "excalidraw") blob = new Blob([exportExcalidraw(doc, { page, theme: ui.theme })], { type: "application/vnd.excalidraw+json" });
-    else if (format === "svg") blob = new Blob([exportSvg(doc, { page, theme: ui.theme, scale, ...(frameId ? { frameId } : {}) })], { type: "image/svg+xml" });
-    else { const cv = paintPng(doc, document.createElement("canvas"), { page, theme: ui.theme, scale, loadImage: await loadPictures(doc.files), ...(frameId ? { frameId } : {}) }); blob = await new Promise(r => cv.toBlob(r, "image/png")); }
-    const a = h("a", { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove();
-    clock.set(() => URL.revokeObjectURL(a.href), 5000);
-  }
-  // A dialog control that changes what the dialog shows (a format chip) rebuilds the dialog: remember which control had focus so chrome() puts it back.
-  function rebuildDialog(d) { pendingFocus = captureFocus(chromeRoots()); dialogRebuilding = true; d.replaceChildren(); chromeDirty = true; }
+  // `#dialogs` hosts presenter modals (mermaid/embed/export/share) while `document.body` hosts
+  // `help-dialog.js`, `views-menu.js`, `settings-dialog.js`, `versions-dialog.js`, and `move.js`;
+  // `dismissOverlays()` + `hasOpenDialog()` coordinate both via `a11y.js` without collision.
+  const boardDialogs = createBoardDialogs({
+    S,
+    ui,
+    board,
+    canvas,
+    image,
+    clock,
+    toast,
+    displayBoardTitle,
+    getDialogsContainer: () => $("#dialogs"),
+    getChromeRoots: () => chromeRoots(),
+    isShareOpen: () => Boolean(activeShare),
+    getOpener: () => dialogOpener,
+    clearOpener: () => { dialogOpener = null; },
+    restoreOpener,
+    setPendingFocus: held => { pendingFocus = held; },
+    onDirty: () => { chromeDirty = true; },
+  });
   function dialogs() {
-    if (activeShare) return;
-    const d = $("#dialogs"), may = S.may();
-    if (document.activeElement?.closest?.("#dialogs") && d.firstChild) return;   // don't rebuild under the cursor
-    const close = () => {
-      ui.dialog = null;
-      const opener = dialogOpener;
-      dialogOpener = null;
-      dialogTrap?.deactivate({ restoreFocus: false });
-      dialogTrap = null;
-      chromeDirty = true;
-      restoreOpener(opener, canvas);
-    };
-    const chip = (t, on, onclick) => h("button.c" + (on ? ".on" : ""), { "aria-pressed": String(Boolean(on)), onclick }, t);
-    const rebuilding = dialogRebuilding;
-    dialogRebuilding = false;
-    if (ui.dialog === "mermaid" && S.role === "presenter") {
-      dialogTrap?.deactivate({ restoreFocus: false });
-      const cv = h("canvas", { width: 300, height: 180 });
-      const ta = h("textarea.code", { spellcheck: false, "aria-label": "Mermaid flowchart source", value: ui.mermaid.src, oninput: e => { ui.mermaid.src = e.target.value; mermaidPreview(cv); }, onkeydown: e => { if (e.key === "Escape") { e.preventDefault?.(); close(); return; } e.stopPropagation(); } });
-      const dlg = h("div.dialog", { role: "dialog", "aria-modal": "true", "aria-labelledby": "mermaid-dialog-title", "aria-label": "Insert a Mermaid flowchart", tabindex: "-1" },
-        h("h2", { id: "mermaid-dialog-title" }, icon("mermaid", { size: 17 }), " Insert a Mermaid flowchart", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
-        h("div.dbody", {}, h("div.cols", {}, ta, h("div.preview", {}, cv)),
-          h("div.row", {}, h("span.lab", {}, "Arrows"), h("span.opts", {}, chip("straight", !ui.mermaid.elbow, () => { ui.mermaid.elbow = false; ui.dialog = "mermaid"; rebuildDialog(d); }), chip("elbow", ui.mermaid.elbow, () => { ui.mermaid.elbow = true; rebuildDialog(d); }))),
-          h("div.hint", {}, "Flowcharts only (graph / flowchart, TD TB BT LR RL, subgraphs become frames). Pasting Mermaid text on the board does the same.")),
-        h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { disabled: !may, onclick: () => {
-          let err = null;
-          S.act("board", e => { try { e.importMermaid(ui.mermaid.src, undefined, { elbow: ui.mermaid.elbow }); } catch (x) { err = x; } });
-          if (err) toast(String(err.message ?? err)); else close();
-        } }, "Insert as shapes")));
-      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
-      dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, focusOnActivate: !rebuilding });
-      mermaidPreview(cv);
-    } else if (ui.dialog === "embed" && S.role === "presenter") {
-      dialogTrap?.deactivate({ restoreFocus: false });
-      const errEl = h("div.hint", { role: "alert", hidden: !ui.embed.error, style: { color: "var(--danger, #e03131)" } }, ui.embed.error);
-      const setErr = msg => { ui.embed.error = msg; errEl.textContent = msg; errEl.hidden = !msg; };
-      const submitEmbed = () => {
-        if (!S.may()) return;
-        const parsed = parseEmbedUrl(ui.embed.url);
-        if (!parsed) {
-          setErr("Enter a valid YouTube, video (.mp4/.webm/.mov), or image (.png/.jpg/.webp/.gif) HTTPS URL.");
-          urlInput.focus?.();
-          return;
-        }
-        const ok = S.act("board", e => e.addEmbed(parsed));
-        if (!ok) return;
-        ui.embed.url = "";
-        ui.embed.error = "";
-        close();
-      };
-      const urlInput = h("input.field", {
-        type: "url",
-        "aria-label": "Embed URL",
-        placeholder: "https://youtube.com/watch?v=… or direct .mp4 / .png URL",
-        value: ui.embed.url,
-        style: { width: "100%" },
-        oninput: e => { ui.embed.url = e.target.value; if (ui.embed.error) setErr(""); },
-        onkeydown: e => {
-          if (e.key === "Escape") { e.preventDefault?.(); close(); return; }
-          if (e.key === "Enter") { e.preventDefault?.(); submitEmbed(); return; }
-          e.stopPropagation();
-        },
-      });
-      const pasteBtn = h("button.btn", {
-        type: "button",
-        "data-action": "embed-paste",
-        "aria-label": "Paste URL from clipboard",
-        onclick: async () => {
-          const clip = globalThis.navigator?.clipboard;
-          if (typeof clip?.readText !== "function") {
-            setErr("Clipboard unavailable — paste directly into the URL field.");
-            urlInput.focus?.();
-            return;
-          }
-          try {
-            const text = (await clip.readText())?.trim() ?? "";
-            if (!text) {
-              setErr("Clipboard is empty.");
-              urlInput.focus?.();
-              return;
-            }
-            ui.embed.url = text;
-            urlInput.value = text;
-            setErr("");
-            urlInput.focus?.();
-          } catch {
-            setErr("Clipboard access was denied — paste directly into the URL field.");
-            urlInput.focus?.();
-          }
-        },
-      }, icon("paste", { size: 15 }), " Paste from clipboard");
-      const dlg = h("div.dialog", { style: { width: "min(480px,100%)" }, role: "dialog", "aria-modal": "true", "aria-labelledby": "embed-dialog-title", "aria-label": "Embed URL", tabindex: "-1" },
-        h("h2", { id: "embed-dialog-title" }, icon("play", { size: 17 }), " Embed URL", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
-        h("div.dbody", {},
-          h("div.row", { style: { flexDirection: "column", alignItems: "stretch", gap: "8px" } },
-            urlInput,
-            h("div", { style: { display: "flex", gap: "8px" } }, pasteBtn)),
-          errEl,
-          h("div.hint", {}, "Supports YouTube links, direct video (.mp4, .webm, .mov), and image (.png, .jpg, .webp, .gif) HTTPS URLs. Click Play on the card to activate.")),
-        h("footer", {},
-          h("button.btn", { onclick: close }, "Cancel"),
-          h("button.btn.primary", { disabled: !may, "data-action": "embed-submit", onclick: submitEmbed }, "Embed")));
-      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
-      dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, initialFocus: urlInput, focusOnActivate: !rebuilding });
-    } else if (ui.dialog === "export" && S.role === "presenter") {
-      dialogTrap?.deactivate({ restoreFocus: false });
-      const cv = h("canvas"), x = ui.export, set = (k, v) => { x[k] = v; rebuildDialog(d); };
-      const frames = listNamedFrames(S.eds.board.doc);
-      if (x.frameId && !frames.some(f => f.id === x.frameId)) x.frameId = null;
-      const scopeSelect = frames.length && x.format !== "excalidraw"
-        ? h("select.field", {
-          "aria-label": "Export scope",
-          value: x.frameId ?? "",
-          onchange: e => set("frameId", e.target.value || null),
-        },
-        h("option", { value: "", selected: !x.frameId }, x.format === "pdf" ? `Whole board (${frames.length} frames)` : "Whole board"),
-        frames.map(f => h("option", { value: f.id, selected: x.frameId === f.id }, f.name)))
-        : null;
-      const dlg = h("div.dialog", { style: { width: "min(520px,100%)" }, role: "dialog", "aria-modal": "true", "aria-labelledby": "export-dialog-title", "aria-label": "Export the board", tabindex: "-1" },
-        h("h2", { id: "export-dialog-title" }, icon("export", { size: 17 }), " Export the board", h("span.spacer"), h("button.tb", { onclick: close, title: "Close", "aria-label": "Close" }, icon("close", { size: 16 }))),
-        h("div.dbody", {}, h("div.preview", { style: { minHeight: "120px" } }, cv),
-          h("div.row", {}, h("span.lab", {}, "Format"), h("span.opts", {},
-            chip("SVG", x.format === "svg", () => set("format", "svg")),
-            chip("PNG", x.format === "png", () => set("format", "png")),
-            chip("PDF / Print", x.format === "pdf", () => set("format", "pdf")),
-            chip(".excalidraw", x.format === "excalidraw", () => set("format", "excalidraw")))),
-          scopeSelect ? h("div.row", {}, h("span.lab", {}, "Scope"), scopeSelect) : null,
-          (x.format === "svg" || x.format === "png") ? h("div.row", {}, h("span.lab", {}, "Scale"), h("span.opts", {}, chip("1×", x.scale === 1, () => set("scale", 1)), chip("2×", x.scale === 2, () => set("scale", 2)))) : null,
-          h("div.row", {}, h("span.lab", {}, "Page"), h("span.opts", {}, chip("board color", x.page === "board", () => set("page", "board")), chip("white", x.page === "white", () => set("page", "white")))),
-          h("div.hint", {}, x.format === "excalidraw"
-            ? "Excalidraw v2 JSON with embedded images. Opens directly in excalidraw.com or Plenary."
-            : x.format === "pdf"
-              ? "Opens a print-ready landscape document (one page per frame) for Print or Save as PDF."
-              : x.frameId
-                ? "Cropped tightly to the selected frame. Notes, selection, cursors and comments never show."
-                : "The board stream only, cropped to what's drawn, 32 units of padding. Notes, selection, cursors and comments never show.")),
-        h("footer", {}, h("button.btn", { onclick: close }, "Cancel"), h("button.btn.primary", { onclick: () => { download(); close(); } }, x.format === "pdf" ? "Print / Save PDF" : "Download")));
-      replace(d, h("div.dialog-veil", { onclick: e => { if (e.target === e.currentTarget) close(); }, onkeydown: e => dialogTrap?.handleKeyDown(e) }, dlg));
-      dialogTrap = trapFocus(dlg, { onEscape: close, returnFocusTo: dialogOpener?.el ?? canvas, focusOnActivate: !rebuilding });
-      exportPreview(cv);
-    } else {
-      dialogTrap?.deactivate({ restoreFocus: false });
-      dialogTrap = null;
-      ui.dialog = null;
-      d.replaceChildren();
-    }
+    boardDialogs.render();
   }
 
   // Sign in again (C-9): a link (so it reads as one and opens in a new tab if asked), whose click remembers this
@@ -3008,6 +2526,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const CHROME_MS = 250;
   const rebuilds = ui.rebuilds = { topbar: 0, panel: 0, drawer: 0, timeline: 0, hud: 0, overlays: 0, dock: 0, sheet: 0, dialogs: 0 };
   let chromeAt = -Infinity, gateKey = "", chromeHeld = false;
+  // Why: defer chrome rebuilds between a non-canvas pointerdown and pointerup so `replace()` never
+  // detaches the pressed button before its `click` event fires.
   document.addEventListener("pointerdown", e => { if (e.target !== canvas) chromeHeld = true; }, true);
   addEventListener("pointerup", () => { chromeHeld = false; }, true);
   addEventListener("pointercancel", () => { chromeHeld = false; }, true);
@@ -3148,6 +2668,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   let pendingFocus = null;
   const chromeRoots = () => ["#topbar", "#panel", "#drawer", "#timeline", "#hudBL", "#hudBC", "#hudBR", "#dock", "#sheet", "#dialogs", "#overlays"].map(sel => $(sel)).filter(Boolean);
   function chrome() {
+    // Why: if a presenter is demoted mid-session to annotator/viewer, force back to `"draw"` and
+    // collapse the authoring timeline so they are never stranded in Present mode without exit controls.
     if ((S.role !== "presenter" || S.effective !== "presenter") && ui.workspaceMode !== "draw") {
       ui.workspaceMode = "draw";
       ui.timelineExpanded = false;
@@ -3163,7 +2685,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     const gate = [S.version(), S.status, S.pending, S.online, S.congested, S.limited, S.limitedNextTry, ticking, S.eds.board.play ? now : ""].join("|");
     if (!chromeDirty && gate === gateKey) return;
     if (chromeHeld) return;                                   // a press on the chrome: don't swap the button under it
-    if ((S.gesture || !chromeDirty) && now - chromeAt < CHROME_MS) return;   // mid-drag, playback, incoming ops: a few times a second at most
+    // Why: throttle mid-drag and incoming remote-op chrome rebuilds to CHROME_MS (250 ms), while
+    // discrete local UI clicks (`chromeDirty && !S.gesture`) bypass throttling for instant feedback.
+    if ((S.gesture || !chromeDirty) && now - chromeAt < CHROME_MS) return;
     const env = envKey(), force = chromeDirty || env !== keys.env;
     chromeDirty = false; gateKey = gate; chromeAt = now; keys.env = env;
     const held = pendingFocus ?? captureFocus(chromeRoots());
@@ -3373,8 +2897,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   function openAdminShare() {
     if (!admin) return null;
     cancelActiveSampler();
-    const savedOpener = captureOpener();
     dismissOverlays();
+    const savedOpener = captureOpener();
     activeShare = mountShareDialog({
       root: $("#dialogs"),
       board,

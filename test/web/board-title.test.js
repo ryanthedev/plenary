@@ -219,7 +219,7 @@ describe("#110 Board Menu UX (Board / View / Collaborate)", () => {
 
     const labelsIn = g => findAll(g, e => e.attrs.role === "menuitem").map(e => e.attrs["aria-label"]);
     expect(labelsIn(groups[0])).toEqual(["Rename board", "Export", "Import .excalidraw", "Mermaid", "Insert swimlane", "Insert table", "Embed URL"]);
-    expect(labelsIn(groups[1])).toEqual(["Jump to frame or view", "Light / dark", "Toggle grid", "Side panel", "Settings & keybindings"]);
+    expect(labelsIn(groups[1])).toEqual(["Jump to frame or view", "Light / dark", "Toggle grid", "Side panel", "Settings & keybindings", "Help & shortcuts"]);
     expect(labelsIn(groups[2])).toEqual(["Notes", "Comments", "Lock audience edits"]);
 
     // Toggle grid from View section updates board appState.herdr.grid

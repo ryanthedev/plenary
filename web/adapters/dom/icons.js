@@ -305,6 +305,11 @@ export const ICONS = Object.freeze({
     ["polyline", { points: "3 3 3 8 8 8" }],
     ["polyline", { points: "12 7 12 12 15.5 14" }],
   ],
+  help: [
+    ["circle", { cx: 12, cy: 12, r: 9 }],
+    ["path", { d: "M9.5 9.5a2.5 2.5 0 0 1 4.8.8c0 1.6-2.3 2.1-2.3 3.4" }],
+    ["circle", { cx: 12, cy: 17, r: 0.75, fill: "currentColor" }],
+  ],
 });
 
 function createSvgNode(tag) {

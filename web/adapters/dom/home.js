@@ -1,19 +1,31 @@
 // @ts-check
-// The Home page: a driving adapter over the DOM that renders web/core/home.js's model (Recent, Starred, Shared with me,
-// the Group/Space tree, search). Part of the dom group; the composition root (web/main.js) mounts it when someone is signed in with no
-// board in the link. All text goes in through textContent (titles and names are other people's words). Keyboard: "/"
-// focuses search, Escape clears it, every card is a link plus a star button. Visuals are intentionally plain: #56 restyles.
+/**
+ * @module web/adapters/dom/home
+ * Home screen DOM adapter rendering `web/core/home.js` (Recent, Starred, Shared with me,
+ * starter templates, the Area/Space tree, search, and self-serve Workspace Admin panels).
+ *
+ * Invariants:
+ * - User-authored names and titles go through `textContent` only.
+ * - `/` or `⌘K` focuses search, `Escape` clears it, `?` toggles Help, and every card is a link + star/menu control.
+ */
 
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
-import { overflowMenu, avatarEl, auditTone } from "./spaces.js";
+import { icon } from "./icons.js";
+import { hasActiveOverlay } from "./a11y.js";
+import { openHelpDialog, closeHelpDialog, isHelpDialogOpen } from "./help-dialog.js";
+import { overflowMenu, svgEl, brandMark, avatarEl, auditTone } from "./spaces.js";
 import { createThemeToggle } from "./theme.js";
 import { startMove } from "./move.js";
 import { pathText, whenText } from "../../core/home.js";
 import { TEMPLATES } from "../../../packages/core/templates.js";
 
-/** SessionStorage key holding a selected template seed while navigating to a newly created board. */
+/**
+ * SessionStorage key holding a selected template seed across the navigation from Home (`openTemplate`)
+ * to the newly created board (`app.js` `consumePendingTemplate`).
+ */
 export const PENDING_TEMPLATE_KEY = "plenary:pending-template";
+// Why: a 60s TTL ensures an abandoned or cancelled navigation never seeds an unrelated empty board later.
 const PENDING_TEMPLATE_TTL_MS = 60_000;
 
 function resolveStorage(storage) {
@@ -21,6 +33,12 @@ function resolveStorage(storage) {
   try { return globalThis.sessionStorage ?? null; } catch { return null; }
 }
 
+/**
+ * Persist (or clear, when `templateId` is null/`"blank"`) the pending template seed before opening a new board.
+ * @param {any} storage
+ * @param {string | null | undefined} templateId
+ * @param {number} now
+ */
 function setPendingTemplate(storage, templateId, now) {
   try {
     const store = resolveStorage(storage);
@@ -61,28 +79,6 @@ export function consumePendingTemplate(storage, now = Date.now(), maxAgeMs = PEN
   } catch {
     return null;
   }
-}
-
-/** Build a CSP-safe inline SVG node, falling back to an empty decorative span on minimal stub DOMs. */
-function svgEl(tag, attrs = {}, kids = []) {
-  if (typeof document === "undefined" || typeof document.createElementNS !== "function") {
-    return h("span", { class: attrs.class ?? "", "aria-hidden": "true" });
-  }
-  const ns = "http://www.w3.org/2000/svg";
-  const el = document.createElementNS(ns, tag);
-  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, String(v));
-  for (const k of kids) if (k) el.append(k);
-  return el;
-}
-
-function brandMark() {
-  return h("span.home-brand-mark", { "aria-hidden": "true" },
-    svgEl("svg", { viewBox: "0 0 24 24", class: "home-brand-ico", "aria-hidden": "true" }, [
-      svgEl("path", { d: "M4 6a2 2 0 0 1 2-2h5v7H4V6z" }),
-      svgEl("path", { d: "M13 4h5a2 2 0 0 1 2 2v5h-7V4z" }),
-      svgEl("path", { d: "M4 13h7v7H6a2 2 0 0 1-2-2v-5z" }),
-      svgEl("path", { d: "M13 13h7v5a2 2 0 0 1-2 2h-5v-7z" }),
-    ]));
 }
 
 /** Featured template ids exposed in the Home starter strip (paired with Blank Board). */
@@ -240,6 +236,13 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
   const main = h("main.home-main", { id: "home-main", tabindex: "-1" });
   const fabHost = h("div.home-fab-host");
   const who = h("span.home-who");
+  const helpBtn = mark(h("button.btn.ghost.home-help-btn", {
+    type: "button",
+    "data-action": "open-help",
+    "aria-label": "Help & shortcuts",
+    title: "Help & shortcuts (?)",
+    onclick: e => openHelp(e?.currentTarget ?? helpBtn),
+  }, icon("help", { size: 16 })), "help");
   const themeToggle = createThemeToggle({ themeCtrl, mark });
   const logoutBtn = onLogout
     ? mark(h("button.btn.ghost.home-logout", { type: "button", "data-action": "logout", "aria-label": "Sign out", onclick: () => onLogout() }, "Sign out"), "logout")
@@ -250,7 +253,7 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     h("a.logo", { href: homeHref, "aria-label": "Plenary home" }, brandMark(), "Plenary"),
     orgBadge,
     h("div.home-searchbox", { role: "search" }, search, h("kbd", { "aria-hidden": "true" }, "/ or ⌘K")),
-    h("span.spacer"), themeToggle.el, who, logoutBtn);
+    h("span.spacer"), helpBtn, themeToggle.el, who, logoutBtn);
   const home = h("div.home.home-page", { id: "home" }, top, status, mobileTabs, drawerBackdrop, h("div.home-body", {}, side, main), fabHost);
   root.replaceChildren(home);
 
@@ -269,6 +272,20 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     const s = activeCardSheet;
     activeCardSheet = null;
     s.close();
+  }
+
+  function openHelp(opener = null) {
+    if (isHelpDialogOpen(document)) {
+      closeHelpDialog({ doc: document, restoreFocus: true });
+      return;
+    }
+    closeCardSheet();
+    if (drawerOpen) setDrawer(false, false);
+    openHelpDialog({
+      opener: opener ?? document.activeElement ?? helpBtn,
+      doc: document,
+      host: document.body ?? root,
+    });
   }
 
   function openCardActionsSheet(c, opener) {
@@ -338,7 +355,8 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     sheet.focus?.();
   }
 
-  // Persistent inputs for self-serve Workspace creation and Members add-by-email (kept across redraws so typing never loses focus).
+  // Why: allocated once outside `draw()` so async member/audit reloads never replace these inputs
+  // mid-typing, preserving focus, caret position, and active IME composition.
   const orgNameInput = h("input.field.home-org-input", { type: "text", maxlength: "80", autocomplete: "off", placeholder: "Workspace name (e.g. My Studio)", "aria-label": "Workspace name" });
   const orgCreateBtn = h("button.btn.primary.home-org-btn", { type: "submit" }, "Create Workspace");
   const orgCreateErr = h("p.sp-error", { role: "alert" });
@@ -790,12 +808,40 @@ export function mountHome({ root, model, clock, boardHref, spaceHref, groupHref,
     if (S.notice) status.append(" ", mark(h("button.btn.ghost", { type: "button", onclick: () => model.dismissNotice() }, "Dismiss"), "dismiss"));
   }
   const unsub = model.subscribe(render);
+  const isTypingTarget = el => {
+    for (let x = el; x; x = x.parentNode ?? null) {
+      const tag = typeof x.tagName === "string" ? x.tagName : "";
+      if (/^(input|textarea|select)$/i.test(tag) || x.isContentEditable === true) return true;
+      const ce = x.getAttribute?.("contenteditable");
+      if (ce != null && String(ce).toLowerCase() !== "false") return true;
+    }
+    return false;
+  };
   const onKey = e => {
+    if (e.defaultPrevented) return;
     if (e.key === "Escape" && drawerOpen) { e.preventDefault?.(); setDrawer(false, true); return; }
-    const typing = /^(input|textarea|select)$/i.test(e.target?.tagName ?? "") || e.target?.isContentEditable;
-    if ((e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) || ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey) && !e.altKey)) { e.preventDefault(); search.focus(); }
+    const typing = isTypingTarget(e.target);
+    if (e.key === "?" && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) {
+      if (isHelpDialogOpen(document)) {
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        closeHelpDialog({ doc: document, restoreFocus: true });
+        return;
+      }
+      if (!hasActiveOverlay(document) && !activeCardSheet) {
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        openHelp(document.activeElement ?? helpBtn);
+        return;
+      }
+    }
+    if ((e.key === "/" && !e.ctrlKey && !e.metaKey && !e.altKey && !typing) || ((e.key === "k" || e.key === "K") && (e.metaKey || e.ctrlKey) && !e.altKey)) {
+      if (hasActiveOverlay(document) || activeCardSheet) return;
+      e.preventDefault();
+      search.focus();
+    }
   };
   document.addEventListener("keydown", onKey);
   render();
-  return { destroy() { destroyed = true; themeToggle.destroy(); closeCardSheet(); unsub(); document.removeEventListener("keydown", onKey); root.replaceChildren(); } };
+  return { destroy() { destroyed = true; closeHelpDialog({ doc: document, restoreFocus: false }); themeToggle.destroy(); closeCardSheet(); unsub(); document.removeEventListener("keydown", onKey); root.replaceChildren(); } };
 }

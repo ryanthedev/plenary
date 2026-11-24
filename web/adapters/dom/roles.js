@@ -1,12 +1,15 @@
 // @ts-check
-// The Roles screen (driving adapter over the DOM), rendering web/core/role-admin.js: the roles as named list items, the selected role's
-// permission matrix (a real checkbox per management permission, cells that say where it applies), duplicate, edit, save, delete, and the
-// many-people confirmation. Plain on purpose (#56 restyles); structure follows design/orgs/mock.html [roles].
-//
-// Rules this file keeps: names are other people's words (textContent only); every control is a real button, link, input or select; rows are
-// named list items; stable `data-fk` keys (`rolepick:<id>` is a role's neutral name, `perm:<id>` a checkbox) and focus goes back by exact key only,
-// to a neutral name when its control is gone; `aria-disabled`, never `disabled`; changes are said in the polite live region (announce());
-// the matrix scrolls sideways inside its own region at 390 px and the page does not.
+/**
+ * @module web/adapters/dom/roles
+ * Roles admin screen DOM adapter rendering `web/core/role-admin.js`: role list, selected role's
+ * permission matrix, duplicate/edit/save/delete flows, and many-people confirmation banner.
+ *
+ * Invariants:
+ * - Names are other people's words (`textContent` only); controls are real buttons/links/inputs/selects.
+ * - Stable `data-fk` keys (`rolepick:<id>`, `perm:<id>`) preserve exact-key focus across redraws.
+ * - Uses `aria-disabled` (never `disabled`) so keyboard users keep Tab order and `aria-describedby` reasons.
+ * - Changes are announced via the polite live region (`announce()`), and matrix scrolls horizontally inside its region.
+ */
 
 import { h, replace } from "./dom.js";
 import { keeper } from "./focus.js";
@@ -19,8 +22,10 @@ const KIND = { builtin: "Built-in, read-only", member: "Built-in, permissions ed
 const CELL = { yes: ["✓", "applies"], no: ["", "not granted"], na: ["–", "not at this scope"] };
 
 /**
+ * Mount the Roles administration page into `root`.
  * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/role-admin.js").createRolesModel>, hrefs: { home: string },
  *   signIn?: { href: string, text?: string } | null, mobileCards?: boolean | null, themeCtrl?: import("./theme.js").ThemeController | null }} o
+ * @returns {{ destroy(): void }}
  */
 export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards = null, themeCtrl = null }) {
   const S = model.state;
@@ -77,6 +82,8 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
       const heading = r.group === "content-tier" && !tierHead && (tierHead = true)
         ? h("tr.tier-head", {}, h("th", { scope: "colgroup", colspan: String(2 + S.page.matrix.scopes.length) }, "Content tier", h("br"), h("small", {}, "Opening boards beyond your own access. Held at the organization only; only someone who holds a permission can give it.")))
         : null;
+      // Why: `aria-disabled` (never `disabled`) keeps the checkbox in Tab order so screen-reader and
+      // keyboard users can still reach its `aria-describedby` explanation and avoid focus loss during `S.busy`.
       const grant = r.group === "content"
         ? h("td", { "data-label": "Granted" }, h("span", {}, r.ticked ? "Yes" : "No"), h("small", {}, " set by board access"))
         : h("td", { "data-label": "Granted" }, keys.mark(ctl(h("input", { type: "checkbox", checked: r.ticked, "aria-label": `${r.label}, ${r.id}`, "aria-disabled": r.tickable ? "false" : "true", ...(r.reason ? { "aria-describedby": `reason-${r.id.replace(/\W/g, "-")}` } : {}),
@@ -99,6 +106,7 @@ export function mountRolesPage({ root, model, hrefs, signIn = null, mobileCards 
     nameIn.setAttribute("aria-readonly", canName ? "false" : "true");
     nameIn.readOnly = !canName;
     const ladders = S.page.matrix.ladders;
+    // Why: `aria-disabled` instead of `disabled` keeps the select focusable in Tab order on read-only/member roles and prevents focus blur during `S.busy`.
     const ladderSel = keys.mark(ctl(h("select.field", { "aria-label": "Board access", "aria-disabled": editable && !member ? "false" : "true",
       onchange: e => { if (!editable || member || S.busy) { e.target.value = shown.ladder ?? ""; return; } model.setLadder(e.target.value); } },
       member || !editable ? h("option", { value: shown.ladder ?? "", selected: true }, shown.ladder ? (LADDER_LABEL[shown.ladder] ?? shown.ladder) : "None") : null,

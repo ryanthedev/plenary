@@ -1,7 +1,10 @@
 // @ts-check
-// The side panel: core's SECTIONS (panel.js) in stack or tabs mode through applyPanel, styled as the mock.
-// The model (what's on, what's available) is pure and tested; render() builds DOM with ./dom.js.
-// Every write goes through session.act(stream, fn): the role and connection gate it, not the disabled look.
+/**
+ * @module web/adapters/dom/panel
+ * Inspector panel / ribbon DOM adapter rendering `packages/core/panel.js` (`panelSections`, `applyPanel`)
+ * across desktop ribbon mode, vertical tool bars (Layers/Frames/Library), and the mobile bottom sheet.
+ * Every write goes through `session.act(stream, fn)` so role and connection state—not visual disabling—gate edits.
+ */
 
 import { STROKES, FILLS, WIDTHS, STYLES } from "../../../packages/core/editor.js";
 import { panelSections, applyPanel } from "../../../packages/core/panel.js";
@@ -31,7 +34,11 @@ export const HEADS = [["none", null, null], ["→", null, "arrow"], ["↔", "arr
 export const OPACITIES = [100, 75, 50, 25];
 export const SIZES = [16, 20, 28, 36];
 
-/** What the Properties section shows as on: the first selected element's values, else the next-shape style. */
+/**
+ * Compute what the Properties section shows as active: the first selected element's values, else the next-shape style.
+ * @param {any} ed
+ * @returns {{ count: number, strokeColor: any, backgroundColor: any, strokeWidth: any, strokeStyle: any, roughness: any, opacity: any, fillStyle: any, round: boolean, font: string, fontSize: number, arrowType: string, heads: [any, any], blendMode: string, clipShape: string }}
+ */
 export function propsModel(ed) {
   const sel = ed.selected().filter(e => !isLabel(e)), e = sel[0], st = ed.style;
   const label = e && isShape(e) ? ed.doc.labelOf(e) : null;
@@ -51,7 +58,12 @@ export function propsModel(ed) {
   };
 }
 
-/** Sections with something to say (core's panelSections `available`). */
+/**
+ * Build the section-availability predicate passed to `panelSections`.
+ * @param {any} session
+ * @param {"draw" | "animate" | "present" | null} [workspaceMode]
+ * @returns {(id: string) => boolean}
+ */
 export function availableFor(session, workspaceMode = null) {
   const b = session.eds.board;
   return id => {
@@ -87,16 +99,31 @@ const isOn = (m, key, val) => {
 
 // ── library (per browser, localStorage; .excalidrawlib in and out) ──
 const LIB_KEY = "plenary.library";
-/** The per-browser library from the storage port (web/ports/storage.js); a missing, junk or unavailable store reads as empty. */
+/**
+ * Read the per-browser library from the storage port (`web/ports/storage.js`); a missing, junk or unavailable store reads as empty.
+ * @param {import("../../ports/storage.js").Storage | null | undefined} store
+ * @returns {any[]}
+ */
 export function loadLibrary(store) { try { return parseLibrary(store?.get(LIB_KEY) ?? ""); } catch { return []; } }
-/** Save the library; a full or unavailable store (STORAGE_UNAVAILABLE) is survived: the library stays in memory. */
+/**
+ * Save the library; a full or unavailable store (`STORAGE_UNAVAILABLE`) is survived so the library stays in memory.
+ * @param {import("../../ports/storage.js").Storage | null | undefined} store
+ * @param {any[]} items
+ */
 export function saveLibrary(store, items) { try { store?.set(LIB_KEY, JSON.stringify({ type: "excalidrawlib", version: 2, libraryItems: items })); } catch {} }
+/**
+ * Merge incoming items into the existing library without mutating `items`.
+ * @param {any[]} items
+ * @param {any[]} incoming
+ * @returns {any[]}
+ */
 export function addToLibrary(items, incoming) { return mergeLibrary(items, incoming); }
 
 /**
  * Build deterministic-ID icon pack items so repeated installs never duplicate existing icons.
  * @param {string} packId
  * @param {number} [now]
+ * @returns {any[]}
  */
 export function iconPackLibraryItems(packId, now) {
   const pack = getIconPack(packId);
@@ -108,7 +135,12 @@ export function iconPackLibraryItems(packId, now) {
   }));
 }
 
-/** Return true if every icon in `packId` is already present in `items`. */
+/**
+ * Return true if every icon in `packId` is already present in `items`.
+ * @param {any[]} items
+ * @param {string} packId
+ * @returns {boolean}
+ */
 export function isIconPackInstalled(items, packId) {
   const pack = getIconPack(packId);
   if (!pack || !Array.isArray(items) || !items.length) return false;
@@ -117,9 +149,39 @@ export function isIconPackInstalled(items, packId) {
 }
 
 /**
- * Build the panel into `root`. ctx: { session, state, setState(op), h, inSheet, library, setLibrary, onChange }.
+ * Build the inspector panel DOM nodes for desktop ribbon or mobile sheet.
+ * @param {any} _root Legacy container argument (unused; callers pass `null` or container and spread returned nodes).
+ * @param {{
+ *   session: any,
+ *   state: any,
+ *   setState: (op: any) => void,
+ *   h: typeof import("./dom.js").h,
+ *   inSheet?: boolean,
+ *   workspaceMode?: "draw" | "animate" | "present" | null,
+ *   ribbonExpanded?: boolean,
+ *   ribbonShowAll?: boolean,
+ *   colorPicker?: string | null,
+ *   setColorPicker?: ((prop: string | null) => void) | null,
+ *   colorPickerState?: { h: number | null, mode: string } | null,
+ *   prefs?: import("../../ports/storage.js").Storage | null,
+ *   canvas?: HTMLCanvasElement | null,
+ *   win?: any,
+ *   clock?: import("../../ports/clock.js").Clock | null,
+ *   library?: any[],
+ *   setLibrary: (items: any[]) => void,
+ *   localView?: any,
+ *   onResetLocalView?: (() => void) | null,
+ *   onSoloLayer?: ((id: string) => void) | null,
+ *   onJumpFrame?: ((id: string) => void) | null,
+ *   onStepFrame?: ((delta: number) => void) | null,
+ *   onRibbonTab?: ((id: string, activeTabId: string) => void) | null,
+ *   onToggleRibbon?: (() => void) | null,
+ *   onToggleRibbonAll?: (() => void) | null,
+ *   onChange: () => void,
+ * }} ctx
+ * @returns {any[]}
  */
-export function renderPanel(root, ctx) {
+export function renderPanel(_root, ctx) {
   const { session: S, state, h } = ctx;
   const may = S.may(), role = S.role;
   const notesOnly = role === "annotator";
@@ -130,7 +192,8 @@ export function renderPanel(root, ctx) {
   const touchSheet = Boolean(ctx.inSheet || isPhoneTouchViewport(ctx.win ?? globalThis));
   const touchBtnStyle = touchSheet ? { minHeight: "44px", minWidth: "44px", maxWidth: "100%" } : undefined;
   const touchSelectStyle = touchSheet ? { minHeight: "44px", fontSize: "16px", maxWidth: "100%", minWidth: "0", flex: "1 1 140px" } : undefined;
-  // `fk` is the control's focus key (web/adapters/dom/focus.js): made of what it changes, never of what it says, so a redraw restores focus to the SAME control.
+  // Why: `fk` (`data-fk`) encodes stable action identity rather than mutable display text,
+  // so `focus.js` restores focus to the exact same control across redraws.
   const chip = (txt, on, onclick, title, view = false, fk = null) => {
     const iconOnly = typeof txt !== "string" && !Array.isArray(txt);
     return h("button.c" + (on ? ".on" : ""), { type: "button", title, ...(iconOnly && title ? { "aria-label": title } : {}), disabled: !view && dis, "data-fk": fk, onclick: () => onclick?.() }, txt);
@@ -139,9 +202,13 @@ export function renderPanel(root, ctx) {
   const style = patch => act(e => e.setStyle(patch));
   const row = (lab, key, ...opts) => h("div.row", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {}, h("span.lab", {}, lab, key ? h("i", {}, key) : null), h("span.opts", touchSheet ? { style: { minWidth: "0", maxWidth: "100%" } } : {}, ...opts));
 
+  // Why: Desktop presenters use the horizontal grouped ribbon; mobile sheets (`inSheet`) and
+  // annotators (`notesOnly`) use the compact vertical stack with inline swatch rows instead.
   const ribbonMode = !ctx.inSheet && !notesOnly;
   const ribbonExpanded = ctx.ribbonExpanded !== undefined ? Boolean(ctx.ribbonExpanded) : true;
   const ribbonShowAll = Boolean(ctx.ribbonShowAll);
+  // Why: `.panel .sec` sets `overflow-x: auto; overflow-y: hidden` for horizontal ribbon scrolling,
+  // which would clip any vertical popover inside it; capture the open popover and portal it after `.sec`.
   /** @type {any} */
   let activeColorPopover = null;
   const ribbonRow = (lab, key, ...opts) => h("div.row.ribbon-row", {},
@@ -1108,6 +1175,7 @@ export function renderPanel(root, ctx) {
       h("h4", { onclick: () => !tabs && ctx.setState({ type: "fold", id: s.id }) }, s.title, sub[s.id] ? h("span", {}, sub[s.id]) : null),
       s.folded ? null : bodies[s.id]()));
   }
+  // Portal the active color popover outside `.panel .sec` so `overflow-y: hidden` does not clip it.
   if (activeColorPopover && ribbonExpanded && activeTabId === "properties") {
     out.push(activeColorPopover);
   }

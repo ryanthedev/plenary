@@ -1,8 +1,11 @@
 // @ts-check
-// Shared Light & Dark theme controller and toggle button for Plenary's DOM surfaces
-// (Sign-in gate, Home, Space/Area, Teams, Access, Roles, Offboard, Trash).
-// Uses the exact same `plenary.settings.v1` persistence port (`web/core/settings.js`)
-// as the canvas editor (`web/adapters/dom/app.js`) so light/dark stays in sync everywhere.
+/**
+ * @module web/adapters/dom/theme
+ * Shared Light & Dark theme controller and toggle button for Plenary's DOM surfaces
+ * (Sign-in gate, Home, Space/Area, Teams, Access, Roles, Offboard, Trash, and canvas editor).
+ * Uses the exact same `plenary.settings.v1` persistence port (`web/core/settings.js`)
+ * so Light/Dark stays in sync everywhere.
+ */
 
 import { h, replace } from "./dom.js";
 import { icon } from "./icons.js";
@@ -78,6 +81,8 @@ export function applyThemeToDom(theme) {
  */
 export function initTheme({ prefs = null, urlTheme = null, prefersDark = prefersDarkScheme } = {}) {
   const settings = loadSettings(prefs);
+  // Why: `?theme=light|dark` overrides persisted settings for the current visit (deep links,
+  // embeds, screenshots) without overwriting the user's saved `defaultTheme` in storage.
   const initial = urlTheme === "dark" || urlTheme === "light"
     ? urlTheme
     : resolveTheme(settings.defaultTheme, Boolean(prefersDark()));

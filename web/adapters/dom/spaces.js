@@ -1,8 +1,14 @@
 // @ts-check
-// The Space page and the Group page (driving adapter over the DOM): a board grid / a Space grid, rename in place, an overflow menu, and the
-// New board / New space actions (dialogs: ./dialogs.js). Renders web/core/spaces.js's page model. Names and titles are other people's words:
-// they go in through textContent only. Every control is a real button or link (keyboard), menus follow the ARIA menu pattern, and the
-// layout is one column that works at 390 and 1280 px. Visuals are plain on purpose (#56 restyles); structure follows design/orgs/mock.html.
+/**
+ * @module web/adapters/dom/spaces
+ * Space and Area (Group) DOM page adapters plus shared admin shell, brand mark, avatar,
+ * badge tone, and overflow menu primitives reused by Home, Roles, Access, Trash, and Offboard.
+ *
+ * Invariants:
+ * - Untrusted names and titles go through `textContent` only.
+ * - Controls are real `<button>`/`<a>`/`<input>` elements following ARIA menu patterns.
+ * - Single-column layout works at 390 px and 1280 px.
+ */
 
 import { h, replace } from "./dom.js";
 import { keeper, announce } from "./focus.js";
@@ -13,8 +19,9 @@ import { showTrashToast } from "./toast.js";
 import { generalText, spaceEmpty, groupEmpty } from "../../core/spaces.js";
 
 /**
- * An overflow menu: a button that opens a `role="menu"`. Arrow keys move, Enter/Space choose, Escape closes and returns focus to the
- * button, a click elsewhere closes.
+ * An overflow menu: a button that opens a `role="menu"`. Arrow keys move, Enter/Space choose,
+ * Escape closes and returns focus to the button, and an outside click closes without stealing focus.
+ * @param {{ label: string, items: Array<any> }} o
  * @returns {{ el: HTMLElement, button: HTMLElement, close: () => void, update: (n: { label: string, items: any[] }) => void }}
  */
 export function overflowMenu({ label, items }) {
@@ -49,11 +56,14 @@ export function overflowMenu({ label, items }) {
   return { el: wrap, button, close: () => close(false), update: n => { cfg.label = n.label; cfg.items = n.items; button.setAttribute("aria-label", n.label); } };
 }
 
-/** Focus an input and select its text once it is in the page (so typing replaces the old title). */
-const focusSelect = el => { globalThis.queueMicrotask?.(() => { el.focus?.(); el.select?.(); }); return el; };
-
-/** Build a CSP-safe inline SVG node, falling back to an empty decorative span on minimal stub DOMs. */
-function svgEl(tag, attrs = {}, kids = []) {
+/**
+ * Build a CSP-safe inline SVG node, falling back to an empty decorative span on minimal stub DOMs.
+ * @param {string} tag
+ * @param {Record<string, any>} [attrs]
+ * @param {any[]} [kids]
+ * @returns {SVGElement | HTMLElement}
+ */
+export function svgEl(tag, attrs = {}, kids = []) {
   if (typeof document === "undefined" || typeof document.createElementNS !== "function") {
     return h("span", { class: attrs.class ?? "", "aria-hidden": "true" });
   }
@@ -64,7 +74,10 @@ function svgEl(tag, attrs = {}, kids = []) {
   return el;
 }
 
-/** Shared Plenary brand mark used in Home and standalone admin/Space headers. */
+/**
+ * Shared Plenary brand mark used in Home and standalone admin/Space headers.
+ * @returns {HTMLElement}
+ */
 export function brandMark() {
   return h("span.home-brand-mark", { "aria-hidden": "true" },
     svgEl("svg", { viewBox: "0 0 24 24", class: "home-brand-ico", "aria-hidden": "true" }, [
@@ -75,7 +88,12 @@ export function brandMark() {
     ]));
 }
 
-/** Deterministic initials + soft-tint circular (or team rounded-square) avatar for admin rows. */
+/**
+ * Deterministic initials + soft-tint circular (or team rounded-square) avatar for admin rows.
+ * @param {string | null | undefined} label
+ * @param {{ team?: boolean }} [o]
+ * @returns {HTMLElement}
+ */
 export function avatarEl(label, { team = false } = {}) {
   const raw = String(label ?? "").trim();
   const base = raw.includes("@") && !raw.includes(" ") ? raw.split("@")[0] : raw;
@@ -90,7 +108,11 @@ export function avatarEl(label, { team = false } = {}) {
   return h("span", { class: `adm-avatar adm-avatar-t${tone}${team ? " adm-avatar-team" : ""}`, "aria-hidden": "true" }, letters.toUpperCase());
 }
 
-/** Semantic pill tone for a role id or display name. */
+/**
+ * Semantic pill tone for a role id or display name.
+ * @param {string | null | undefined} role
+ * @returns {"accent" | "ok" | "warn" | "neutral"}
+ */
 export function roleTone(role) {
   const k = String(role ?? "").toLowerCase();
   if (k.includes("owner") || k.includes("admin")) return "accent";
@@ -99,7 +121,11 @@ export function roleTone(role) {
   return "neutral";
 }
 
-/** Semantic pill tone for an audit action string. */
+/**
+ * Semantic pill tone for an audit action string.
+ * @param {string | null | undefined} action
+ * @returns {"danger" | "ok" | "accent" | "neutral"}
+ */
 export function auditTone(action) {
   const k = String(action ?? "").toLowerCase();
   if (/(delete|remove|revoke|trash|offboard|ban|drop)/.test(k)) return "danger";
@@ -108,7 +134,13 @@ export function auditTone(action) {
   return "neutral";
 }
 
-/** The page chrome shared by all Workspace Admin, Space, Area, Access, Roles, Offboard, and Trash pages. */
+/**
+ * Render the shared page chrome for Workspace Admin, Space, Area, Access, Roles, Offboard, and Trash pages.
+ * @param {any} root
+ * @param {{ home: string }} hrefs
+ * @param {{ themeCtrl?: import("./theme.js").ThemeController | null }} [o]
+ * @returns {{ status: any, main: any, destroyTheme: () => void }}
+ */
 export function shell(root, hrefs, { themeCtrl = null } = {}) {
   const status = h("div.home-status", { role: "status", "aria-live": "polite", hidden: true });
   const main = h("main.home-main.sp-main", { id: "home-main", tabindex: "-1" });
@@ -117,13 +149,35 @@ export function shell(root, hrefs, { themeCtrl = null } = {}) {
     h("header.home-top", {}, h("a.logo", { href: hrefs.home, "aria-label": "Plenary home" }, brandMark(), "Plenary"), h("span.spacer"), themeToggle.el), status, main));
   return { status, main, destroyTheme: themeToggle.destroy };
 }
+
+/**
+ * Update the polite status banner (`#home-status`) from `model.state.notice`.
+ * @param {HTMLElement} status
+ * @param {{ state: { notice?: string | null }, dismissNotice: () => void }} model
+ */
 export function showNotice(status, model) {
   const S = model.state;
   status.textContent = S.notice ?? "";
   status.hidden = !S.notice;
   if (S.notice) status.append(" ", h("button.btn.ghost", { type: "button", onclick: () => model.dismissNotice() }, "Dismiss"));
 }
+
+/**
+ * Build a centered empty/gate message block.
+ * @param {string} title
+ * @param {string} [detail]
+ * @returns {HTMLElement}
+ */
 export const message = (title, detail) => h("div.home-empty", {}, h("h2", {}, title), detail ? h("p", {}, detail) : null);
+
+/**
+ * Render loading/notfound/signed-out/error gate into `main` when the page has no ready data.
+ * @param {{ status: string, page?: any }} S
+ * @param {HTMLElement} main
+ * @param {() => void} retry
+ * @param {{ href: string, text?: string } | null} [signIn]
+ * @returns {boolean} True when a gate state was rendered (caller should skip page draw).
+ */
 export const gate = (S, main, retry, signIn) => {
   if (S.status === "loading" && !S.page) { replace(main, h("p.muted", {}, "Loading…")); return true; }
   if (S.status === "notfound") { replace(main, message("This page is not available.", "It may not exist, or you may not have access to it."), h("a.btn", { href: "./" }, "Back to Home")); return true; }
@@ -267,7 +321,14 @@ export function mountSpacePage({ root, model, dialogs, hrefs, signIn = null, acc
   return { destroy() { destroyTheme(); unsub(); root.replaceChildren(); } };
 }
 
-/** The Group page: its Spaces as tiles, New space, rename in place, overflow menu. */
+/**
+ * Mount the Area (Group) page: its Spaces as tiles, New space, rename in place, and overflow menu.
+ * @param {{ root: HTMLElement, model: ReturnType<typeof import("../../core/spaces.js").createPageModel>,
+ *   dialogs: ReturnType<typeof import("./dialogs.js").createDialogs>,
+ *   hrefs: { home: string, space(id: string): string, access?(type: string, id: string): string },
+ *   signIn?: { href: string, text?: string } | null, themeCtrl?: import("./theme.js").ThemeController | null }} o
+ * @returns {{ destroy(): void }}
+ */
 export function mountGroupPage({ root, model, dialogs, hrefs, signIn = null, themeCtrl = null }) {
   const S = model.state;
   const { status, main, destroyTheme } = shell(root, hrefs, { themeCtrl });

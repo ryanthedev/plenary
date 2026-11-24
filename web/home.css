@@ -159,6 +159,34 @@
   color: var(--fg);
 }
 
+.home-page .home-top .home-help-btn {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.home-page .home-top .home-help-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--fg);
+}
+
+.home-page .home-top .home-help-btn .ico {
+  width: 16px;
+  height: 16px;
+}
+
 .home-page .home-status {
   padding: 10px calc(20px + env(safe-area-inset-right)) 10px calc(20px + env(safe-area-inset-left));
   background: var(--accent-soft);
@@ -1085,7 +1113,8 @@
     min-width: 44px;
   }
 
-  .home-page .home-top .theme-toggle {
+  .home-page .home-top .theme-toggle,
+  .home-page .home-top .home-help-btn {
     width: 40px;
     height: 40px;
     min-width: 40px;
@@ -1160,6 +1189,7 @@
   .home-page .home-side .btn.home-side-add,
   .home-page .home-admin-summary,
   .home-page .home-top .theme-toggle,
+  .home-page .home-top .home-help-btn,
   .home-page .card .star,
   .home-page .card .card-menu .more {
     min-width: 44px;
@@ -1177,7 +1207,8 @@
   .home-page .home-admin-summary::after,
   .home-page .home-search,
   .home-page .home-side .nav,
-  .home-page .card .star {
+  .home-page .card .star,
+  .home-page .home-top .home-help-btn {
     transition: none !important;
   }
 

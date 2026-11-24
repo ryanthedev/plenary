@@ -6,7 +6,18 @@
 // Output: JSON to stdout by default; errors to stderr. Exit 0 = ok, 2 = usage error, 1 = runtime/API error.
 
 import { readFileSync } from "node:fs";
-import { createPlenaryClient } from "./plenary-client.js";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { spawn } from "node:child_process";
+import {
+  createPlenaryClient,
+  DEFAULT_PLENARY_URL,
+  normalizeBaseUrl,
+  PlenaryError,
+  readCredentials,
+  removeServerCredentials,
+  resolveCredentials,
+  saveServerCredentials,
+} from "./plenary-client.js";
 
 export class CliUsageError extends Error {
   constructor(message) {
@@ -24,6 +35,9 @@ Global options:
   --help, -h              Show this help
 
 Commands:
+  login                   [--url <url>] [--provider <google|microsoft|oidc>] [--no-open]
+  logout                  [--url <url>] [--all]
+  whoami                  [--url <url>]
   list-boards
   create-board            [--title <title>] [--member-role <editor|annotator|commenter|viewer|null>] [--space <id>]
   create-share-link       --board <id> [--role <editor|annotator|viewer>] [--expires-at <ms>] [--passcode <4..128 chars>] [--no-download]
@@ -50,6 +64,9 @@ Commands:
 Aliases: snake_case command names (e.g. list_boards, read_board, set_moderation) are also accepted.`;
 
 const COMMAND_ALIASES = {
+  "login": "login",
+  "logout": "logout",
+  "whoami": "whoami",
   "list-boards": "list_boards",
   "list_boards": "list_boards",
   "create-board": "create_board",
@@ -96,7 +113,7 @@ const COMMAND_ALIASES = {
   "gdpr_erase_user": "gdpr_erase_user",
 };
 
-const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant", "--loop", "--clear", "--no-download", "--confirm"]);
+const BOOL_FLAGS = new Set(["--help", "-h", "--json", "--elbow", "--tenant", "--loop", "--clear", "--no-download", "--confirm", "--no-open", "--all"]);
 
 /**
  * Parse CLI argv into `{ help, command, flags, positional }`.
@@ -187,11 +204,148 @@ function parseListOrJson(raw, name) {
   return items;
 }
 
+function openSystemBrowser(url) {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  try {
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+  } catch { /* user still has the URL printed on stderr */ }
+}
+
+function constantTimeEq(a, b) {
+  const ab = Buffer.from(String(a), "utf8");
+  const bb = Buffer.from(String(b), "utf8");
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
+}
+
+const LOGIN_SUCCESS_HTML = `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Signed in to Plenary</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;max-width:400px;text-align:center}h1{font-size:20px;margin:0 0 8px}p{font-size:14px;color:#94a3b8;margin:0}</style>
+</head>
+<body><main class="card"><h1>Signed in to Plenary</h1><p>Signed in to Plenary — you can close this tab.</p></main></body>
+</html>`;
+
+/**
+ * Execute the PKCE loopback browser SSO login flow.
+ * @param {{ url?: string, provider?: string, noOpen?: boolean, env?: Record<string, string | undefined>, err?: (s: string) => void, openBrowser?: (url: string) => void, timeoutMs?: number }} opts
+ */
+export async function runLoginFlow({
+  url,
+  provider,
+  noOpen = false,
+  env = process.env,
+  err = s => process.stderr.write(s + "\n"),
+  openBrowser = openSystemBrowser,
+  timeoutMs = 120_000,
+} = {}) {
+  const creds = readCredentials({ env });
+  const baseUrl = normalizeBaseUrl(url ?? env.PLENARY_URL ?? creds.defaultUrl ?? DEFAULT_PLENARY_URL);
+  const state = randomBytes(32).toString("base64url");
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+
+  let settled = false;
+  let resolveFlow, rejectFlow;
+  const done = new Promise((res, rej) => { resolveFlow = res; rejectFlow = rej; });
+  const timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      rejectFlow(new PlenaryError("login timed out waiting for browser callback", { code: "timeout" }));
+    }
+  }, timeoutMs);
+  timer.unref?.();
+
+  const htmlResp = (status, html) => new Response(html, {
+    status,
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+  });
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(req) {
+      const u = new URL(req.url);
+      if (u.pathname !== "/callback") return new Response("Not Found", { status: 404 });
+      if (settled) return htmlResp(200, LOGIN_SUCCESS_HTML);
+
+      const errParam = u.searchParams.get("error");
+      if (errParam) {
+        settled = true;
+        rejectFlow(new PlenaryError(`login failed: ${errParam}`, { code: "auth" }));
+        return htmlResp(400, `<!doctype html><html><body><h1>Sign-in failed</h1><p>You can close this tab.</p></body></html>`);
+      }
+
+      const gotState = u.searchParams.get("state") ?? "";
+      const code = u.searchParams.get("code") ?? "";
+      if (!code || !constantTimeEq(gotState, state)) {
+        return htmlResp(400, `<!doctype html><html><body><h1>Invalid callback</h1><p>State mismatch or missing code.</p></body></html>`);
+      }
+
+      try {
+        const exRes = await fetch(`${baseUrl}/auth/cli-exchange`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ code, verifier }),
+        });
+        const text = await exRes.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+        if (!exRes.ok || !data?.token) {
+          settled = true;
+          const codeStr = typeof data?.error === "string" ? data.error : `http-${exRes.status}`;
+          rejectFlow(new PlenaryError(`CLI token exchange failed (${codeStr})`, { code: codeStr, status: exRes.status }));
+          return htmlResp(400, `<!doctype html><html><body><h1>Sign-in failed</h1><p>Token exchange failed (${codeStr}).</p></body></html>`);
+        }
+        saveServerCredentials({
+          url: baseUrl,
+          token: data.token,
+          expiresAt: data.expiresAt ?? null,
+          user: data.user ?? null,
+          setDefault: true,
+        }, { env });
+        settled = true;
+        resolveFlow({
+          ok: true,
+          url: baseUrl,
+          user: data.user ?? null,
+          expiresAt: data.expiresAt ?? null,
+        });
+        return htmlResp(200, LOGIN_SUCCESS_HTML);
+      } catch (e) {
+        settled = true;
+        rejectFlow(e instanceof PlenaryError ? e : new PlenaryError(`CLI token exchange failed: ${e?.message ?? e}`, { code: "network-error" }));
+        return htmlResp(500, `<!doctype html><html><body><h1>Sign-in error</h1><p>Could not complete token exchange.</p></body></html>`);
+      }
+    },
+  });
+
+  try {
+    const loginUrl = new URL(`${baseUrl}/auth/login`);
+    loginUrl.searchParams.set("cli_port", String(server.port));
+    loginUrl.searchParams.set("cli_state", state);
+    loginUrl.searchParams.set("cli_challenge", challenge);
+    if (provider && String(provider).trim()) {
+      loginUrl.searchParams.set("provider", String(provider).trim().toLowerCase());
+    }
+    err(`Open this URL in your browser to sign in:\n${loginUrl.href}`);
+    if (!noOpen) openBrowser(loginUrl.href);
+    const result = await done;
+    await new Promise(r => setTimeout(r, 25));
+    return result;
+  } finally {
+    clearTimeout(timer);
+    try { server.stop(true); } catch { /* already stopped */ }
+  }
+}
+
 /**
  * Execute the Plenary CLI with explicit argv, env, and IO streams (easy to test).
  * @param {string[]} argv
  * @param {Record<string, string | undefined>} [env]
- * @param {{ out?: (s: string) => void, err?: (s: string) => void, clientFactory?: (o: { url?: string, token?: string }) => any }} [io]
+ * @param {{ out?: (s: string) => void, err?: (s: string) => void, clientFactory?: (o: { url?: string, token?: string }) => any, openBrowser?: (url: string) => void, loginTimeoutMs?: number }} [io]
  * @returns {Promise<number>} process exit code
  */
 export async function runCli(
@@ -201,6 +355,8 @@ export async function runCli(
     out = s => process.stdout.write(s + "\n"),
     err = s => process.stderr.write(s + "\n"),
     clientFactory,
+    openBrowser,
+    loginTimeoutMs,
   } = {},
 ) {
   let parsed;
@@ -220,11 +376,43 @@ export async function runCli(
   const board = flags.board ?? positional[0];
 
   try {
+    if (command === "login") {
+      const result = await runLoginFlow({
+        url: flags.url,
+        provider: flags.provider,
+        noOpen: Boolean(flags["no-open"]),
+        env,
+        err,
+        ...(openBrowser ? { openBrowser } : {}),
+        ...(loginTimeoutMs !== undefined ? { timeoutMs: loginTimeoutMs } : {}),
+      });
+      out(JSON.stringify(result, null, 2));
+      return 0;
+    }
+
+    if (command === "logout") {
+      const res = removeServerCredentials({ url: flags.url ?? null, all: Boolean(flags.all) }, { env });
+      out(JSON.stringify({ ok: true, url: res.url, ...(res.all ? { all: true } : {}) }, null, 2));
+      return 0;
+    }
+
+    if (command === "whoami") {
+      const resolved = resolveCredentials({ url: flags.url ?? null, token: flags.token ?? null, env });
+      out(JSON.stringify({
+        url: resolved.url,
+        source: resolved.source,
+        user: resolved.user,
+        expiresAt: resolved.expiresAt,
+      }, null, 2));
+      return 0;
+    }
+
+    const resolved = resolveCredentials({ url: flags.url ?? null, token: flags.token ?? null, env });
     const client = clientFactory
-      ? clientFactory({ url: flags.url ?? env.PLENARY_URL, token: flags.token ?? env.PLENARY_TOKEN })
+      ? clientFactory({ url: resolved.url ?? undefined, token: resolved.token ?? undefined })
       : createPlenaryClient({
-          url: flags.url ?? env.PLENARY_URL,
-          token: flags.token ?? env.PLENARY_TOKEN,
+          url: resolved.url ?? undefined,
+          token: resolved.token ?? undefined,
           clientName: "plenary-cli",
         });
 

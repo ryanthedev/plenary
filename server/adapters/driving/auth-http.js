@@ -111,6 +111,12 @@ export const LOGIN_COOKIE = "__Host-plen_login";
 export const EXCHANGE_COOKIE = "__Host-plen_xchg";
 const LOGIN_TTL_SEC = 600;
 const CODE_TTL_SEC = 60;
+export const CLI_TOKEN_TTL_SEC = 90 * 24 * 60 * 60;
+export const CLI_TOKEN_TTL_MS = CLI_TOKEN_TTL_SEC * 1000;
+const CLI_STATE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const CLI_CHALLENGE_RE = /^[A-Za-z0-9_-]{43,128}$/;
+const CLI_VERIFIER_RE = /^[A-Za-z0-9_-]{43,128}$/;
+const CLI_CODE_RE = /^[A-Za-z0-9_-]{43}$/;
 const COOKIE_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Lax";
 const XCHG_ATTRS = "Path=/; Secure; HttpOnly; SameSite=Strict";
 
@@ -148,7 +154,7 @@ const refuse = (status, code, extra) => new Refusal(err(status, code, extra));
 /**
  * @param {{
  *   registry: import("../../ports/registry.js").Registry,
- *   sessions: { issue(id: import("../../ports/idp.js").Identity): Promise<string>, verify(t: string): Promise<import("../../ports/idp.js").Session|null>, verifySnapshotTicket?(t: string): Promise<{ board: string, seq: number, exp: number }|null> },
+ *   sessions: { issue(id: import("../../ports/idp.js").Identity, opts?: { ttlSec?: number, ttlMs?: number }): Promise<string>, verify(t: string): Promise<import("../../ports/idp.js").Session|null>, verifySnapshotTicket?(t: string): Promise<{ board: string, seq: number, exp: number }|null> },
  *   oidc?: import("../../ports/idp.js").IdP | null,
  *   providers?: Array<{ id: string, label?: string, idp: import("../../ports/idp.js").IdP }> | Record<string, import("../../ports/idp.js").IdP> | null,
  *   tenancy: ReturnType<typeof import("../../core/auth/tenancy.js").tenancy>,
@@ -233,9 +239,15 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
   const clearXchg = `${EXCHANGE_COOKIE}=; ${XCHG_ATTRS}; Max-Age=0`;
   const appOrigin = new URL(postLoginUrl).origin;
 
-  async function sealLogin({ state, nonce, verifier, link, provider }) {
+  async function sealLogin({ state, nonce, verifier, link, provider, cli = null }) {
     const exp = Math.floor(now() / 1000) + LOGIN_TTL_SEC;
-    const payload = b64url(utf8(JSON.stringify({ s: state, n: nonce, v: verifier, ...(link ? { l: link } : {}), ...(provider ? { p: provider } : {}), exp })));
+    const payload = b64url(utf8(JSON.stringify({
+      s: state, n: nonce, v: verifier,
+      ...(link ? { l: link } : {}),
+      ...(provider ? { p: provider } : {}),
+      ...(cli ? { cp: cli.cliPort, cs: cli.cliState, cc: cli.cliChallenge } : {}),
+      exp,
+    })));
     const mac = b64url(await crypto.subtle.sign("HMAC", await macKey, utf8("l1." + payload)));
     return `${LOGIN_COOKIE}=l1.${payload}.${mac}; ${COOKIE_ATTRS}; Max-Age=${LOGIN_TTL_SEC}`;
   }
@@ -249,7 +261,14 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
       const c = JSON.parse(fromUtf8(unb64url(parts[1])));
       if (!c || !Number.isFinite(c.exp) || Math.floor(now() / 1000) >= c.exp) return null;
       if (![c.s, c.n, c.v].every(x => typeof x === "string" && x)) return null;
-      return { state: c.s, nonce: c.n, verifier: c.v, link: typeof c.l === "string" ? c.l : null, provider: typeof c.p === "string" ? c.p : null };
+      let cli = null;
+      if (c.cp !== undefined || c.cs !== undefined || c.cc !== undefined) {
+        if (!Number.isInteger(c.cp) || c.cp < 1024 || c.cp > 65535
+          || typeof c.cs !== "string" || !CLI_STATE_RE.test(c.cs)
+          || typeof c.cc !== "string" || !CLI_CHALLENGE_RE.test(c.cc)) return null;
+        cli = { cliPort: c.cp, cliState: c.cs, cliChallenge: c.cc };
+      }
+      return { state: c.s, nonce: c.n, verifier: c.v, link: typeof c.l === "string" ? c.l : null, provider: typeof c.p === "string" ? c.p : null, cli };
     } catch { return null; }
   }
   // States already used in THIS process (defence in depth against a replayed callback; not shared across gateways,
@@ -288,6 +307,17 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
   // Exchange codes already spent in THIS process, by sha256(code). Defence in depth: the cookie is cleared on first
   // use, but a client could keep it. Not shared across nodes (see the header).
   const usedCodes = usedSet(CODE_TTL_SEC, null);
+  // Single-use PKCE-bound CLI exchange codes (60 s TTL, bounded by maxStates, insertion-ordered by expiry).
+  /** @type {Map<string, { identity: import("../../ports/idp.js").Identity, cliChallenge: string, expMs: number }>} */
+  const cliCodes = new Map();
+  const pruneCliCodes = () => {
+    const t = now();
+    for (const [k, v] of cliCodes) {
+      if (v.expMs > t) break;
+      cliCodes.delete(k);
+    }
+    return t;
+  };
 
   // ---- exchange code + cookie ----
   async function mintCode(identity) {
@@ -360,14 +390,122 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
     return withCookie(json(200, { token, ...x.identity, exp }), clearXchg);
   }
 
-  async function beginLogin(link, requestedProvider = null) {
+  /**
+   * Parse optional PKCE loopback CLI login params from `/auth/login`.
+   * Returns `null` when none are present, `{ cliPort, cliState, cliChallenge }` when all three are valid,
+   * or throws a 400 Refusal if any is present and incomplete/invalid.
+   */
+  function parseCliLoginParams(url) {
+    const hasPort = url.searchParams.has("cli_port");
+    const hasState = url.searchParams.has("cli_state");
+    const hasChallenge = url.searchParams.has("cli_challenge");
+    if (!hasPort && !hasState && !hasChallenge) return null;
+    if (!hasPort || !hasState || !hasChallenge) throw refuse(400, "bad-request");
+    const rawPort = url.searchParams.get("cli_port") ?? "";
+    const cliState = url.searchParams.get("cli_state") ?? "";
+    const cliChallenge = url.searchParams.get("cli_challenge") ?? "";
+    if (!/^\d+$/.test(rawPort)) throw refuse(400, "bad-request");
+    const cliPort = Number(rawPort);
+    if (!Number.isInteger(cliPort) || cliPort < 1024 || cliPort > 65535) throw refuse(400, "bad-request");
+    if (!CLI_STATE_RE.test(cliState) || !CLI_CHALLENGE_RE.test(cliChallenge)) throw refuse(400, "bad-request");
+    return { cliPort, cliState, cliChallenge };
+  }
+
+  function renderCliProviderChooser(cli) {
+    const links = providerList.map(p => {
+      const q = new URLSearchParams({
+        provider: p.id,
+        cli_port: String(cli.cliPort),
+        cli_state: cli.cliState,
+        cli_challenge: cli.cliChallenge,
+      });
+      const href = `/auth/login?${q.toString()}`;
+      return `<a class="btn" href="${escapeHtml(href)}">Continue with ${escapeHtml(p.label)}</a>`;
+    }).join("\n      ");
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in to Plenary CLI</title>
+  <style>
+    body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:32px;max-width:360px;width:100%;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    h1{font-size:20px;margin:0 0 8px}
+    p{font-size:14px;color:#94a3b8;margin:0 0 24px}
+    .providers{display:flex;flex-direction:column;gap:12px}
+    .btn{display:block;padding:12px 16px;border-radius:8px;background:#3b82f6;color:#fff;text-decoration:none;font-weight:600;font-size:15px}
+    .btn:hover{background:#2563eb}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Sign in to Plenary CLI</h1>
+    <p>Choose an identity provider to authenticate your CLI session.</p>
+    <div class="providers">
+      ${links}
+    </div>
+  </main>
+</body>
+</html>`;
+    return new Response(html, {
+      status: 200,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        ...NO_STORE,
+        "referrer-policy": "no-referrer",
+        "x-frame-options": "DENY",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+      },
+    });
+  }
+
+  async function cliExchange(req) {
+    if (!hasOidc) return err(503, "sign-in-unavailable");
+    const b = await body(req, ["code", "verifier"]);
+    if (typeof b.code !== "string" || !CLI_CODE_RE.test(b.code)
+      || typeof b.verifier !== "string" || !CLI_VERIFIER_RE.test(b.verifier)) {
+      return err(401, "invalid-code");
+    }
+    const t = pruneCliCodes();
+    const entry = cliCodes.get(b.code);
+    if (!entry || entry.expMs <= t) {
+      if (entry) cliCodes.delete(b.code);
+      return err(401, "invalid-code");
+    }
+    // Single-use: consume atomically before any await.
+    cliCodes.delete(b.code);
+    const computed = b64url(await crypto.subtle.digest("SHA-256", utf8(b.verifier)));
+    if (!sameString(computed, entry.cliChallenge)) return err(401, "invalid-verifier");
+    let token;
+    try { token = await sessions.issue(entry.identity, { ttlMs: CLI_TOKEN_TTL_MS, ttlSec: CLI_TOKEN_TTL_SEC }); }
+    catch { return err(503, "unavailable"); }
+    let verified;
+    try { verified = await sessions.verify(token); } catch { verified = null; }
+    if (!Number.isInteger(verified?.exp)) return err(503, "unavailable");
+    recordMember(entry.identity);
+    return json(200, {
+      token,
+      expiresAt: verified.exp * 1000,
+      user: {
+        id: entry.identity.user,
+        name: entry.identity.name ?? null,
+        email: entry.identity.email ?? null,
+      },
+    });
+  }
+
+  async function beginLogin(link, requestedProvider = null, cli = null) {
     if (!hasOidc) return err(503, "sign-in-unavailable");
     const rawProvider = typeof requestedProvider === "string" ? requestedProvider.trim().toLowerCase() : "";
+    if (cli && !rawProvider && providerList.length > 1) {
+      return renderCliProviderChooser(cli);
+    }
     const selected = rawProvider ? (providerMap.get(rawProvider) ?? null) : providerList[0];
     if (!selected) return err(400, "unknown-provider");
     let b;
     try { b = await selected.idp.begin(); } catch { return err(503, "unavailable"); }
-    return redirect(b.url, [await sealLogin({ ...b, link, provider: selected.id })]);
+    return redirect(b.url, [await sealLogin({ ...b, link, provider: selected.id, cli })]);
   }
 
   /** One "sign-in failed" line; a broken logger never changes the answer. */
@@ -404,6 +542,17 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
     if (autoProvisionDomainOrgs) {
       try { await provisionDomainTenant({ caller: identity }, { registry, now }); }
       catch { try { log?.warn?.("domain org auto-provision failed"); } catch {} }
+    }
+    if (expected.cli) {
+      const t = pruneCliCodes();
+      if (cliCodes.size >= maxStates) {
+        failed("replay_guard_full");
+        return withCookie(err(503, "unavailable"), clearLogin);
+      }
+      const cliCode = b64url(crypto.getRandomValues(new Uint8Array(32)));
+      cliCodes.set(cliCode, { identity, cliChallenge: expected.cli.cliChallenge, expMs: t + CODE_TTL_SEC * 1000 });
+      const loc = `http://127.0.0.1:${expected.cli.cliPort}/callback?code=${encodeURIComponent(cliCode)}&state=${encodeURIComponent(expected.cli.cliState)}`;
+      return redirect(loc, [clearLogin]);
     }
     let x;
     try { x = await mintCode(identity); } catch { failed("mint_failed"); return withCookie(err(503, "unavailable"), clearLogin); }
@@ -610,9 +759,10 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
       return users.length ? json(200, { board: devMenu.board, users }) : err(404, "not-found");
     } }]] : []),
     ["/auth/providers", { GET: () => json(200, { providers: providerList.map(p => ({ id: p.id, label: p.label })) }) }],
-    ["/auth/login", { GET: (_req, url) => beginLogin(null, url.searchParams.get("provider")) }],
+    ["/auth/login", { GET: (_req, url) => beginLogin(null, url.searchParams.get("provider"), parseCliLoginParams(url)) }],
     ["/auth/callback", { GET: (req, url) => callback(req, url) }],
     ["/auth/exchange", { POST: req => exchange(req) }],
+    ["/auth/cli-exchange", { POST: req => cliExchange(req) }],
     ["/auth/logout", { GET: () => redirect(postLogoutUrl, [clearLogin]) }],
     ["/tenants", {
       GET: async req => {
@@ -1149,4 +1299,9 @@ function sameString(a, b) {
   let d = 0;
   for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
+}
+
+/** Escape HTML special characters for safe interpolation in static HTML templates. */
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }

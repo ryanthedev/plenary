@@ -24,10 +24,18 @@ export async function sessions({ key, ttlSec = 12 * 3600, snapshotTtlSec = 300, 
   const k = await crypto.subtle.importKey("raw", /** @type {BufferSource} */ (raw), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 
   return {
-    /** @param {Identity} id */
-    async issue(id) {
+    /** @param {Identity} id @param {{ ttlSec?: number, ttlMs?: number }} [opts] */
+    async issue(id, opts) {
       const iat = Math.floor(now() / 1000);
-      const payload = b64url(utf8(JSON.stringify({ u: id.user, n: typeof id.name === "string" ? id.name.slice(0, 200) : null, e: id.email ?? null, d: id.domain ?? null, iat, exp: iat + ttlSec })));
+      let ttl = ttlSec;
+      if (opts?.ttlSec !== undefined) {
+        if (!Number.isInteger(opts.ttlSec) || opts.ttlSec <= 0) throw new Error("session: ttlSec must be a positive integer");
+        ttl = opts.ttlSec;
+      } else if (opts?.ttlMs !== undefined) {
+        if (!Number.isFinite(opts.ttlMs) || opts.ttlMs <= 0) throw new Error("session: ttlMs must be positive");
+        ttl = Math.max(1, Math.floor(opts.ttlMs / 1000));
+      }
+      const payload = b64url(utf8(JSON.stringify({ u: id.user, n: typeof id.name === "string" ? id.name.slice(0, 200) : null, e: id.email ?? null, d: id.domain ?? null, iat, exp: iat + ttl })));
       const mac = await crypto.subtle.sign("HMAC", k, utf8("s1." + payload));
       return `s1.${payload}.${b64url(mac)}`;
     },

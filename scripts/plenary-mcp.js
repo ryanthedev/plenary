@@ -4,7 +4,7 @@
 // Exposes Plenary HTTP Admin API & Protocol v1.1 board operations as 22 MCP tools.
 // Never writes non-JSON-RPC output to stdout; diagnostics go to stderr only.
 
-import { createPlenaryClient, PlenaryError } from "./plenary-client.js";
+import { createPlenaryClient, PlenaryError, resolveCredentials } from "./plenary-client.js";
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
 export const SUPPORTED_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
@@ -598,9 +598,10 @@ export function createMcpHandler({ env = process.env, clientFactory } = {}) {
 
   const getClient = () => {
     if (clientFactory) return clientFactory();
+    const creds = resolveCredentials({ env });
     return createPlenaryClient({
-      url: env.PLENARY_URL,
-      token: env.PLENARY_TOKEN,
+      url: creds.url ?? undefined,
+      token: creds.token ?? undefined,
       clientName: "plenary-mcp",
     });
   };

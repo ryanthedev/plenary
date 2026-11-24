@@ -79,6 +79,7 @@ const ROUTES = {
   "GET /auth/login": { path: "/auth/login", idpBegin: true },   // the IdP hangs
   "GET /auth/callback": { path: "/auth/callback", fast: 400 },
   "POST /auth/exchange": { path: "/auth/exchange", init: { method: "POST" }, fast: 403 },   // its slow-Sessions case is its own test below
+  "POST /auth/cli-exchange": { path: "/auth/cli-exchange", init: { method: "POST" }, fast: 415 },
   "GET /auth/logout": { path: "/auth/logout", fast: 302 },
   "GET /tenants": { path: "/tenants" },
   "POST /tenants": { path: "/tenants", body: { name: "Studio" } },

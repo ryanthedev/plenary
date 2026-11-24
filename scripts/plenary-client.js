@@ -2,6 +2,9 @@
 // Shared Plenary HTTP Admin API + Protocol v1.1 WebSocket client for AI agents (CLI & MCP).
 // Zero extra dependencies: only Bun/Node built-ins and workspace packages.
 
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { Replica } from "../packages/protocol/replica.js";
 import { jsonCodec } from "../packages/protocol/codec.js";
 import { ELEMENT_STREAMS, MAX_ID_CHARS, MAX_OP_BYTES, utf8Bytes } from "../packages/protocol/envelope.js";
@@ -12,6 +15,7 @@ import { getEasing, getPreset } from "../packages/core/anim.js";
 import { buildLinkCard, parseLinkCardUrl } from "../packages/core/link-card.js";
 
 export const DEFAULT_TIMEOUT_MS = 15_000;
+export const DEFAULT_PLENARY_URL = "https://p5y.omni.ooo";
 /** Maximum UTF-8 JSON byte size of a single outgoing element op (half of MAX_OP_BYTES = 1 MB). */
 export const MAX_CHUNK_BYTES = 512 * 1024;
 const OP_WRAPPER_BYTES = utf8Bytes('{"elements":[]}');
@@ -1946,4 +1950,172 @@ export function createPlenaryClient({ url, token, timeoutMs = DEFAULT_TIMEOUT_MS
   };
 
   return client;
+}
+
+/**
+ * Resolve the path to the Plenary credentials file (`~/.config/plenary/credentials.json` by default,
+ * overridable via `credPath` or `env.PLENARY_CREDENTIALS_PATH`).
+ * @param {Record<string, string | undefined>} [env]
+ * @param {string} [credPath]
+ * @returns {string}
+ */
+export function getCredentialsPath(env = process.env, credPath) {
+  if (typeof credPath === "string" && credPath.trim()) return credPath.trim();
+  if (typeof env?.PLENARY_CREDENTIALS_PATH === "string" && env.PLENARY_CREDENTIALS_PATH.trim()) {
+    return env.PLENARY_CREDENTIALS_PATH.trim();
+  }
+  return join(homedir(), ".config", "plenary", "credentials.json");
+}
+
+/**
+ * Read saved Plenary credentials from disk. Returns `{ defaultUrl: null, servers: {} }` if missing or unreadable.
+ * @param {{ env?: Record<string, string | undefined>, credPath?: string }} [opts]
+ * @returns {{ defaultUrl: string | null, servers: Record<string, { token: string, expiresAt: number | null, user: { id: string, name: string | null, email: string | null } | null }> }}
+ */
+export function readCredentials({ env = process.env, credPath } = {}) {
+  const path = getCredentialsPath(env, credPath);
+  if (!existsSync(path)) return { defaultUrl: null, servers: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { defaultUrl: null, servers: {} };
+    }
+    const defaultUrl = typeof parsed.defaultUrl === "string" && parsed.defaultUrl.trim()
+      ? parsed.defaultUrl.trim()
+      : null;
+    const servers = parsed.servers && typeof parsed.servers === "object" && !Array.isArray(parsed.servers)
+      ? parsed.servers
+      : {};
+    return { defaultUrl, servers };
+  } catch {
+    return { defaultUrl: null, servers: {} };
+  }
+}
+
+/**
+ * Atomically write Plenary credentials to disk with `0700` directory and `0600` file permissions.
+ * @param {{ defaultUrl: string | null, servers: Record<string, any> }} creds
+ * @param {{ env?: Record<string, string | undefined>, credPath?: string }} [opts]
+ * @returns {string} written file path
+ */
+export function writeCredentials(creds, { env = process.env, credPath } = {}) {
+  const path = getCredentialsPath(env, credPath);
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { chmodSync(dir, 0o700); } catch { /* best-effort on non-POSIX filesystems */ }
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  const body = JSON.stringify({
+    defaultUrl: creds.defaultUrl ?? null,
+    servers: creds.servers ?? {},
+  }, null, 2) + "\n";
+  writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
+  try { chmodSync(tmp, 0o600); } catch { /* best-effort */ }
+  renameSync(tmp, path);
+  try { chmodSync(path, 0o600); } catch { /* best-effort */ }
+  return path;
+}
+
+/**
+ * Save a server's CLI session token to `credentials.json` (0600, atomic write).
+ * @param {{ url: string, token: string, expiresAt?: number | null, user?: { id: string, name: string | null, email: string | null } | null, setDefault?: boolean }} entry
+ * @param {{ env?: Record<string, string | undefined>, credPath?: string }} [opts]
+ */
+export function saveServerCredentials({ url, token, expiresAt = null, user = null, setDefault = true }, { env = process.env, credPath } = {}) {
+  const normalizedUrl = normalizeBaseUrl(url);
+  if (typeof token !== "string" || !token.trim()) {
+    throw new PlenaryError("token is required", { code: "bad-request" });
+  }
+  const creds = readCredentials({ env, credPath });
+  creds.servers[normalizedUrl] = {
+    token: token.trim(),
+    expiresAt: typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : null,
+    user: user && typeof user === "object"
+      ? { id: String(user.id ?? ""), name: user.name ?? null, email: user.email ?? null }
+      : null,
+  };
+  if (setDefault || !creds.defaultUrl) {
+    creds.defaultUrl = normalizedUrl;
+  }
+  const path = writeCredentials(creds, { env, credPath });
+  return { path, url: normalizedUrl, creds };
+}
+
+/**
+ * Remove saved credentials for a single server URL (or all servers when `all: true`).
+ * @param {{ url?: string | null, all?: boolean }} [target]
+ * @param {{ env?: Record<string, string | undefined>, credPath?: string }} [opts]
+ */
+export function removeServerCredentials({ url = null, all = false } = {}, { env = process.env, credPath } = {}) {
+  const creds = readCredentials({ env, credPath });
+  if (all) {
+    const hadAny = Object.keys(creds.servers).length > 0 || creds.defaultUrl !== null;
+    writeCredentials({ defaultUrl: null, servers: {} }, { env, credPath });
+    return { removed: hadAny, url: null, all: true };
+  }
+  const rawUrl = (typeof url === "string" && url.trim())
+    ? url.trim()
+    : (typeof env?.PLENARY_URL === "string" && env.PLENARY_URL.trim())
+      ? env.PLENARY_URL.trim()
+      : creds.defaultUrl;
+  if (!rawUrl) return { removed: false, url: null, all: false };
+  const normalizedUrl = normalizeBaseUrl(rawUrl);
+  const existed = Object.prototype.hasOwnProperty.call(creds.servers, normalizedUrl);
+  if (existed) delete creds.servers[normalizedUrl];
+  if (creds.defaultUrl === normalizedUrl) {
+    creds.defaultUrl = Object.keys(creds.servers)[0] ?? null;
+  }
+  if (existed || existsSync(getCredentialsPath(env, credPath))) {
+    writeCredentials(creds, { env, credPath });
+  }
+  return { removed: existed, url: normalizedUrl, all: false };
+}
+
+/**
+ * Resolve `{ url, token, source, user, expiresAt }` using precedence:
+ *   1. Explicit `token` or `env.PLENARY_TOKEN` wins (source: `"env"`).
+ *   2. Otherwise reads `credentials.json`: resolves `url` from explicit `url` -> `env.PLENARY_URL` -> `creds.defaultUrl`,
+ *      and `token` from `creds.servers[normalizedUrl]` (source: `"credentials"`).
+ *   3. Otherwise returns `token: null, source: "none"`.
+ * @param {{ url?: string | null, token?: string | null, env?: Record<string, string | undefined>, credPath?: string }} [opts]
+ * @returns {{ url: string | null, token: string | null, source: "env" | "credentials" | "none", user: { id: string, name: string | null, email: string | null } | null, expiresAt: number | null }}
+ */
+export function resolveCredentials({ url = null, token = null, env = process.env, credPath } = {}) {
+  const explicitToken = typeof token === "string" && token.trim() ? token.trim() : null;
+  const envToken = typeof env?.PLENARY_TOKEN === "string" && env.PLENARY_TOKEN.trim() ? env.PLENARY_TOKEN.trim() : null;
+  const creds = readCredentials({ env, credPath });
+  const rawUrl = (typeof url === "string" && url.trim())
+    ? url.trim()
+    : (typeof env?.PLENARY_URL === "string" && env.PLENARY_URL.trim())
+      ? env.PLENARY_URL.trim()
+      : creds.defaultUrl;
+  const normalizedUrl = rawUrl ? normalizeBaseUrl(rawUrl) : null;
+  const saved = normalizedUrl && Object.prototype.hasOwnProperty.call(creds.servers, normalizedUrl)
+    ? creds.servers[normalizedUrl]
+    : null;
+
+  if (explicitToken || envToken) {
+    return {
+      url: normalizedUrl,
+      token: explicitToken ?? envToken,
+      source: "env",
+      user: null,
+      expiresAt: null,
+    };
+  }
+  if (saved && typeof saved.token === "string" && saved.token.trim()) {
+    return {
+      url: normalizedUrl,
+      token: saved.token.trim(),
+      source: "credentials",
+      user: saved.user ?? null,
+      expiresAt: typeof saved.expiresAt === "number" ? saved.expiresAt : null,
+    };
+  }
+  return {
+    url: normalizedUrl,
+    token: null,
+    source: "none",
+    user: null,
+    expiresAt: null,
+  };
 }

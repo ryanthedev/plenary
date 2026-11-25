@@ -1598,6 +1598,18 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
   }
 }
 
+/* Prevent iOS/Safari long-press blue selection box across canvas & chrome while keeping inputs selectable */
+.app, .canvas, .board, .topbar, .dock, .hud-rail, .timeline {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+.app input, .app textarea, .app .ink, .app [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
 /* ── phone landscape side-rail layout (e.g. 844×390): move bars to left/right edges for full canvas height ── */
 @media (orientation: landscape) and (max-height: 520px) and (max-width: 1023px) {
   body {
@@ -1706,7 +1718,15 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
   .timeline {
     grid-column: 2;
     grid-row: 2;
+    padding-right: calc(8px + var(--safe-right));
+    padding-bottom: var(--safe-bottom);
   }
+  .timeline .tl-authoring,
+  .timeline .tl-tracks-toggle {
+    display: none !important;
+  }
+  .timeline .tl-track { min-width: 80px; }
+  .timeline .tl-speed { min-height: 36px; height: 36px; }
   .dock {
     left: auto;
     right: calc(8px + var(--safe-right));
@@ -1742,6 +1762,10 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
   .hud-rail {
     bottom: var(--canvas-bottom);
     padding: 0 calc(68px + var(--safe-right)) 0 8px;
+  }
+  body[data-workspace-mode="animate"] .hud-rail,
+  body[data-workspace-mode="present"] .hud-rail {
+    padding-right: calc(8px + var(--safe-right));
   }
   .phone-sel-pill {
     bottom: calc(var(--canvas-bottom) + 52px);

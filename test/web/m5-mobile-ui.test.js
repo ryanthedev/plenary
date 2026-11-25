@@ -211,6 +211,8 @@ test("HTML & CSS static rules: viewport-fit=cover, 100dvh/--vv-height, safe-area
   const mp34Css = await Bun.file(new URL("../../web/styles/mobile-phase3-4.css", import.meta.url)).text();
   expect(css).toContain("--safe-top:");
   expect(css).toContain("--safe-bottom:");
+  expect(css).toContain("--safe-left:");
+  expect(css).toContain("--safe-right:");
   expect(css).toContain("--dock-h:");
   expect(css).toContain("--hud-gap:");
   // Phone landscape side-rail layout: left vertical topbar rail, right vertical icon dock, hides board title/status text

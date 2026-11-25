@@ -46,6 +46,8 @@
   --topbar-h: 46px;
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
   --dock-h: 0px;
   --hud-gap: 12px;
   --canvas-bottom: calc(var(--dock-h) + var(--hud-gap) + var(--safe-bottom));
@@ -1724,19 +1726,19 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
     overflow-y: auto;
   }
   .dock .tb {
-    flex: 0 0 44px;
-    width: 44px;
-    height: 44px;
-    min-width: 44px;
-    min-height: 44px;
+    flex: 0 0 38px;
+    width: 42px;
+    height: 38px;
+    min-width: 42px;
+    min-height: 38px;
     font-size: 0;
     gap: 0;
     padding: 0;
-    border-radius: 12px;
+    border-radius: 10px;
     justify-content: center;
     align-items: center;
   }
-  .dock .tb .ic { font-size: 20px; }
+  .dock .tb .ic { font-size: 18px; }
   .hud-rail {
     bottom: var(--canvas-bottom);
     padding: 0 calc(68px + var(--safe-right)) 0 8px;

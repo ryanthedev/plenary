@@ -372,12 +372,20 @@ export function buildTimeline(el, ctx) {
       "aria-expanded": String(isExpanded),
       "data-action": "toggle-tracks",
       onclick: () => { ctx.onToggleExpand?.(!isExpanded); },
-    }, phoneDrawer && isExpanded ? "Minimize ⌄" : `Tracks (${tracks.length}) ${isExpanded ? "⌄" : "⌃"}`)
+    }, phoneDrawer ? (isExpanded ? "Minimize ⌄" : "Tracks ⌃") : `Tracks (${tracks.length}) ${isExpanded ? "⌄" : "⌃"}`)
     : null;
 
   const rmBadge = reduced
     ? h("span.tl-rm", { title: "Reduced motion preference detected (tap Play to animate)" }, "Reduced motion")
     : null;
+
+  const playBtn = h("button.c.tl-play", {
+    type: "button",
+    title: "Play / pause (⇧Space)",
+    "aria-label": B.play ? "Pause" : "Play",
+    "data-state": B.play ? "playing" : "paused",
+    onclick: () => { B.playToggle(); onChange(); },
+  }, icon(B.play ? "pause" : "play", { size: 16 }));
 
   const transportControls = h("div.tl-controls", {},
     h("button.c", {
@@ -387,13 +395,7 @@ export function buildTimeline(el, ctx) {
       "data-action": "step-start",
       onclick: () => { B.stepToStart(); onSeek(); },
     }, icon("skipBack", { size: 13 })),
-    h("button.c", {
-      type: "button",
-      title: "Play / pause (⇧Space)",
-      "aria-label": B.play ? "Pause" : "Play",
-      "data-state": B.play ? "playing" : "paused",
-      onclick: () => { B.playToggle(); onChange(); },
-    }, icon(B.play ? "pause" : "play", { size: 14 })),
+    playBtn,
     h("button.c", {
       type: "button",
       title: "Step to end",
@@ -411,17 +413,27 @@ export function buildTimeline(el, ctx) {
 
   if (!isExpanded) {
     tl.track = compactTrack;
-    replace(
-      el,
-      transportControls,
-      compactTrack,
-      tl.text,
-      loopBtn,
-      speedSel,
-      authoringControls,
-      tracksToggleBtn,
-      rmBadge,
-    );
+    if (phoneDrawer) {
+      replace(
+        el,
+        playBtn,
+        compactTrack,
+        tl.text,
+        tracksToggleBtn,
+      );
+    } else {
+      replace(
+        el,
+        transportControls,
+        compactTrack,
+        tl.text,
+        loopBtn,
+        speedSel,
+        authoringControls,
+        tracksToggleBtn,
+        rmBadge,
+      );
+    }
     updateTimelineInPlace(tl, B, safeDur);
     if (restoreFocus === "track") compactTrack.focus?.();
     else if (restoreFocus === "speed") speedSel.focus?.();

@@ -213,6 +213,9 @@ test("HTML & CSS static rules: viewport-fit=cover, 100dvh/--vv-height, safe-area
   expect(css).toContain("--safe-bottom:");
   expect(css).toContain("--dock-h:");
   expect(css).toContain("--hud-gap:");
+  // Phone landscape side-rail layout: left vertical topbar rail, right vertical icon dock, hides board title/status text
+  expect(css).toMatch(/@media\s*\(orientation:\s*landscape\)\s*and\s*\(max-height:\s*520px\)/);
+  expect(css).toMatch(/grid-template-columns:\s*calc\(52px\s*\+\s*var\(--safe-left\)\)\s*minmax\(0,\s*1fr\)/);
   expect(css).toContain("--canvas-bottom:");
   expect(css).toMatch(/body\[data-workspace-mode="animate"\]\s*\{[^}]*--canvas-bottom:\s*var\(--hud-gap\)/s);
   expect(css).toMatch(/body\[data-workspace-mode="present"\]\s*\{[^}]*--canvas-bottom:\s*calc\(12px \+ var\(--safe-bottom\)\)/s);

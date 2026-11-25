@@ -183,9 +183,19 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const mineKey = mineKeyOf(me.user);
   let chromeDirty = true, syncMove = () => {};
   if (move && (typeof move.port?.options !== "function" || typeof move.clock?.mono !== "function")) throw new TypeError("mountApp: move must be { port: MovePort, clock, newKey? }");
+  const isNarrowPhone = () => matchMedia("(max-width: 640px)").matches;
+  const isPhone = () => isNarrowPhone() || matchMedia("(max-width: 1023px)").matches;
+  let mobileDefaultToolApplied = false;
   const S = startSession({
     mine: (() => { try { const v = JSON.parse(get(mineKey) ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } })(),
-    onChange: () => { chromeDirty = true; syncMove(); },
+    onChange: () => {
+      if (!mobileDefaultToolApplied && S.chrome && isPhone()) {
+        mobileDefaultToolApplied = true;
+        if (S.tool !== "hand") S.setTool("hand");
+      }
+      chromeDirty = true;
+      syncMove();
+    },
   });
   S.eds.board.style.roughness = userSettings.roughDefault;
   S.eds.notes.style.roughness = userSettings.roughDefault;
@@ -195,8 +205,6 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   const WHY = { quota: "the storage quota is full", forbidden: "you can't upload here", "too-large": "it is over 10 MB", "not-image": "it is not a PNG, JPEG, GIF or WebP", "gave-up": "the server could not be reached (still trying)", busy: "the server is busy (still trying)", limit: "too many uploads at once (still trying)" };
   net.onFail?.(({ code, retrying }) => toast(`The picture ${retrying ? "is not saved for others yet" : "was not saved for others"}: ${WHY[code] ?? code}`, 6000));
 
-  const isNarrowPhone = () => matchMedia("(max-width: 640px)").matches;
-  const isPhone = () => isNarrowPhone() || matchMedia("(max-width: 1023px)").matches;
   const isCoarse = () => matchMedia("(pointer: coarse)").matches;
   const INK_KEYBOARD_PAD_PX = 24;
   let lastPointerTouch = false;
@@ -2258,9 +2266,9 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       const discussBtn = isNarrowPhone()
         ? [btn("comments", "Discuss", ui.sheet === "notes" || ui.sheet === "comments", e => setSheet(ui.sheet === "notes" || ui.sheet === "comments" ? null : "notes", { opener: e?.currentTarget }), false, "Notes and comments", { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "notes" || ui.sheet === "comments"), "data-dock-discuss": "1" })]
         : [sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
-      items = [...["select", "freedraw", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), ...discussBtn];
+      items = [...["select", "arrow", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), ...discussBtn];
     }
-    else if (role === "annotator") items = [...["select", "note", "highlighter", "freedraw"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
+    else if (role === "annotator") items = [...["select", "note", "highlighter", "arrow"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
     else items = [btn("chevronLeft", "Prev", false, () => stepBoardFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => stepBoardFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     replace(dockEl, items);
   }

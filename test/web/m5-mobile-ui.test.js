@@ -329,7 +329,8 @@ test("bottom sheet swipe-down-to-dismiss: past threshold & fast flick dismiss; s
 test("mobile layout invariants (<= 640px) for presenter, annotator, and viewer", () => {
   // Presenter
   {
-    const { byId, app, step } = setupMobile({ token: "t-ada", phone: true, collab: true });
+    const { byId, app, S, step } = setupMobile({ token: "t-ada", phone: true, collab: true });
+    expect(S.tool).toBe("hand");
     expect(find(byId.topbar, e => e.className === "board-name")?.textContent).toContain("mobile-board");
     expect(find(byId.topbar, e => /\bpill\b/.test(e.className))).toBeTruthy();
     expect(find(byId.topbar, e => /\bwatching\b/.test(e.className))).toBeTruthy();
@@ -338,6 +339,8 @@ test("mobile layout invariants (<= 640px) for presenter, annotator, and viewer",
     const dockLabels = findAll(byId.dock, e => e.tagName === "BUTTON").map(b => b.textContent);
     expect(dockLabels.length).toBeLessThanOrEqual(7);
     expect(dockLabels.some(t => t.includes("Select"))).toBe(true);
+    expect(dockLabels.some(t => t.includes("Arrow"))).toBe(true);
+    expect(dockLabels.some(t => t.includes("Pen") || t.includes("Draw"))).toBe(false);
     expect(dockLabels.some(t => t.includes("More"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Discuss"))).toBe(true);
     overflow.click();
@@ -349,10 +352,12 @@ test("mobile layout invariants (<= 640px) for presenter, annotator, and viewer",
 
   // Annotator
   {
-    const { byId, app, step } = setupMobile({ token: "t-cy", phone: true, collab: true });
+    const { byId, app, S, step } = setupMobile({ token: "t-cy", phone: true, collab: true });
+    expect(S.tool).toBe("hand");
     const dockLabels = findAll(byId.dock, e => e.tagName === "BUTTON").map(b => b.textContent);
     expect(dockLabels.some(t => t.includes("Note"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Highlight"))).toBe(true);
+    expect(dockLabels.some(t => t.includes("Arrow"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Style"))).toBe(true);
     const overflow = find(byId.topbar, e => e.className.includes("overflow-btn"));
     overflow.click();

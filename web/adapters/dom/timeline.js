@@ -103,6 +103,7 @@ function buildPresetOptions(h, currentPreset) {
  *   reducedMotion?: boolean,
  *   expanded?: boolean,
  *   compactOnly?: boolean,
+ *   phoneDrawer?: boolean,
  *   showAuthoring?: boolean,
  *   canEdit?: boolean,
  *   act?: (fn: (ed: any) => any) => any,
@@ -119,8 +120,9 @@ export function buildTimeline(el, ctx) {
   const act = ctx.act ?? (fn => fn(B));
   const actSettings = ctx.actSettings ?? (fn => fn(B));
   const compactOnly = Boolean(ctx.compactOnly);
+  const phoneDrawer = Boolean(ctx.phoneDrawer);
   const isExpanded = Boolean(ctx.expanded && !compactOnly);
-  const showAuthoring = Boolean((ctx.showAuthoring || isExpanded) && !compactOnly);
+  const showAuthoring = Boolean((ctx.showAuthoring || isExpanded) && !compactOnly && (!phoneDrawer || isExpanded));
   const reduced = ctx.reducedMotion ?? prefersReducedMotion();
   const maxCueAt = cues.length ? cues[cues.length - 1].at : 0;
   const naturalDur = Math.max(Number.isFinite(dur) ? dur : 0, maxCueAt);
@@ -129,6 +131,7 @@ export function buildTimeline(el, ctx) {
   const onSeek = ctx.onSeek ?? (() => updateTimelineInPlace(tl, B, safeDur));
 
   el.classList?.toggle?.("tl-expanded", isExpanded);
+  el.classList?.toggle?.("tl-phone-drawer", phoneDrawer);
   el.setAttribute?.("data-expanded", isExpanded ? "true" : "false");
 
   // Preserve keyboard focus across structural rebuilds (e.g. pressing Space on the slider).
@@ -369,7 +372,7 @@ export function buildTimeline(el, ctx) {
       "aria-expanded": String(isExpanded),
       "data-action": "toggle-tracks",
       onclick: () => { ctx.onToggleExpand?.(!isExpanded); },
-    }, `Tracks (${tracks.length}) ${isExpanded ? "⌄" : "⌃"}`)
+    }, phoneDrawer && isExpanded ? "Minimize ⌄" : `Tracks (${tracks.length}) ${isExpanded ? "⌄" : "⌃"}`)
     : null;
 
   const rmBadge = reduced

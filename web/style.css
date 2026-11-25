@@ -1277,7 +1277,9 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
   .presenter-bar .btn { min-width: 44px; min-height: 44px; height: 44px; padding: 0 8px; gap: 4px; flex-shrink: 0; }
   .presenter-bar .btn.primary { padding: 0 10px; }
   .timeline { height: auto; min-height: calc(52px + env(safe-area-inset-bottom)); flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 8px; padding: 8px calc(10px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left)); }
-  .timeline .tl-authoring, .timeline .tl-tracks-toggle { display: none !important; }
+  .timeline .tl-authoring { display: none !important; }
+  .timeline.tl-phone-drawer.tl-expanded .tl-authoring { display: inline-flex !important; }
+  .timeline .tl-tracks-toggle { display: inline-flex !important; min-height: 36px; height: 36px; align-items: center; padding: 0 10px; font-size: 12px; }
   .timeline .track { order: -1; flex: 1 1 80px; min-width: 80px; height: 28px; }
   .timeline .track::before, .timeline .track .fill { top: 13px; }
   .timeline .track .head { top: 8px; }
@@ -1598,6 +1600,21 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
   }
 }
 
+/* Phone Animate full-drawer overlay when expanded (portrait & landscape) */
+.timeline.tl-phone-drawer.tl-expanded {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: calc(10dvh + var(--safe-top));
+  height: auto !important;
+  max-height: none;
+  z-index: 30;
+  border-radius: 18px 18px 0 0;
+  box-shadow: var(--shadow-lg);
+  padding: 6px calc(8px + var(--safe-right)) calc(8px + var(--safe-bottom)) calc(8px + var(--safe-left));
+}
+
 /* Prevent iOS/Safari long-press blue selection box across canvas & chrome while keeping inputs selectable */
 .app, .canvas, .board, .topbar, .dock, .hud-rail, .timeline {
   -webkit-user-select: none;
@@ -1721,9 +1738,19 @@ body[data-workspace-mode="present"] .hud-bc { display: flex !important; }
     padding-right: calc(8px + var(--safe-right));
     padding-bottom: var(--safe-bottom);
   }
-  .timeline .tl-authoring,
-  .timeline .tl-tracks-toggle {
+  .timeline .tl-authoring {
     display: none !important;
+  }
+  .timeline.tl-phone-drawer.tl-expanded .tl-authoring {
+    display: inline-flex !important;
+  }
+  .timeline .tl-tracks-toggle {
+    display: inline-flex !important;
+    min-height: 36px;
+    height: 36px;
+    align-items: center;
+    padding: 0 10px;
+    font-size: 12px;
   }
   .timeline .tl-track { min-width: 80px; }
   .timeline .tl-speed { min-height: 36px; height: 36px; }

@@ -185,6 +185,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   if (move && (typeof move.port?.options !== "function" || typeof move.clock?.mono !== "function")) throw new TypeError("mountApp: move must be { port: MovePort, clock, newKey? }");
   const isNarrowPhone = () => matchMedia("(max-width: 640px)").matches;
   const isPhone = () => isNarrowPhone() || matchMedia("(max-width: 1023px)").matches;
+  const isCompactPhone = () => isNarrowPhone() || (isPhone() && matchMedia("(orientation: landscape) and (max-height: 520px)").matches);
   let mobileDefaultToolApplied = false;
   const S = startSession({
     mine: (() => { try { const v = JSON.parse(get(mineKey) ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } })(),
@@ -1634,7 +1635,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     ui.workspaceMode = mode;
     syncWorkspaceModeAttr(mode);
     if (mode === "animate") {
-      ui.timelineExpanded = !isNarrowPhone();
+      ui.timelineExpanded = !isCompactPhone();
     } else if (mode === "draw") {
       ui.timelineExpanded = false;
     } else if (mode === "present") {
@@ -2185,7 +2186,8 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
       replace,
       reducedMotion: reduced,
       expanded,
-      compactOnly: isNarrowPhone(),
+      compactOnly: false,
+      phoneDrawer: isCompactPhone(),
       showAuthoring: ui.workspaceMode === "animate" && !isNarrowPhone(),
       canEdit: S.may(),
       act: fn => S.act("board", fn),
@@ -2587,7 +2589,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
   // Don't rebuild a panel or drawer the user is typing in.
   const busy = el => el.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName);
   // What every part depends on from the page and the session (a change rebuilds them all, as chromeDirty does).
-  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, ui.workspaceMode, ui.timelineExpanded, isPhone(), isNarrowPhone(), JSON.stringify(ui.panel), ui.ribbon.pinnedOpen, ui.ribbon.manualCollapsed, ui.ribbon.showAll, ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
+  const envKey = () => [S.role, S.effective, S.readOnly, S.may(), S.tool, S.active, S.toolLock(), ui.theme, ui.workspaceMode, ui.timelineExpanded, isPhone(), isNarrowPhone(), isCompactPhone(), JSON.stringify(ui.panel), ui.ribbon.pinnedOpen, ui.ribbon.manualCollapsed, ui.ribbon.showAll, ui.drawer, ui.sheet, ui.dialog, ui.colorPicker, ui.library.length, S.canShare, canMove(), currentBoardTitle ?? "", ui.renamingBoard, serverCanRename, S.eds.board.grid, boardModeration().locked, ui.localView.soloLayerId ?? "", ui.localView.activeViewId ?? ""].join("|");
   const notesRowsKey = () => {
     const { notes, labels } = notesInfo(S.eds.notes.doc);
     return JSON.stringify([notes.length, S.mine.size, notes.slice(0, 200).map(e => [e.id, e.text ?? labels.get(e.id)?.text ?? "", e.backgroundColor, e.strokeColor, S.isMine(e.id)])]);
@@ -2654,7 +2656,7 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     topbar: { key: () => `${ui.workspaceMode}:${notesCount()}${S.canShare ? ":share" : ""}${canMove() ? ":move" : ""}:${moveInfo.space?.id ?? ""}:${moveInfo.space?.name ?? ""}:${currentBoardTitle ?? ""}:${ui.renamingBoard ? "1" : "0"}:${S.eds.board.grid}:${boardModeration().locked ? "1" : "0"}:${ui.localView.soloLayerId ?? ""}:${ui.localView.activeViewId ?? ""}:${viewsOf(S.eds.board.doc).length}:${ribbonTabsKey()}`, build: buildTopbar },
     panel: { key: () => (S.role === "viewer" || ui.workspaceMode === "present" || !ui.panel.open ? "" : `${ui.workspaceMode}:${panelKey()}`), build: buildPanel },
     drawer: { key: () => (ui.workspaceMode === "present" ? "" : ui.drawer === "notes" ? notesRowsKey() : ""), build: buildDrawer },
-    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" || ui.workspaceMode === "present" ? "" : JSON.stringify([ui.workspaceMode, ui.timelineExpanded, isNarrowPhone(), bi.marks, bi.spansSig, bi.tracksSig, bi.cuesSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t, ui.workspaceMode === "animate" ? [...B.sel].join(",") : ""]); }, build: timeline },
+    timeline: { key: () => { const B = S.eds.board, bi = boardInfo(B.doc), t = B.time(); return S.role !== "presenter" || ui.workspaceMode === "present" ? "" : JSON.stringify([ui.workspaceMode, ui.timelineExpanded, isCompactPhone(), bi.marks, bi.spansSig, bi.tracksSig, bi.cuesSig, bi.dur, !!B.play, B.playLoop, B.playSpeed, B.reducedMotion, B.play ? null : t, ui.workspaceMode === "animate" ? [...B.sel].join(",") : ""]); }, build: timeline },
     hud: { key: hudKey, build: hud },
     overlays: { key: () => JSON.stringify([S.status, trashShown(), S.online, S.pending, S.limited, nextTryIn() == null ? null : Math.ceil(nextTryIn() / 1000), S.settingsRefused.map(r => [r.stream, r.i, r.ready, r.code, r.keys]), expiry()?.bucket ?? null]), build: () => replace($("#overlays"), banners()) },
     dock: { key: () => "", build: dock },

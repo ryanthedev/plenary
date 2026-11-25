@@ -2260,15 +2260,15 @@ export function mountApp({ startSession, net, board, me, prefs, theme: theme0 = 
     if (dockEl.hidden) { replace(dockEl, []); return; }
     const btn = (icName, label, on, onclick, disabled = false, ariaLabel = label, extra = {}) => h("button.tb" + (on ? ".on" : ""), { onclick, disabled, "aria-label": ariaLabel, title: ariaLabel, ...(label === "More" ? { "data-dock-more": "1" } : {}), ...extra }, h("span.ic", {}, icon(icName, { size: 20 })), label);
     const sheetBtn = (icName, label, id) => btn(icName, label, ui.sheet === id, e => setSheet(ui.sheet === id ? null : id, { opener: e?.currentTarget }), false, label, { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === id) });
-    const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) });
+    const tool = id => btn(id, T(id).name, S.tool === id, () => { if (id === "image") openPicker(); S.setTool(id); chromeDirty = true; }, id !== "hand" && !may, T(id).name, { "aria-pressed": String(S.tool === id) });
     let items;
     if (role === "presenter") {
       const discussBtn = isNarrowPhone()
         ? [btn("comments", "Discuss", ui.sheet === "notes" || ui.sheet === "comments", e => setSheet(ui.sheet === "notes" || ui.sheet === "comments" ? null : "notes", { opener: e?.currentTarget }), false, "Notes and comments", { "aria-haspopup": "dialog", "aria-expanded": String(ui.sheet === "notes" || ui.sheet === "comments"), "data-dock-discuss": "1" })]
         : [sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
-      items = [...["select", "arrow", "rectangle", "text"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), ...discussBtn];
+      items = [...["hand", "select", "arrow", "rectangle"].map(id => id === "rectangle" ? btn(id, "Rect", S.tool === id, () => { S.setTool(id); chromeDirty = true; }, !may, T(id).name, { "aria-pressed": String(S.tool === id) }) : tool(id)), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), ...discussBtn];
     }
-    else if (role === "annotator") items = [...["select", "note", "highlighter", "arrow"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel"), sheetBtn("note", "Notes", "notes")];
+    else if (role === "annotator") items = [...["hand", "select", "note", "highlighter", "arrow"].map(tool), sheetBtn("more", "More", "tools"), sheetBtn("panel", "Style", "panel")];
     else items = [btn("chevronLeft", "Prev", false, () => stepBoardFrame(-1)), btn("fit", "Fit", false, () => S.fit()), btn("chevronRight", "Next", false, () => stepBoardFrame(1)), sheetBtn("note", "Notes", "notes"), sheetBtn("comments", "Comments", "comments")];
     replace(dockEl, items);
   }

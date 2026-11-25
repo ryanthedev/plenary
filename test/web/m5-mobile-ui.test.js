@@ -338,11 +338,21 @@ test("mobile layout invariants (<= 640px) for presenter, annotator, and viewer",
     expect(overflow).toBeTruthy();
     const dockLabels = findAll(byId.dock, e => e.tagName === "BUTTON").map(b => b.textContent);
     expect(dockLabels.length).toBeLessThanOrEqual(7);
+    expect(dockLabels.some(t => t.includes("Hand"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Select"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Arrow"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Pen") || t.includes("Draw"))).toBe(false);
     expect(dockLabels.some(t => t.includes("More"))).toBe(true);
     expect(dockLabels.some(t => t.includes("Discuss"))).toBe(true);
+    // Switch away to Arrow and back to Hand in 1 tap
+    const arrowBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Arrow"));
+    const handBtn = find(byId.dock, e => e.tagName === "BUTTON" && e.textContent.includes("Hand"));
+    arrowBtn.click();
+    step(2);
+    expect(S.tool).toBe("arrow");
+    handBtn.click();
+    step(2);
+    expect(S.tool).toBe("hand");
     overflow.click();
     step(2);
     expect(app.ui.sheet).toBe("tools");

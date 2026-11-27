@@ -112,6 +112,13 @@ services:
 
       # Optional Prometheus metrics (GET /metrics)
       PLENARY_METRICS_TOKEN:
+
+      # Public-exposure hardening (behind Caddy HTTPS proxy)
+      PLENARY_TRUST_PROXY: ${PLENARY_TRUST_PROXY:-1}
+      PLENARY_RATE_LIMIT: ${PLENARY_RATE_LIMIT:-1}
+      PLENARY_HIDE_HEALTH_STATS: ${PLENARY_HIDE_HEALTH_STATS:-1}
+      PLENARY_AUTO_PROVISION_DOMAIN_ORGS:
+      PLENARY_ALLOW_PERSONAL_ORGS:
     volumes:
       - plenary-data:/data
     depends_on:

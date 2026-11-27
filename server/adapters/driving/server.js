@@ -22,7 +22,79 @@ import { blobRoutes } from "./blob-http.js";
 import { metricsRoute } from "./metrics-http.js";
 import { noopMetrics } from "../../ports/metrics.js";
 
-const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+const BASE_SECURITY_HEADERS = Object.freeze({
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+});
+
+const json = (status, body, extraHeaders = {}) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", "cache-control": "no-store", ...BASE_SECURITY_HEADERS, ...extraHeaders },
+  });
+
+/**
+ * Apply baseline HTTP security headers to every response without clobbering stricter route-specific headers.
+ * @param {Response} res
+ * @param {{ https: boolean, isEmbed: boolean }} opts
+ */
+function hardenResponse(res, { https, isEmbed }) {
+  const h = res.headers;
+  if (!h.has("x-content-type-options")) h.set("x-content-type-options", "nosniff");
+  if (!h.has("referrer-policy")) h.set("referrer-policy", "no-referrer");
+  if (!h.has("permissions-policy")) h.set("permissions-policy", BASE_SECURITY_HEADERS["permissions-policy"]);
+  if (!isEmbed && !h.has("x-frame-options")) h.set("x-frame-options", "DENY");
+  if (https && !h.has("strict-transport-security")) h.set("strict-transport-security", "max-age=63072000; includeSubDomains");
+  const ct = h.get("content-type") ?? "";
+  if (ct.includes("text/html") && !h.has("cross-origin-opener-policy")) h.set("cross-origin-opener-policy", "same-origin");
+  return res;
+}
+
+/**
+ * Bounded per-IP token-bucket rate limiter (FIFO eviction past `maxEntries` so an IP flood cannot OOM the process).
+ * @param {{ burst: number, refillPerSec: number, maxEntries?: number, now?: () => number }} opts
+ */
+function createIpRateLimiter({ burst, refillPerSec, maxEntries = 10_000, now = Date.now }) {
+  /** @type {Map<string, { tokens: number, lastMs: number }>} */
+  const buckets = new Map();
+  return {
+    /** @param {string} key @returns {{ ok: boolean, retryAfterSec?: number }} */
+    take(key) {
+      const t = now();
+      let b = buckets.get(key);
+      if (!b) {
+        if (buckets.size >= maxEntries) buckets.delete(buckets.keys().next().value);
+        b = { tokens: burst, lastMs: t };
+        buckets.set(key, b);
+      } else {
+        const elapsed = Math.max(0, (t - b.lastMs) / 1000);
+        b.tokens = Math.min(burst, b.tokens + elapsed * refillPerSec);
+        b.lastMs = t;
+      }
+      if (b.tokens >= 1) {
+        b.tokens -= 1;
+        return { ok: true };
+      }
+      const waitSec = Math.max(1, Math.ceil((1 - b.tokens) / refillPerSec));
+      return { ok: false, retryAfterSec: waitSec };
+    },
+  };
+}
+
+/** Extract client IP for rate limiting: uses CF-Connecting-IP / X-Forwarded-For only when `trustProxy` is true. */
+function clientIpOf(req, srv, trustProxy) {
+  if (trustProxy) {
+    const cf = req.headers.get("cf-connecting-ip")?.trim();
+    if (cf && cf.length <= 64) return cf;
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) {
+      const first = xff.split(",")[0]?.trim();
+      if (first && first.length <= 64) return first;
+    }
+  }
+  try { return srv.requestIP?.(req)?.address || "unknown"; } catch { return "unknown"; }
+}
 
 /**
  * @param {{
@@ -41,13 +113,17 @@ const json = (status, body) => new Response(JSON.stringify(body), { status, head
  *   deflate?: ((data: string | Uint8Array) => Promise<Uint8Array | null>) | null,
  *   onWelcomed?: ((user: string, board: string) => void) | null,
  *   snapshotTickets?: { issue(board: string, seq: number): Promise<string> } | null,
+ *   hideHealthStats?: boolean,
+ *   trustProxy?: boolean,
+ *   rateLimit?: boolean | { authBurst?: number, authRefillPerSec?: number, wsBurst?: number, wsRefillPerSec?: number } | null,
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
  *   leaseTtlMs). `static: false` serves no web app; an object passes its `mounts` to staticSite (default: the repo's
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
  *   (names a gateway-only node's open requests). `onWelcomed(user, board)`: told when a connection is welcomed (Recent). `now`, `timers`: the gateway's clock and timers; tests inject virtual ones (default Date.now and the globals).
  */
 export function createServer({ auth, registry, store, bus, blobs = null, log = quietLogger, port = 0, hostname = "127.0.0.1", http, limits, metrics = noopMetrics, metricsEndpoint, host = {}, static: web = {},
-  roles = { gateway: true, host: true }, node = "node", now, timers, deflate, blobKey, quotaBytes, blobUsageTtlMs, publicUrl, maxBlobPuts, blobHttp: blobHttpOpts, onWelcomed, idleTimeoutSec = 30, snapshotTickets = null }) {
+  roles = { gateway: true, host: true }, node = "node", now, timers, deflate, blobKey, quotaBytes, blobUsageTtlMs, publicUrl, maxBlobPuts, blobHttp: blobHttpOpts, onWelcomed, idleTimeoutSec = 30, snapshotTickets = null,
+  hideHealthStats = false, trustProxy = false, rateLimit = false }) {
   if (!roles || (!roles.gateway && !roles.host)) throw new TypeError("createServer needs at least one role (gateway, host)");
   const started = Date.now();
   const badRequest = badRequestLimiter();
@@ -57,11 +133,17 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
     : remoteRooms({ bus, node, timeoutMs: host.leaseTtlMs ?? 10_000, log });
   const unserve = roles.host ? serveOpens({ bus, rooms, log }) : () => {};
   const origin = publicUrl?.replace(/\/+$/, "") ?? "";   // "": signed URLs are the path /blobs/<token>, which the client resolves against the origin it connected to
+  const isHttps = origin.startsWith("https://");
+  const clock = now ?? Date.now;
+  const rlOpts = rateLimit === true ? {} : (rateLimit && typeof rateLimit === "object" ? rateLimit : null);
+  const authLimiter = rlOpts ? createIpRateLimiter({ burst: rlOpts.authBurst ?? 30, refillPerSec: rlOpts.authRefillPerSec ?? 1, now: clock }) : null;
+  const wsLimiter = rlOpts ? createIpRateLimiter({ burst: rlOpts.wsBurst ?? 60, refillPerSec: rlOpts.wsRefillPerSec ?? 2, now: clock }) : null;
   const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}), ...(blobUsageTtlMs ? { usageTtlMs: blobUsageTtlMs } : {}) }) : null;
   const blobHttp = access ? blobRoutes({ access, ...(maxBlobPuts ? { maxPuts: maxBlobPuts } : {}), ...(blobHttpOpts ?? {}) }) : null;
   const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, metrics, snapshotTickets, ...(deflate ? { deflate } : {}), ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}), ...(onWelcomed ? { onWelcomed } : {}) }) : null;
 
   const metricsHttp = metricsRoute({ ...metricsEndpoint, log });
+  const finish = (res, pathname) => hardenResponse(res, { https: isHttps, isEmbed: pathname.startsWith("/embed/") });
   const server = Bun.serve({
     port, hostname,
     // Bun's default is 10 s without a byte either way, which would cut a slow upload of a 10 MB picture mid-body (WebSockets have their
@@ -71,25 +153,46 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
       try {
         let url;
         try { url = new URL(req.url); }
-        catch { badRequest(log); return json(400, { error: "bad-request" }); }   // a malformed Host header: no stack, a short line at most
-        if (url.pathname === "/health" && (req.method === "GET" || req.method === "HEAD"))
-          return json(200, { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...(http?.stats ? { http: http.stats() } : {}), ...rooms.stats() });
-        if (url.pathname === "/metrics") return await metricsHttp.handle(req);   // before the host-only 404: a host node is the one with the leases
-        if (!gw) return json(404, { error: "not-found" });   // host only: nothing but /health
-        if (url.pathname === "/ws") {
-          if (srv.upgrade(req, /** @type {any} */ ({ data: { z: url.searchParams.get("z") === "deflate" } }))) return undefined;   // § Joining: the client can inflate catch-up
-          return json(426, { error: "upgrade", message: "this is a WebSocket endpoint" });
+        catch { badRequest(log); return hardenResponse(json(400, { error: "bad-request" }), { https: isHttps, isEmbed: false }); }   // a malformed Host header: no stack, a short line at most
+        const path = url.pathname;
+        if (path === "/health" && (req.method === "GET" || req.method === "HEAD")) {
+          const body = hideHealthStats
+            ? { ok: true }
+            : { ok: true, uptimeMs: Date.now() - started, roles: { gateway: !!gw, host: !!roles.host }, gateway: gw ? gw.stats() : null, ...(http?.stats ? { http: http.stats() } : {}), ...rooms.stats() };
+          return finish(json(200, body), path);
         }
-        if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return res; }
-        if (http) { const res = await http(req, url); if (res) return res; }
-        if (site) { const res = await site.handle(req, url); if (res) return res; }
-        return json(404, { error: "not-found" });
+        if (path === "/metrics") return finish(await metricsHttp.handle(req), path);   // before the host-only 404: a host node is the one with the leases
+        if (!gw) return finish(json(404, { error: "not-found" }), path);   // host only: nothing but /health
+        if (path === "/ws") {
+          const reqOrigin = req.headers.get("origin");
+          if (reqOrigin) {
+            const allowedOrigin = origin || url.origin;
+            if (reqOrigin !== allowedOrigin) {
+              log.warn("ws upgrade rejected: bad origin");
+              return finish(json(403, { error: "bad-origin" }), path);
+            }
+          }
+          if (wsLimiter) {
+            const rl = wsLimiter.take(clientIpOf(req, srv, trustProxy));
+            if (!rl.ok) return finish(json(429, { error: "rate-limited", retryAfter: rl.retryAfterSec }, { "retry-after": String(rl.retryAfterSec) }), path);
+          }
+          if (srv.upgrade(req, /** @type {any} */ ({ data: { z: url.searchParams.get("z") === "deflate" } }))) return undefined;   // § Joining: the client can inflate catch-up
+          return finish(json(426, { error: "upgrade", message: "this is a WebSocket endpoint" }), path);
+        }
+        if (authLimiter && (path.startsWith("/auth/") || path.startsWith("/links/"))) {
+          const rl = authLimiter.take(clientIpOf(req, srv, trustProxy));
+          if (!rl.ok) return finish(json(429, { error: "rate-limited", retryAfter: rl.retryAfterSec }, { "retry-after": String(rl.retryAfterSec) }), path);
+        }
+        if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return finish(res, path); }
+        if (http) { const res = await http(req, url); if (res) return finish(res, path); }
+        if (site) { const res = await site.handle(req, url); if (res) return finish(res, path); }
+        return finish(json(404, { error: "not-found" }), path);
       } catch (err) {
         log.error("http handler failed", { method: req.method, err });
-        return json(500, { error: "internal" });
+        return hardenResponse(json(500, { error: "internal" }), { https: isHttps, isEmbed: false });
       }
     },
-    error(err) { log.error("http error", { err }); return json(500, { error: "internal" }); },
+    error(err) { log.error("http error", { err }); return hardenResponse(json(500, { error: "internal" }), { https: isHttps, isEmbed: false }); },
     // A host-only node never upgrades (/ws is 404 above); Bun still wants handlers.
     websocket: gw ? gw.websocket : { message() {} },
   });

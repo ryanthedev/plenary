@@ -126,7 +126,7 @@ const DEV_MENU_WAIT_MS = 3000;
 export const REQUEST_DEADLINE_MS = 8000;
 /** `Idempotency-Key`: 8-64 of [A-Za-z0-9_-] (PROTOCOL.md "Idempotent creates"). */
 const IDEM_KEY = /^[A-Za-z0-9_-]{8,64}$/;
-const NO_STORE = { "cache-control": "no-store" };
+const NO_STORE = { "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" };
 const json = (status, body, headers = {}) =>
   new Response(body === undefined ? null : JSON.stringify(body), {
     status, headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...NO_STORE, ...headers },
@@ -228,6 +228,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
   const providerMap = new Map(providerList.map(p => [p.id, p]));
   const hasOidc = providerList.length > 0;
   const autoProvisionDomainOrgs = Boolean(config.autoProvisionDomainOrgs);
+  const allowPersonalOrgs = config.allowPersonalOrgs !== false;
 
   let macKey = null;
   if (hasOidc) {
@@ -771,6 +772,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
       },
       POST: async req => {
         const who = await caller(req);
+        if (!allowPersonalOrgs) throw new AdminError("forbidden", "personal workspace creation is disabled");
         const b = await body(req, ["name"]);
         const tenant = await createPersonalTenant({ caller: who, name: b.name }, admin);
         return json(201, { tenant });

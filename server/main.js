@@ -613,6 +613,13 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
 
   const perUser = Number(env.PLENARY_MAX_CONNS_PER_USER);
   const limits = Number.isSafeInteger(perUser) && perUser > 0 ? { maxConnsPerUser: perUser } : undefined;
+  const publicHost = publicHostOf(env.PUBLIC_URL);
+  const isPublicOrigin = Boolean(publicHost && !LOOPBACK_HOSTS.includes(publicHost.toLowerCase()));
+  const hideHealthStats = env.PLENARY_HIDE_HEALTH_STATS === "1" || env.PLENARY_HIDE_HEALTH_STATS === "true";
+  const trustProxy = env.PLENARY_TRUST_PROXY === "1" || env.PLENARY_TRUST_PROXY === "true";
+  const rateLimit = env.PLENARY_RATE_LIMIT === "0" || env.PLENARY_RATE_LIMIT === "false"
+    ? false
+    : (env.PLENARY_RATE_LIMIT === "1" || env.PLENARY_RATE_LIMIT === "true" || isPublicOrigin);
   const config = {
     cookieKey,
     postLoginUrl: env.POST_LOGIN_URL || `${origin}/`,
@@ -620,6 +627,7 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
     publicUrl: origin,
     requestDeadlineMs,
     autoProvisionDomainOrgs: env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS !== "0",
+    allowPersonalOrgs: env.PLENARY_ALLOW_PERSONAL_ORGS !== "0" && env.PLENARY_ALLOW_PERSONAL_ORGS !== "false",
   };
   if (devMenu) config.devSignIn = devMenu;
   const home = homeService({ registry, tenancy });
@@ -636,7 +644,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   const snapshot = { get: (board, seq) => server?.gateway?.snapshot(board, seq) ?? null };
   const http = httpRoutes({ registry, sessions, oidc, providers, tenancy, home, spaces, access, offboard, now: Date.now, config, log: log.child({ component: "auth" }), snapshot, snapshotTickets, ...(dev.enabled ? { dev } : {}) });
   server = createServer({ auth, registry, store, bus, blobs, blobKey, snapshotTickets, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), blobUsageTtlMs: Number(reapRaw ?? 600_000), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
-    roles, node, host: { hostname: node, leaseTtlMs }, metrics, ...(prom ? { metricsEndpoint: { token: metricsToken, render: prom.render } } : {}) });
+    roles, node, host: { hostname: node, leaseTtlMs }, metrics, ...(prom ? { metricsEndpoint: { token: metricsToken, render: prom.render } } : {}),
+    hideHealthStats, trustProxy, rateLimit });
   // The purge of Trash: every node sweeps on a timer (the claim is a conditional write and every delete a no-op the second time, so two nodes are safe). The timer is the only wall-clock wait; tests drive `sweep()` on an injected clock.
   const sweeper = trashSweeper({ registry: rawRegistry, store, clock: { now: Date.now }, log: log.child({ component: "trash" }) });
   const sweepTimer = setInterval(() => { sweeper.sweep().then(r => { if (r.boards || r.spaces || r.failed) log.info("trash sweep", r); }); }, Number(sweepRaw ?? 600_000));

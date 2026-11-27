@@ -2,6 +2,8 @@
 
 **Plenary** is an open-source (Apache-2.0), self-hostable collaborative infinite canvas built with Bun, vanilla ESM JavaScript, and a strict hexagonal architecture — from a 5-minute single-node pilot to a multi-node high-availability cluster.
 
+**[Try Plenary Live (`p5y.omni.ooo`)](https://p5y.omni.ooo)** · **[Interactive Showcase & Overview](https://ryan.upubli.sh/plenary/)** · **[GitHub Repository](https://github.com/ryanthedev/plenary)**
+
 Presenters sketch diagrams, import Excalidraw/Draw.io/Mermaid scenes, animate multi-swimlane timelines, and run live presentations, while annotators and audiences collaborate in real time through isolated **board**, **notes**, and **comments (`records`)** streams.
 
 ---
@@ -144,6 +146,8 @@ bun run clean
 
 ## Documentation
 
+- **Live Instance:** <https://p5y.omni.ooo>
+- **Interactive Showcase & Feature Overview:** <https://ryan.upubli.sh/plenary/>
 - **End-User Guide:** [`docs/user-guide.md`](docs/user-guide.md)
 - **OIDC, Google & Microsoft Entra ID Setup:** [`docs/self-hosting-oidc.md`](docs/self-hosting-oidc.md)
 - **Enterprise Self-Hosting & Operations Handbook:** [`docs/enterprise-hosting.md`](docs/enterprise-hosting.md)

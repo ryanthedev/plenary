@@ -186,7 +186,7 @@ describe("microsoftOidc + verifyMicrosoftIdToken", () => {
     });
   });
 
-  test("preferred_username fallback when email claim is absent, and sub fallback when oid is absent", async () => {
+  test("preferred_username fallback never derives a corporate domain, and sub fallback works when oid is absent", async () => {
     const keys = jwksCache({ url: microsoftEndpoints("common").jwks, fetch: msIdp.fetch, now, algorithms: ["RS256"] });
     const tok = await msIdp.mint({
       nonce: "n-pref",
@@ -202,9 +202,18 @@ describe("microsoftOidc + verifyMicrosoftIdToken", () => {
       user: "microsoft:sub-only-99",
       name: "Crew Member",
       email: "crew.member@alaskaair.com",
-      domain: "alaskaair.com",
+      domain: null,
       tid: ALASKA_TID,
     });
+
+    // Unverified email (xms_edov: false) and consumer mail domain on a work tenant must also yield domain: null
+    const unverified = await msIdp.mint({ nonce: "n-unv", tid: ALASKA_TID, email: "ceo@victim.com", xms_edov: false });
+    expect(await verifyMicrosoftIdToken(unverified, { clientId: MS_CLIENT_ID, tenant: "common", nonce: "n-unv", keys, now }))
+      .toMatchObject({ email: null, domain: null });
+
+    const consumerGuest = await msIdp.mint({ nonce: "n-cg", tid: ALASKA_TID, email: "guest@gmail.com" });
+    expect(await verifyMicrosoftIdToken(consumerGuest, { clientId: MS_CLIENT_ID, tenant: "common", nonce: "n-cg", keys, now }))
+      .toMatchObject({ email: "guest@gmail.com", domain: null });
   });
 
   test("MSA consumer tenant gets domain: null in `common` and is rejected in `organizations`", async () => {

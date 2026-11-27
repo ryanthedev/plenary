@@ -151,7 +151,7 @@ test("headers are exact: CSP, nosniff, no-referrer, no-cache, a strong ETag", as
   const p = plant();
   const res = await get(staticSite({ mounts: p.mounts }), "/main.js");
   expect(res.headers.get("content-security-policy")).toBe("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-    "img-src 'self' data: blob:; media-src 'self' blob:; frame-src https://www.youtube-nocookie.com; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    "img-src 'self' data: blob:; media-src 'self' blob:; frame-src https://www.youtube-nocookie.com; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
   expect(CSP).toBe(res.headers.get("content-security-policy"));
   expect(res.headers.get("x-content-type-options")).toBe("nosniff");
   expect(res.headers.get("referrer-policy")).toBe("no-referrer");

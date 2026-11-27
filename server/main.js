@@ -233,9 +233,9 @@ export function redact(text, urls, parts = secretsOf(urls)) {
  * Error's message, code and stack (log.js logs no `cause`), before log.js clips or escapes them. Errors stay
  * Errors, so lines keep their shape. Children redact too. With no URL set it returns `log` unchanged.
  */
-export function redactingLogger(log, urls) {
-  if (!urls.some(u => typeof u === "string" && u.trim())) return log;
-  const parts = secretsOf(urls);   // once, not per string
+export function redactingLogger(log, urls, extraSecrets = []) {
+  const secretList = extraSecrets.filter(s => typeof s === "string" && s.length >= 8);
+  const parts = [...new Set([...secretsOf(urls), ...secretList])].sort((a, b) => b.length - a.length);
   const r = t => redact(t, urls, parts);
   const scrub = (v, depth) => {
     try {
@@ -378,7 +378,8 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   // write: tests capture log lines; hostname: tests fix the default node id; adapters: tests replace the cluster
   // adapter factories ({ postgresStore?, postgresRegistry?, natsBus? }) with fakes.
   // Every line this node logs, from any component, has the URLs' secrets redacted (p4-wire2 L2).
-  const log = redactingLogger(createLogger({ level: /** @type {"debug"|"info"|"warn"|"error"} */ (env.LOG_LEVEL || "info"), ...(write ? { write } : {}) }), [env.DATABASE_URL, env.NATS_URL]);
+  const envSecrets = [env.S3_SECRET_ACCESS_KEY, env.S3_SESSION_TOKEN, env.GOOGLE_CLIENT_SECRET, env.MICROSOFT_CLIENT_SECRET, env.OIDC_CLIENT_SECRET, env.COOKIE_KEY, env.SESSION_KEY, env.PLENARY_METRICS_TOKEN];
+  const log = redactingLogger(createLogger({ level: /** @type {"debug"|"info"|"warn"|"error"} */ (env.LOG_LEVEL || "info"), ...(write ? { write } : {}) }), [env.DATABASE_URL, env.NATS_URL], envSecrets);
   // Every refusal of the cluster env comes before anything is created, connected or listening.
   const { cluster, node, roles, leaseTtlMs, requestDeadlineMs } = nodeConfig(env, hostname ?? osHostname());
   const sweepRaw = env.PLENARY_TRASH_SWEEP_MS;   // checked here, before anything opens
@@ -406,8 +407,11 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   }
   const sessionKey = env.SESSION_KEY ?? cookieKey;
   if (!keyOk(sessionKey)) throw new Error(`SESSION_KEY must be at least ${KEY_MIN} bytes`);
-  const redirectUri = env.OIDC_REDIRECT_URI || "http://localhost:8080/auth/callback";
+  const redirectUri = env.OIDC_REDIRECT_URI || (env.PUBLIC_URL ? `${new URL(env.PUBLIC_URL).origin}/auth/callback` : "http://localhost:8080/auth/callback");
   const origin = env.PUBLIC_URL ? new URL(env.PUBLIC_URL).origin : new URL(redirectUri).origin;
+  if (env.PUBLIC_URL && env.OIDC_REDIRECT_URI && new URL(redirectUri).origin !== origin) {
+    throw new Error(`OIDC_REDIRECT_URI must share PUBLIC_URL's origin (${origin})`);
+  }
 
   // /metrics is off unless a token is set; a set but short or blank one is a mistake, so it refuses the start (the value is never in the message).
   const metricsToken = env.PLENARY_METRICS_TOKEN;
@@ -613,21 +617,28 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
 
   const perUser = Number(env.PLENARY_MAX_CONNS_PER_USER);
   const limits = Number.isSafeInteger(perUser) && perUser > 0 ? { maxConnsPerUser: perUser } : undefined;
-  const publicHost = publicHostOf(env.PUBLIC_URL);
+  const publicHost = publicHostOf(origin);
   const isPublicOrigin = Boolean(publicHost && !LOOPBACK_HOSTS.includes(publicHost.toLowerCase()));
-  const hideHealthStats = env.PLENARY_HIDE_HEALTH_STATS === "1" || env.PLENARY_HIDE_HEALTH_STATS === "true";
+  const hideHealthStats = env.PLENARY_HIDE_HEALTH_STATS === "0" || env.PLENARY_HIDE_HEALTH_STATS === "false"
+    ? false
+    : (env.PLENARY_HIDE_HEALTH_STATS === "1" || env.PLENARY_HIDE_HEALTH_STATS === "true" || isPublicOrigin);
   const trustProxy = env.PLENARY_TRUST_PROXY === "1" || env.PLENARY_TRUST_PROXY === "true";
   const rateLimit = env.PLENARY_RATE_LIMIT === "0" || env.PLENARY_RATE_LIMIT === "false"
     ? false
     : (env.PLENARY_RATE_LIMIT === "1" || env.PLENARY_RATE_LIMIT === "true" || isPublicOrigin);
+  const maxPersonalOrgsRaw = Number(env.PLENARY_MAX_PERSONAL_ORGS);
+  const maxPersonalOrgs = Number.isInteger(maxPersonalOrgsRaw) && maxPersonalOrgsRaw > 0 ? maxPersonalOrgsRaw : undefined;
+  /** @type {Record<string, any>} */
   const config = {
     cookieKey,
     postLoginUrl: env.POST_LOGIN_URL || `${origin}/`,
     boardUrl: env.BOARD_URL || `${origin}/?board={board}`,
     publicUrl: origin,
     requestDeadlineMs,
-    autoProvisionDomainOrgs: env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS !== "0",
+    autoProvisionDomainOrgs: env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS === "1" || env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS === "true"
+      || (env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS !== "0" && env.PLENARY_AUTO_PROVISION_DOMAIN_ORGS !== "false" && !isPublicOrigin),
     allowPersonalOrgs: env.PLENARY_ALLOW_PERSONAL_ORGS !== "0" && env.PLENARY_ALLOW_PERSONAL_ORGS !== "false",
+    ...(maxPersonalOrgs ? { maxPersonalOrgs } : {}),
   };
   if (devMenu) config.devSignIn = devMenu;
   const home = homeService({ registry, tenancy });
@@ -643,9 +654,9 @@ export async function start(env = {}, { fetch: fetchFn = globalThis.fetch, write
   let server;
   const snapshot = { get: (board, seq) => server?.gateway?.snapshot(board, seq) ?? null };
   const http = httpRoutes({ registry, sessions, oidc, providers, tenancy, home, spaces, access, offboard, now: Date.now, config, log: log.child({ component: "auth" }), snapshot, snapshotTickets, ...(dev.enabled ? { dev } : {}) });
-  server = createServer({ auth, registry, store, bus, blobs, blobKey, snapshotTickets, ...(env.PUBLIC_URL ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), blobUsageTtlMs: Number(reapRaw ?? 600_000), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
+  server = createServer({ auth, registry, store, bus, blobs, blobKey, snapshotTickets, ...(env.PUBLIC_URL || env.OIDC_REDIRECT_URI ? { publicUrl: origin } : {}), ...(quotaRaw ? { quotaBytes: Number(quotaRaw) } : {}), blobUsageTtlMs: Number(reapRaw ?? 600_000), log, limits, http, deflate: zlibDeflate(), onWelcomed: recentRecorder({ registry, log: log.child({ component: "home" }) }), port: Number(env.PORT ?? 8080), hostname: env.HOST || "127.0.0.1",
     roles, node, host: { hostname: node, leaseTtlMs }, metrics, ...(prom ? { metricsEndpoint: { token: metricsToken, render: prom.render } } : {}),
-    hideHealthStats, trustProxy, rateLimit });
+    static: { cache: isProd || isPublicOrigin }, hideHealthStats, trustProxy, rateLimit });
   // The purge of Trash: every node sweeps on a timer (the claim is a conditional write and every delete a no-op the second time, so two nodes are safe). The timer is the only wall-clock wait; tests drive `sweep()` on an injected clock.
   const sweeper = trashSweeper({ registry: rawRegistry, store, clock: { now: Date.now }, log: log.child({ component: "trash" }) });
   const sweepTimer = setInterval(() => { sweeper.sweep().then(r => { if (r.boards || r.spaces || r.failed) log.info("trash sweep", r); }); }, Number(sweepRaw ?? 600_000));

@@ -40,20 +40,20 @@ async function readExactly(req, len, signal) {
   return out;
 }
 
-export const MAX_CONCURRENT_PUTS = 8, MAX_PUTS_PER_USER = 2, BODY_DEADLINE_MS = 120_000;
+export const MAX_CONCURRENT_PUTS = 8, MAX_PUTS_PER_USER = 2, MAX_CONCURRENT_GETS = 32, BODY_DEADLINE_MS = 120_000;
 const busy = () => json(503, { error: "busy" }, { "retry-after": "2" });
 
 /**
  * @param {{ access: ReturnType<typeof import("../../core/blob-access.js").blobAccess>, maxPuts?: number, maxPutsPerUser?: number,
- *           bodyDeadlineMs?: number, timers?: { set(fn: () => void, ms: number): any, clear(h: any): void } }} o
+ *           maxGets?: number, bodyDeadlineMs?: number, timers?: { set(fn: () => void, ms: number): any, clear(h: any): void } }} o
  *   maxPuts: PUT bodies being read or stored at once on this node (each can hold 10 MB); maxPutsPerUser: the same for one
- *   account (tenant and user from the verified token, across all its boards), so one account's slow uploads can't take every slot. Past either, 503
+ *   account (user from the verified token, across all its tenants and boards), so one account's slow uploads can't take every slot. Past either, 503
  *   `busy` (a client retries). One token has one PUT in flight: a second gets 409 `in-flight`. bodyDeadlineMs: the whole
  *   body must arrive within it, however slowly it drips (408 `timeout`, retryable); the idle timeout can't see a drip.
  *   timers: where the deadline runs (default the globals; tests pass a virtual one).
  */
-export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUser = MAX_PUTS_PER_USER, bodyDeadlineMs = BODY_DEADLINE_MS, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
-  let puts = 0;
+export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUser = MAX_PUTS_PER_USER, maxGets = MAX_CONCURRENT_GETS, bodyDeadlineMs = BODY_DEADLINE_MS, timers = { set: (f, ms) => setTimeout(f, ms), clear: h => clearTimeout(h) } }) {
+  let puts = 0, gets = 0;
   const byUser = new Map(), tokens = new Set();
   return {
     /** @returns {Promise<Response | undefined>} undefined when the path isn't ours. */
@@ -62,35 +62,41 @@ export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUs
       const token = url.pathname.slice("/blobs/".length);
       if (!token || token.includes("/")) return json(404, { error: "not-found" });
       if (req.method === "GET" || req.method === "HEAD") {
-        const r = await access.get(token);
-        if (!r.ok || "code" in r) return fail("code" in r ? r.code : "unavailable");
-        const baseHeaders = {
-          "accept-ranges": "bytes",
-          "x-content-type-options": "nosniff",
-          "cache-control": "no-store",
-          "content-security-policy": "default-src 'none'; sandbox",
-        };
-        const parsedRange = req.method === "GET" ? parseByteRange(req.headers.get("range"), r.bytes.byteLength) : null;
-        if (parsedRange) {
-          if (parsedRange.unsatisfiable) {
-            return new Response(null, { status: 416, headers: { ...baseHeaders, "content-range": `bytes */${r.bytes.byteLength}` } });
+        if (gets >= maxGets) return busy();
+        gets++;
+        try {
+          const r = await access.get(token);
+          if (!r.ok || "code" in r) return fail("code" in r ? r.code : "unavailable");
+          const baseHeaders = {
+            "accept-ranges": "bytes",
+            "x-content-type-options": "nosniff",
+            "cache-control": "no-store",
+            "content-security-policy": "default-src 'none'; sandbox",
+          };
+          const parsedRange = req.method === "GET" ? parseByteRange(req.headers.get("range"), r.bytes.byteLength) : null;
+          if (parsedRange) {
+            if (parsedRange.unsatisfiable) {
+              return new Response(null, { status: 416, headers: { ...baseHeaders, "content-range": `bytes */${r.bytes.byteLength}` } });
+            }
+            const { start, end } = parsedRange;
+            const slice = r.bytes.subarray(start, end + 1);
+            return new Response(/** @type {BodyInit} */ (slice), {
+              status: 206,
+              headers: {
+                ...baseHeaders,
+                "content-type": r.type,
+                "content-length": String(slice.byteLength),
+                "content-range": `bytes ${start}-${end}/${r.bytes.byteLength}`,
+              },
+            });
           }
-          const { start, end } = parsedRange;
-          const slice = r.bytes.subarray(start, end + 1);
-          return new Response(/** @type {BodyInit} */ (slice), {
-            status: 206,
-            headers: {
-              ...baseHeaders,
-              "content-type": r.type,
-              "content-length": String(slice.byteLength),
-              "content-range": `bytes ${start}-${end}/${r.bytes.byteLength}`,
-            },
+          return new Response(req.method === "HEAD" ? null : /** @type {BodyInit} */ (r.bytes), {
+            status: 200,
+            headers: { ...baseHeaders, "content-type": r.type, "content-length": String(r.bytes.byteLength) },
           });
+        } finally {
+          gets--;
         }
-        return new Response(req.method === "HEAD" ? null : /** @type {BodyInit} */ (r.bytes), {
-          status: 200,
-          headers: { ...baseHeaders, "content-type": r.type, "content-length": String(r.bytes.byteLength) },
-        });
       }
       if (req.method === "PUT") {
         const v = await access.verify(token, "PUT");     // before a byte of body is read: no token, no upload
@@ -100,8 +106,8 @@ export function blobRoutes({ access, maxPuts = MAX_CONCURRENT_PUTS, maxPutsPerUs
         const len = Number(raw);
         if (!len) return fail("bad-length");
         if (len > MAX_VIDEO_BLOB_BYTES) return fail("too-large");
-        // One account, however many boards it spreads over; a token with no user (not minted by a gateway today) shares one tight bucket per tenant.
-        const who = v.user === null ? `${v.tenant}/` : `${v.tenant}/${v.user}`, cap = v.user === null ? 1 : maxPutsPerUser;
+        // Key by user alone across all tenants/boards so creating multiple personal orgs cannot multiply upload slots.
+        const who = v.user === null ? `${v.tenant}/` : v.user, cap = v.user === null ? 1 : maxPutsPerUser;
         if (tokens.has(token)) return json(409, { error: "in-flight" });
         if (puts >= maxPuts || (byUser.get(who) ?? 0) >= cap) return busy();
         puts++; byUser.set(who, (byUser.get(who) ?? 0) + 1); tokens.add(token);

@@ -649,13 +649,17 @@ export async function verifyMicrosoftIdToken(token, { clientId, tenant = "common
   const rawSub = (typeof c.oid === "string" && c.oid) ? c.oid : c.sub;
   if (typeof rawSub !== "string" || !rawSub || rawSub.length > 255 || /[\0\r\n]/.test(rawSub)) return refuse("bad_sub");
 
-  const email = c.email_verified === false
-    ? null
-    : (normalizeEmailClaim(c.email) ?? normalizeEmailClaim(c.preferred_username));
-  const emailDomain = email ? email.slice(email.lastIndexOf("@") + 1) : null;
-  let domain = emailDomain && tid !== MICROSOFT_CONSUMER_TID ? emailDomain : null;
-  if (!domain && trustVerifiedEmail && emailDomain && !CONSUMER_MAIL_DOMAINS.has(emailDomain)) {
-    domain = emailDomain;
+  const emailClaim = normalizeEmailClaim(c.email);
+  const emailVerified = c.email_verified !== false && c.xms_edov !== false && c.xms_edov !== 0;
+  const email = emailVerified ? (emailClaim ?? normalizeEmailClaim(c.preferred_username)) : null;
+  // Derive corporate domain ONLY from a verified `email` claim (never from `preferred_username`, which
+  // Microsoft does not verify for domain ownership) and never from public consumer mail domains.
+  const verifiedEmailDomain = emailVerified && emailClaim ? emailClaim.slice(emailClaim.lastIndexOf("@") + 1) : null;
+  let domain = verifiedEmailDomain && tid !== MICROSOFT_CONSUMER_TID && !CONSUMER_MAIL_DOMAINS.has(verifiedEmailDomain)
+    ? verifiedEmailDomain
+    : null;
+  if (!domain && trustVerifiedEmail && verifiedEmailDomain && !CONSUMER_MAIL_DOMAINS.has(verifiedEmailDomain)) {
+    domain = verifiedEmailDomain;
   }
   const rawName = typeof c.name === "string" && c.name.trim() ? c.name.trim() : null;
 

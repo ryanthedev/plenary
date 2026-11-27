@@ -139,3 +139,34 @@ test("allowPersonalOrgs: false blocks POST /tenants with 403 forbidden", async (
   expect(res.status).toBe(403);
   expect(await res.json()).toEqual({ error: "forbidden" });
 });
+
+test("IPv6 /128 addresses in the same /64 share one rate-limit bucket, and CORP header is set", async () => {
+  let t = 2_000_000;
+  const { srv } = await makeTestServer({
+    publicUrl: "https://p5y.omni.ooo",
+    trustProxy: true,
+    rateLimit: { authBurst: 2, authRefillPerSec: 1 },
+    now: () => t,
+  });
+
+  const r1 = await fetch(srv.url + "/auth/providers", { headers: { "cf-connecting-ip": "2001:db8:abcd:1234::1" } });
+  expect(r1.status).toBe(200);
+  expect(r1.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+  const r2 = await fetch(srv.url + "/auth/providers", { headers: { "cf-connecting-ip": "2001:db8:abcd:1234::2" } });
+  expect(r2.status).toBe(200);
+  // 3rd request from a DIFFERENT /128 in the SAME /64 hits the shared /64 bucket
+  const r3 = await fetch(srv.url + "/auth/providers", { headers: { "cf-connecting-ip": "2001:db8:abcd:1234:ffff::99" } });
+  expect(r3.status).toBe(429);
+});
+
+test("promoteTenantAdmin refuses promoting a userId that has never signed into a domain workspace", async () => {
+  const { srv, sessions, registry } = await makeTestServer({ publicUrl: "https://p5y.omni.ooo" });
+  const tenant = await registry.createTenant({ domain: "acme.test", admins: ["google:admin1"] });
+  const adminToken = await sessions.issue({ user: "google:admin1", name: "Admin", email: "admin@acme.test", domain: "acme.test" });
+  const res = await fetch(`${srv.url}/tenants/${tenant.id}/admins`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+    body: JSON.stringify({ userId: "google:outsider999" }),
+  });
+  expect(res.status).toBe(404);
+});

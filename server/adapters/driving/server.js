@@ -13,6 +13,7 @@
 //   GET|PUT /blobs/<token>   signed blob URLs (blob-http.js); only when `blobs` is given. Without it the gateway
 //                            answers a socket's `blob` request `unavailable`.
 
+import { isIP } from "node:net";
 import { gateway as makeGateway } from "../../core/gateway.js";
 import { roomHost, serveOpens, remoteRooms } from "../../core/room-host.js";
 import { quietLogger } from "../../core/log.js";
@@ -45,6 +46,7 @@ function hardenResponse(res, { https, isEmbed }) {
   if (!h.has("referrer-policy")) h.set("referrer-policy", "no-referrer");
   if (!h.has("permissions-policy")) h.set("permissions-policy", BASE_SECURITY_HEADERS["permissions-policy"]);
   if (!isEmbed && !h.has("x-frame-options")) h.set("x-frame-options", "DENY");
+  if (!isEmbed && !h.has("cross-origin-resource-policy")) h.set("cross-origin-resource-policy", "same-origin");
   if (https && !h.has("strict-transport-security")) h.set("strict-transport-security", "max-age=63072000; includeSubDomains");
   const ct = h.get("content-type") ?? "";
   if (ct.includes("text/html") && !h.has("cross-origin-opener-policy")) h.set("cross-origin-opener-policy", "same-origin");
@@ -52,10 +54,10 @@ function hardenResponse(res, { https, isEmbed }) {
 }
 
 /**
- * Bounded per-IP token-bucket rate limiter (FIFO eviction past `maxEntries` so an IP flood cannot OOM the process).
+ * Bounded per-IP LRU token-bucket rate limiter (evicts least-recently-used entry past `maxEntries` so an IP flood cannot OOM).
  * @param {{ burst: number, refillPerSec: number, maxEntries?: number, now?: () => number }} opts
  */
-function createIpRateLimiter({ burst, refillPerSec, maxEntries = 10_000, now = Date.now }) {
+function createIpRateLimiter({ burst, refillPerSec, maxEntries = 50_000, now = Date.now }) {
   /** @type {Map<string, { tokens: number, lastMs: number }>} */
   const buckets = new Map();
   return {
@@ -71,6 +73,9 @@ function createIpRateLimiter({ burst, refillPerSec, maxEntries = 10_000, now = D
         const elapsed = Math.max(0, (t - b.lastMs) / 1000);
         b.tokens = Math.min(burst, b.tokens + elapsed * refillPerSec);
         b.lastMs = t;
+        // Refresh LRU recency so active buckets aren't evicted by a one-shot IP sweep
+        buckets.delete(key);
+        buckets.set(key, b);
       }
       if (b.tokens >= 1) {
         b.tokens -= 1;
@@ -82,18 +87,40 @@ function createIpRateLimiter({ burst, refillPerSec, maxEntries = 10_000, now = D
   };
 }
 
-/** Extract client IP for rate limiting: uses CF-Connecting-IP / X-Forwarded-For only when `trustProxy` is true. */
+/** Normalize an IP for rate limiting: IPv4 as-is; IPv6 collapsed to canonical /64 prefix to prevent /128 rotation bypass. */
+function normalizeRateKey(ip) {
+  const v = isIP(ip);
+  if (v === 4) return ip;
+  if (v === 6) {
+    try {
+      const canonical = new URL(`http://[${ip}]/`).hostname.slice(1, -1);
+      const [head, tail = ""] = canonical.split("::");
+      const left = head ? head.split(":") : [];
+      const right = tail ? tail.split(":") : [];
+      const fill = Math.max(0, 8 - left.length - right.length);
+      const full = [...left, ...Array(fill).fill("0"), ...right];
+      return full.slice(0, 4).map(h => h.padStart(4, "0")).join(":") + "::/64";
+    } catch { return "unknown"; }
+  }
+  return "unknown";
+}
+
+/** Extract client IP for rate limiting: trusts CF-Connecting-IP / rightmost X-Forwarded-For ONLY when `trustProxy` is true AND TCP peer is loopback. */
 function clientIpOf(req, srv, trustProxy) {
-  if (trustProxy) {
+  let peer = "unknown";
+  try { peer = srv.requestIP?.(req)?.address || "unknown"; } catch {}
+  const isLoopbackPeer = peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1";
+  if (trustProxy && isLoopbackPeer) {
     const cf = req.headers.get("cf-connecting-ip")?.trim();
-    if (cf && cf.length <= 64) return cf;
+    if (cf && isIP(cf)) return normalizeRateKey(cf);
     const xff = req.headers.get("x-forwarded-for");
     if (xff) {
-      const first = xff.split(",")[0]?.trim();
-      if (first && first.length <= 64) return first;
+      const hops = xff.split(",").map(s => s.trim()).filter(Boolean);
+      const rightmost = hops.at(-1);
+      if (rightmost && isIP(rightmost)) return normalizeRateKey(rightmost);
     }
   }
-  try { return srv.requestIP?.(req)?.address || "unknown"; } catch { return "unknown"; }
+  return isIP(peer) ? normalizeRateKey(peer) : "unknown";
 }
 
 /**
@@ -115,7 +142,7 @@ function clientIpOf(req, srv, trustProxy) {
  *   snapshotTickets?: { issue(board: string, seq: number): Promise<string> } | null,
  *   hideHealthStats?: boolean,
  *   trustProxy?: boolean,
- *   rateLimit?: boolean | { authBurst?: number, authRefillPerSec?: number, wsBurst?: number, wsRefillPerSec?: number } | null,
+ *   rateLimit?: boolean | { authBurst?: number, authRefillPerSec?: number, wsBurst?: number, wsRefillPerSec?: number, apiBurst?: number, apiRefillPerSec?: number } | null,
  * }} o — `port: 0` picks a free port. `host` options go to the room host (tests; main.js passes hostname and
  *   leaseTtlMs). `static: false` serves no web app; an object passes its `mounts` to staticSite (default: the repo's
  *   web/ and packages/, from static.js's own path). `roles`: see the header (default both). `node`: this node's id
@@ -137,7 +164,8 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
   const clock = now ?? Date.now;
   const rlOpts = rateLimit === true ? {} : (rateLimit && typeof rateLimit === "object" ? rateLimit : null);
   const authLimiter = rlOpts ? createIpRateLimiter({ burst: rlOpts.authBurst ?? 30, refillPerSec: rlOpts.authRefillPerSec ?? 1, now: clock }) : null;
-  const wsLimiter = rlOpts ? createIpRateLimiter({ burst: rlOpts.wsBurst ?? 60, refillPerSec: rlOpts.wsRefillPerSec ?? 2, now: clock }) : null;
+  const wsLimiter = rlOpts ? createIpRateLimiter({ burst: rlOpts.wsBurst ?? 120, refillPerSec: rlOpts.wsRefillPerSec ?? 10, now: clock }) : null;
+  const apiLimiter = rlOpts ? createIpRateLimiter({ burst: rlOpts.apiBurst ?? 180, refillPerSec: rlOpts.apiRefillPerSec ?? 20, now: clock }) : null;
   const access = blobs && roles.gateway ? blobAccess({ blobs, key: blobKey ?? crypto.getRandomValues(new Uint8Array(32)), origin, log, ...(now ? { now } : {}), ...(quotaBytes !== undefined ? { quotaBytes } : {}), ...(blobUsageTtlMs ? { usageTtlMs: blobUsageTtlMs } : {}) }) : null;
   const blobHttp = access ? blobRoutes({ access, ...(maxBlobPuts ? { maxPuts: maxBlobPuts } : {}), ...(blobHttpOpts ?? {}) }) : null;
   const gw = roles.gateway ? makeGateway({ auth, registry, store, bus, rooms, log, limits, metrics, snapshotTickets, ...(deflate ? { deflate } : {}), ...(access ? { blobUrl: access.url } : {}), ...(now ? { now } : {}), ...(timers ? { timers } : {}), ...(onWelcomed ? { onWelcomed } : {}) }) : null;
@@ -181,6 +209,10 @@ export function createServer({ auth, registry, store, bus, blobs = null, log = q
         }
         if (authLimiter && (path.startsWith("/auth/") || path.startsWith("/links/"))) {
           const rl = authLimiter.take(clientIpOf(req, srv, trustProxy));
+          if (!rl.ok) return finish(json(429, { error: "rate-limited", retryAfter: rl.retryAfterSec }, { "retry-after": String(rl.retryAfterSec) }), path);
+        }
+        if (apiLimiter && (path.startsWith("/boards") || path.startsWith("/tenants") || path.startsWith("/admin/") || path.startsWith("/blobs/") || path.startsWith("/spaces") || path.startsWith("/groups") || path.startsWith("/teams") || path.startsWith("/roles") || path.startsWith("/home") || path.startsWith("/access/") || path.startsWith("/members/") || path.startsWith("/trash") || path === "/directory")) {
+          const rl = apiLimiter.take(clientIpOf(req, srv, trustProxy));
           if (!rl.ok) return finish(json(429, { error: "rate-limited", retryAfter: rl.retryAfterSec }, { "retry-after": String(rl.retryAfterSec) }), path);
         }
         if (blobHttp) { const res = await blobHttp.handle(req, url); if (res) return finish(res, path); }

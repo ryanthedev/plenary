@@ -229,6 +229,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
   const hasOidc = providerList.length > 0;
   const autoProvisionDomainOrgs = Boolean(config.autoProvisionDomainOrgs);
   const allowPersonalOrgs = config.allowPersonalOrgs !== false;
+  const maxPersonalOrgs = Number.isInteger(config.maxPersonalOrgs) && config.maxPersonalOrgs > 0 ? config.maxPersonalOrgs : undefined;
 
   let macKey = null;
   if (hasOidc) {
@@ -456,7 +457,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
         ...NO_STORE,
         "referrer-policy": "no-referrer",
         "x-frame-options": "DENY",
-        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
       },
     });
   }
@@ -774,7 +775,7 @@ export function httpRoutes({ registry, sessions, oidc = null, providers = null, 
         const who = await caller(req);
         if (!allowPersonalOrgs) throw new AdminError("forbidden", "personal workspace creation is disabled");
         const b = await body(req, ["name"]);
-        const tenant = await createPersonalTenant({ caller: who, name: b.name }, admin);
+        const tenant = await createPersonalTenant({ caller: who, name: b.name, ...(maxPersonalOrgs ? { maxPersonalOrgs } : {}) }, admin);
         return json(201, { tenant });
       },
     }],

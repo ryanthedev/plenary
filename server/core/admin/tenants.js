@@ -246,21 +246,22 @@ export async function provisionDomainTenant({ caller }, { registry, now = Date.n
 
 /**
  * POST /tenants — any authenticated Google or dev user creates their own personal org (`domain: null`).
- * @param {{ caller: import("../../ports/idp.js").Identity, name: unknown }} req
+ * @param {{ caller: import("../../ports/idp.js").Identity, name: unknown, maxPersonalOrgs?: number }} req
  * @param {{ registry: Registry, now?: () => number }} deps
  */
-export async function createPersonalTenant({ caller, name }, { registry, now = Date.now }) {
+export async function createPersonalTenant({ caller, name, maxPersonalOrgs = MAX_PERSONAL_ORGS_PER_USER }, { registry, now = Date.now }) {
   if (!okAuthenticatedCaller(caller)) throw new AdminError("forbidden", "not allowed");
   if (typeof name !== "string" || CONTROL.test(name)) throw new AdminError("bad-request", "bad org name");
   const trimmed = name.trim();
   if (!trimmed || trimmed.length > ORG_NAME_MAX) throw new AdminError("bad-request", `org name must be 1..${ORG_NAME_MAX} characters`);
+  const cap = Number.isInteger(maxPersonalOrgs) && maxPersonalOrgs > 0 ? maxPersonalOrgs : MAX_PERSONAL_ORGS_PER_USER;
   const vEmail = verifiedEmail(caller);
   const existing = typeof registry.tenantsForAdmin === "function"
     ? await registry.tenantsForAdmin(caller.user, vEmail)
     : (typeof registry.listPersonalTenants === "function" ? await registry.listPersonalTenants() : []);
   const personalCount = existing.filter(t => t.domain === null && isTenantAdminRecord(t, caller)).length;
-  if (personalCount >= MAX_PERSONAL_ORGS_PER_USER) {
-    throw new AdminError("limit", `maximum of ${MAX_PERSONAL_ORGS_PER_USER} personal workspaces reached`);
+  if (personalCount >= cap) {
+    throw new AdminError("limit", `maximum of ${cap} personal workspaces reached`);
   }
   const admins = [caller.user];
   if (vEmail) admins.push("email:" + vEmail);
@@ -417,10 +418,15 @@ export async function promoteTenantAdmin({ caller, tenant, userId, email }, { re
     if (norm.startsWith("email:")) throw new AdminError("bad-request", "use the email field to add an admin by email");
     const state = await registry.memberState?.(t.id, norm);
     if (state?.removed) throw new AdminError("removed", "cannot promote an offboarded member");
-    if (t.domain !== null && state?.email) {
-      const em = normEmail(state.email);
-      if (em && !emailMatchesTenantDomain(t, em)) {
-        throw new AdminError("bad-request", "external email cannot be promoted on a domain workspace");
+    if (t.domain !== null) {
+      if (typeof registry.memberState === "function" && !state) {
+        throw new AdminError("not-found", "member must sign in to the workspace before promotion by userId");
+      }
+      if (state?.email) {
+        const em = normEmail(state.email);
+        if (em && !emailMatchesTenantDomain(t, em)) {
+          throw new AdminError("bad-request", "external email cannot be promoted on a domain workspace");
+        }
       }
     }
     const already = t.admins.includes(norm);
